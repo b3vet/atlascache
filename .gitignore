@@ -1,0 +1,54 @@
+# Binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+coverage.html
+
+# Profiling
+*.prof
+cpu.out
+mem.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Data directory (for local testing)
+data/
+/var/lib/atlascache/
+
+# Config with secrets (keep example)
+config.yaml
+!config.example.yaml
+
+# Temporary files
+tmp/
+temp/
+
+SOW*.md
+prompt.md
+PHASE-*.md

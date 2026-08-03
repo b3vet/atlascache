@@ -1,0 +1,44 @@
+# AtlasCache Configuration
+# Copy this file to config.yaml and modify as needed
+
+# Node configuration
+node:
+  # Unique node identifier (auto-generated if empty)
+  id: ""
+  # Human-readable node name
+  name: ""
+  # Data directory for persistence (Phase 4)
+  data_dir: "/var/lib/atlascache"
+
+# Storage engine configuration
+storage:
+  # Number of shards (0 = auto-detect based on CPU cores)
+  # Auto-detection uses: CPU cores × 4
+  shard_count: 0
+  # Maximum memory limit (e.g., "1GB", "512MB", "0" = unlimited)
+  max_memory: "0"
+  # Maximum value size (e.g., "1MB", "512KB")
+  max_value_size: "1MB"
+
+# TTL (Time-To-Live) configuration
+ttl:
+  # Interval for time wheel tick (default: 100ms)
+  check_interval: "100ms"
+  # Enable lazy expiration (check on access)
+  lazy_expiration: true
+  # Enable active expiration (background cleanup)
+  active_expiration: true
+
+# Eviction policy configuration
+eviction:
+  # Policy type: lru, lfu, fifo, none
+  policy: "lru"
+  # Number of keys to sample for eviction victim selection
+  sample_size: 5
+
+# Logging configuration
+logging:
+  # Log level: debug, info, warn, error
+  level: "info"
+  # Log format: json, console
+  format: "json"
