@@ -9,6 +9,7 @@ require (
 	github.com/rs/zerolog v1.34.0
 	github.com/spf13/viper v1.21.0
 	github.com/stretchr/testify v1.11.1
+	go.uber.org/goleak v1.3.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
