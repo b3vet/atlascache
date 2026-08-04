@@ -89,6 +89,16 @@ func newFake() *fakeharness.Harness {
 	return h
 }
 
+// executorPerSpec builds a fresh fake for every spec, which is required
+// whenever RunAll is given a parallelism above 1: a single shared fake records
+// commands and lifecycle state, so concurrent specs would race on it.
+func executorPerSpec() *runner.Executor {
+	return &runner.Executor{
+		Factory: func(runner.HarnessOptions) (runner.Harness, error) { return newFake(), nil },
+		Binary:  "fake",
+	}
+}
+
 func TestRunPasses(t *testing.T) {
 	spec := loadSpec(t, "specs", "ping-basic.yaml")
 	result := executorWith(newFake()).Run(context.Background(), spec)

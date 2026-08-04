@@ -75,7 +75,7 @@ func TestJSONReportParses(t *testing.T) {
 	failing := loadSpec(t, "failing", "wrong-reply.yaml")
 	specs = append(specs, failing)
 
-	results := executorWith(newFake()).RunAll(t.Context(), specs, 2, nil)
+	results := executorPerSpec().RunAll(t.Context(), specs, 2, nil)
 
 	var out bytes.Buffer
 	reporter := &runner.JSONReporter{Out: &out}
