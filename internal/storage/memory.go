@@ -40,6 +40,40 @@ func (m *MemoryTracker) Add(bytes uint64) {
 	atomic.AddUint64(&m.usedMemory, bytes)
 }
 
+// Reserve accounts a store of size bytes that displaces credit bytes already
+// counted, and reports whether the limit allows it.
+//
+// The check and the commit are one compare-and-swap, which is what makes
+// max_memory a hard limit rather than an advisory one: two writers on different
+// shards cannot both observe room for the last entry and both take it, so the
+// total is never exceeded, not even transiently (ADR-0018).
+//
+// Crediting the displaced entry is the other half. An overwrite only adds the
+// difference between the two entries, so a key rewritten at the limit is not
+// charged twice and rejected for memory it is about to give back.
+func (m *MemoryTracker) Reserve(size, credit uint64) bool {
+	maxMemory := atomic.LoadUint64(&m.maxMemory)
+
+	for {
+		used := atomic.LoadUint64(&m.usedMemory)
+
+		// The credit is a resident entry's size, so it is already part of used;
+		// clamping is defensive against a caller that got that wrong.
+		refund := credit
+		if refund > used {
+			refund = used
+		}
+
+		next := used - refund + size
+		if maxMemory != 0 && next > maxMemory {
+			return false
+		}
+		if atomic.CompareAndSwapUint64(&m.usedMemory, used, next) {
+			return true
+		}
+	}
+}
+
 // Sub subtracts bytes from the used memory counter
 func (m *MemoryTracker) Sub(bytes uint64) {
 	// Use compare-and-swap to prevent underflow

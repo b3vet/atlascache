@@ -1,0 +1,26 @@
+version: 1
+name: evict-hard-limit
+tier: full
+feature: FEAT-0017
+description: >
+  Memory stays inside max_memory under sustained write pressure, and no write is
+  refused while doing it. Both halves matter: eviction runs synchronously on the
+  write path (ADR-0018) so a write makes room for itself rather than failing,
+  and the room it makes is real, so the resident set never grows past the limit.
+
+  Survivors are counted rather than measured. Every entry here costs the same
+  known number of bytes, so the number still resident is the memory in use.
+
+config:
+  storage:
+    shard_count: 1
+    max_memory: "900"
+  eviction:
+    policy: lru
+    sample_size: 100
+
+steps:
+  - scenario: evict_holds_the_memory_limit
+
+  - cmd: PING
+    expect: PONG

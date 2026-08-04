@@ -86,6 +86,7 @@ type Step struct {
 	Expect      Value            `yaml:"expect"`
 	ExpectError Value            `yaml:"expect_error"`
 	ExpectField map[string]Value `yaml:"expect_field"`
+	ExpectValue Value            `yaml:"expect_value"`
 	Sleep       Duration         `yaml:"sleep"`
 	Scenario    string           `yaml:"scenario"`
 	Restart     *bool            `yaml:"restart"`
@@ -404,13 +405,18 @@ func (s Step) validateCommand(assertions []string) []string {
 	switch len(assertions) {
 	case 1:
 	case 0:
-		problems = append(problems, "cmd needs one of expect, expect_error or expect_field; a command with no assertion asserts nothing")
+		problems = append(problems, "cmd needs one of expect, expect_value, expect_error or expect_field; a command with no assertion asserts nothing")
 	default:
 		problems = append(problems, fmt.Sprintf("cmd takes one assertion, got %s", strings.Join(assertions, " and ")))
 	}
 	for _, name := range sortedValueKeys(s.ExpectField) {
 		if _, err := parseComparison(s.ExpectField[name].Text); err != nil {
 			problems = append(problems, fmt.Sprintf("expect_field %s: %s", name, err))
+		}
+	}
+	if s.ExpectValue.Set {
+		if _, err := parseComparison(s.ExpectValue.Text); err != nil {
+			problems = append(problems, fmt.Sprintf("expect_value: %s", err))
 		}
 	}
 	return problems
@@ -446,6 +452,9 @@ func (s Step) presentAssertions() []string {
 	}
 	if len(s.ExpectField) > 0 {
 		found = append(found, "expect_field")
+	}
+	if s.ExpectValue.Set {
+		found = append(found, "expect_value")
 	}
 	return found
 }

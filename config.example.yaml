@@ -39,10 +39,13 @@ storage:
 ttl:
   # Interval for time wheel tick (default: 100ms)
   check_interval: "100ms"
-  # Enable lazy expiration (check on access)
+  # Enable lazy expiration (reclaim an expired key when it is read)
   lazy_expiration: true
-  # Enable active expiration (background cleanup)
+  # Enable active expiration (background cleanup driven by the time wheel)
   active_expiration: true
+  # Maximum keys expired per tick; leftovers are carried to the next tick, so
+  # a mass expiry cannot stall the wheel
+  batch_size: 10000
 
 # Eviction policy configuration
 eviction:

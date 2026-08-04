@@ -1,0 +1,104 @@
+version: 1
+name: ttl-expire-cmd
+tier: full
+feature: FEAT-0017
+description: >
+  EXPIRE attaches an expiry to a key that already exists, and reports 1 or 0
+  rather than an error either way. TTL's -1 and -2 answers are asserted on every
+  path a key can reach: no expiry, an expiry set after the fact, expired, and
+  never written at all.
+
+config:
+  ttl:
+    check_interval: 50ms
+
+steps:
+  - cmd: SET k value
+    expect: OK
+
+  - cmd: TTL k
+    expect: -1
+
+  - cmd: EXPIRE k 200
+    expect: 1
+
+  - cmd: TTL k
+    expect_value: ">= 199"
+
+  # Applying an expiry twice is the second one, not the sum.
+  - cmd: EXPIRE k 500
+    expect: 1
+
+  - cmd: TTL k
+    expect_value: ">= 499"
+
+  # A key that is not there cannot be given an expiry, and asking does not
+  # create one.
+  - cmd: EXPIRE missing 200
+    expect: 0
+
+  - cmd: TTL missing
+    expect: -2
+
+  - cmd: GET missing
+    expect: NIL
+
+  # An expiry already in the past deletes the key, and still counts as applied.
+  - cmd: SET doomed value
+    expect: OK
+
+  - cmd: EXPIRE doomed -1
+    expect: 1
+
+  - cmd: GET doomed
+    expect: NIL
+
+  - cmd: TTL doomed
+    expect: -2
+
+  - cmd: EXPIRE doomed -1
+    expect: 0
+
+  # Argument errors, none of which ends the session.
+  - cmd: EXPIRE k
+    expect_error: "ERR wrong number of arguments for 'expire' command"
+
+  - cmd: EXPIRE
+    expect_error: "ERR wrong number of arguments for 'expire' command"
+
+  - cmd: TTL
+    expect_error: "ERR wrong number of arguments for 'ttl' command"
+
+  - cmd: EXPIRE k soon
+    expect_error: "ERR value is not an integer or out of range"
+
+  - cmd: EXPIRE k 9223372036854775807
+    expect_error: "ERR invalid expire time in 'expire' command"
+
+  # The key survived every rejected attempt with the expiry it already had.
+  # Nothing above this line sleeps, so the countdown has not reached a second.
+  - cmd: TTL k
+    expect_value: ">= 499"
+
+  - cmd: GET k
+    expect: value
+
+  # A key that expires on its own can no longer be given a new expiry: it is
+  # gone, so EXPIRE answers 0 like any other missing key.
+  - cmd: SET brief value PX 300
+    expect: OK
+
+  - sleep: 1s
+
+  - cmd: TTL brief
+    expect: -2
+
+  - cmd: EXPIRE brief 100
+    expect: 0
+
+  - cmd: GET brief
+    expect: NIL
+
+  # And the long-lived key is still there on the far side of all of it.
+  - cmd: GET k
+    expect: value

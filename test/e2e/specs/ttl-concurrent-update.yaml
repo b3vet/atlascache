@@ -1,0 +1,24 @@
+version: 1
+name: ttl-concurrent-update
+tier: full
+feature: FEAT-0017
+issue: ISSUE-0008
+description: >
+  EXPIRE and GET race on one key from separate connections. Entry.ExpireAt is
+  written by one and read by the other, which is the mixed-access pattern
+  ISSUE-0008 was about; a torn read yields a deadline in the past and a live key
+  is reclaimed under its readers.
+
+config:
+  ttl:
+    check_interval: 20ms
+
+steps:
+  - scenario: ttl_concurrent_expire_and_get
+
+  # The server is still serving ordinary traffic afterwards.
+  - cmd: SET after v
+    expect: OK
+
+  - cmd: GET after
+    expect: v

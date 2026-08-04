@@ -13,10 +13,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// newTestServer starts a server over an empty keyspace.
 func newTestServer(t *testing.T) (*Server, chan error) {
 	t.Helper()
 
-	srv, err := New(context.Background(), "127.0.0.1:0", zerolog.Nop())
+	return newTestServerWith(t, newFakeStore())
+}
+
+// newTestServerWith starts a server over the given keyspace, for the tests that
+// need one primed or made to fail.
+func newTestServerWith(t *testing.T, store Store) (*Server, chan error) {
+	t.Helper()
+
+	srv, err := New(context.Background(), "127.0.0.1:0", zerolog.Nop(), store)
 	require.NoError(t, err)
 
 	serveErr := make(chan error, 1)
@@ -174,7 +183,7 @@ func TestNewFailsOnBusyPort(t *testing.T) {
 	srv, serveErr := newTestServer(t)
 	defer shutdownServer(t, srv, serveErr)
 
-	_, err := New(context.Background(), srv.Addr(), zerolog.Nop())
+	_, err := New(context.Background(), srv.Addr(), zerolog.Nop(), newFakeStore())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "listen on")
 }

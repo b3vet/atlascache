@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -58,7 +59,15 @@ type StorageEngine interface {
 
 	// Iteration
 	Keys(pattern string) [][]byte
-	Scan(cursor uint64, count int) (keys [][]byte, nextCursor uint64)
+
+	// Scan returns one page of a snapshot scan owned by owner. See
+	// ShardedEngine.Scan and the package note in scan.go for the guarantee it
+	// offers and the bounds that hold it in place.
+	Scan(owner ScanOwner, cursor string, count int) (keys [][]byte, nextCursor string, err error)
+
+	// ReleaseScans drops every scan cursor owned by owner. A connection handler
+	// must call it when the connection goes away.
+	ReleaseScans(owner ScanOwner)
 
 	// Internal access
 	GetEntry(key []byte) (*Entry, bool)
@@ -90,6 +99,16 @@ type Stats struct {
 	Evictions   uint64 // Keys evicted
 	Expirations uint64 // Keys expired
 	OOMRejected uint64 // Requests rejected due to OOM
+
+	// ScanCursors is the number of scans currently open, and
+	// ScanSnapshotBytes what their snapshots are accounted at.
+	//
+	// Neither is part of MemoryUsed and neither counts against max_memory
+	// (ADR-0017). Charging snapshots to the data budget would let a large scan
+	// evict the very keys it is scanning, so they are reported here instead —
+	// visible, and separate.
+	ScanCursors       uint64
+	ScanSnapshotBytes uint64
 }
 
 // EngineConfig holds configuration for the storage engine
@@ -97,6 +116,19 @@ type EngineConfig struct {
 	ShardCount   int
 	MaxMemory    uint64
 	MaxValueSize uint64
+
+	// DisableLazyExpiration stops reads from reclaiming the expired entries
+	// they find, leaving them for active expiration. It is phrased as an opt-out
+	// on purpose: an engine built from a bare EngineConfig has to reclaim on
+	// access, or ISSUE-0007 comes back through a zero value.
+	DisableLazyExpiration bool
+
+	// Scan cursor bounds. Zero means the default for each, and every one of them
+	// is required rather than optional: a server-side snapshot is memory a
+	// client can ask for and then abandon. See scan.go.
+	ScanIdleTimeout       time.Duration // 0 = DefaultScanIdleTimeout
+	MaxScanCursorsPerConn int           // 0 = DefaultMaxScanCursorsPerConn
+	MaxScanSnapshotBytes  uint64        // 0 = DefaultMaxScanSnapshotBytes
 }
 
 // DefaultEngineConfig returns default configuration
@@ -107,6 +139,48 @@ func DefaultEngineConfig() EngineConfig {
 		MaxValueSize: 1 * 1024 * 1024, // 1MB
 	}
 }
+
+// EvictionController selects the keys a write may drop to make room for itself.
+//
+// The engine declares the seam it needs rather than importing the package that
+// implements it, so the dependency runs one way — internal/eviction imports
+// internal/storage to sample a shard, and nothing imports back.
+type EvictionController interface {
+	// SelectVictims returns keys to drop from shard, best candidate first,
+	// covering at least needed bytes where the sample allows it. An empty
+	// result means the policy found nothing to take, and the caller must not
+	// ask again in a loop.
+	SelectVictims(shard *Shard, needed uint64) []string
+}
+
+// ExpiryScheduler is told about every expiry the engine creates, so the TTL
+// manager can schedule the key for collection. ttl.Manager satisfies it, and
+// this seam is why internal/storage does not import internal/ttl.
+type ExpiryScheduler interface {
+	Add(shard int, key string, expireAt int64)
+}
+
+// evictionHolder and schedulerHolder box an interface so it can live in an
+// atomic.Pointer, which is what makes both swappable at runtime — the eviction
+// policy on config reload, the scheduler at wiring time.
+type evictionHolder struct{ controller EvictionController }
+
+type schedulerHolder struct{ scheduler ExpiryScheduler }
+
+const (
+	// maxEvictionsPerWrite bounds the victims one admission pass may take.
+	// Without it a single large value could evict a whole shard trying to fit,
+	// so ADR-0018 caps the attempts and returns ErrOutOfMemory on reaching the
+	// cap rather than evicting further.
+	maxEvictionsPerWrite = 64
+
+	// admitAttempts bounds how many times a write repeats [make room, store]
+	// after losing the room it just made to a concurrent writer, so the worst
+	// case for one write is admitAttempts passes of the cap above. Each pass
+	// evicts more, so losing repeatedly is vanishingly unlikely; the bound is
+	// there so the loop is provably finite rather than merely improbable.
+	admitAttempts = 4
+)
 
 var _ StorageEngine = (*ShardedEngine)(nil)
 
@@ -119,8 +193,16 @@ type ShardedEngine struct {
 	maxValueSize uint64
 	memory       *MemoryTracker
 
-	// Expiration tracking
-	expirations uint64
+	// scans holds the live SCAN snapshots. Its memory is accounted inside the
+	// registry and never through memory above, which is what keeps a scan from
+	// evicting the keys it is scanning (ADR-0017).
+	scans *scanRegistry
+
+	// Swappable collaborators, both optional: with no controller a full cache
+	// rejects writes as it did before eviction existed, and with no scheduler
+	// expiry falls back to the passive path alone.
+	eviction  atomic.Pointer[evictionHolder]
+	scheduler atomic.Pointer[schedulerHolder]
 
 	// Lifecycle
 	closed int32
@@ -135,9 +217,12 @@ func NewShardedEngine(cfg EngineConfig) *ShardedEngine {
 	}
 	shardCount = nextPowerOfTwo(shardCount)
 
+	memory := NewMemoryTracker(cfg.MaxMemory)
+
 	shards := make([]*Shard, shardCount)
 	for i := range shards {
-		shards[i] = NewShard(1024)
+		shards[i] = NewShard(1024, memory)
+		shards[i].SetLazyExpiration(!cfg.DisableLazyExpiration)
 	}
 
 	// nextPowerOfTwo guarantees shardCount >= 1, so these conversions cannot wrap.
@@ -146,7 +231,48 @@ func NewShardedEngine(cfg EngineConfig) *ShardedEngine {
 		shardCount:   uint64(shardCount),     //nolint:gosec // bounded positive by nextPowerOfTwo
 		shardMask:    uint64(shardCount - 1), //nolint:gosec // bounded positive by nextPowerOfTwo
 		maxValueSize: cfg.MaxValueSize,
-		memory:       NewMemoryTracker(cfg.MaxMemory),
+		memory:       memory,
+		scans:        newScanRegistry(cfg),
+	}
+}
+
+// SetEvictionController installs the policy that picks victims when a write
+// needs room. A nil controller removes it, which makes max_memory a rejection
+// threshold again.
+func (e *ShardedEngine) SetEvictionController(controller EvictionController) {
+	if controller == nil {
+		e.eviction.Store(nil)
+		return
+	}
+	e.eviction.Store(&evictionHolder{controller: controller})
+}
+
+// SetExpiryScheduler installs the TTL manager the engine reports new expiries
+// to. A nil scheduler removes it; expiry then depends on the passive path.
+func (e *ShardedEngine) SetExpiryScheduler(scheduler ExpiryScheduler) {
+	if scheduler == nil {
+		e.scheduler.Store(nil)
+		return
+	}
+	e.scheduler.Store(&schedulerHolder{scheduler: scheduler})
+}
+
+// evictionController returns the installed controller, or nil.
+func (e *ShardedEngine) evictionController() EvictionController {
+	if holder := e.eviction.Load(); holder != nil {
+		return holder.controller
+	}
+	return nil
+}
+
+// schedule hands a new expiry to the TTL manager. The hint is advisory
+// (ADR-0016), so a dropped one costs a late reclamation and nothing else.
+func (e *ShardedEngine) schedule(shard int, key string, expireAt int64) {
+	if expireAt == 0 {
+		return
+	}
+	if holder := e.scheduler.Load(); holder != nil {
+		holder.scheduler.Add(shard, key, expireAt)
 	}
 }
 
@@ -165,10 +291,27 @@ func nextPowerOfTwo(n int) int {
 	return n
 }
 
+// shardFor returns the shard for a given key using xxhash, with its index —
+// which is what the TTL manager schedules against.
+func (e *ShardedEngine) shardFor(key []byte) (int, *Shard) {
+	idx := xxhash.Sum64(key) & e.shardMask
+	return int(idx), e.shards[idx] //nolint:gosec // masked below shardCount, which is at most 4096
+}
+
 // getShard returns the shard for a given key using xxhash
 func (e *ShardedEngine) getShard(key []byte) *Shard {
-	hash := xxhash.Sum64(key)
-	return e.shards[hash&e.shardMask]
+	_, shard := e.shardFor(key)
+	return shard
+}
+
+// shardAt returns the shard with the given index, or nil when the index is out
+// of range. The TTL manager replays indexes from hints it may have held for
+// days, so they are bounds-checked rather than trusted.
+func (e *ShardedEngine) shardAt(idx int) *Shard {
+	if idx < 0 || idx >= len(e.shards) {
+		return nil
+	}
+	return e.shards[idx]
 }
 
 // Get retrieves a value from the storage.
@@ -212,23 +355,82 @@ func (e *ShardedEngine) validateWrite(key, value []byte, ttl time.Duration) (*En
 // admit is the single place max_memory is enforced, shared by Set and SetNX so
 // the two cannot diverge the way they did in ISSUE-0010.
 //
-// FEAT-0013 takes this over: it makes room by evicting instead of rejecting,
-// and widens the signature to admit(shard *Shard, entry *Entry) error so the
-// eviction controller can sample the shard the entry is bound for. Both call
-// sites already pass through here, so that change stays inside this function.
-func (e *ShardedEngine) admit(entry *Entry) error {
+// It makes room rather than refusing it: victims are sampled from the shard the
+// entry is bound for and dropped under the active policy (ADR-0012) until the
+// entry fits. It returns ErrOutOfMemory only when it genuinely cannot — no
+// controller is installed, the policy is none, sampling found no candidates, or
+// the write reached its eviction cap.
+//
+// The shortfall credits whatever the write is about to displace: an overwrite
+// only has to find room for the difference between the two entries, not for the
+// whole incoming one.
+func (e *ShardedEngine) admit(shard *Shard, entry *Entry) error {
 	maxMemory := e.memory.GetMaxMemory()
 	if maxMemory == 0 {
 		return nil
 	}
 
-	if e.memory.GetUsedMemory()+uint64(entry.Size) > maxMemory {
-		// Memory would exceed limit - caller should handle eviction
-		e.memory.RecordOOMRejection()
+	size := uint64(entry.Size)
+	if size > maxMemory {
+		// Emptying the cache would not help: the entry still would not fit.
 		return ErrOutOfMemory
 	}
 
-	return nil
+	controller := e.evictionController()
+	if controller == nil {
+		return ErrOutOfMemory
+	}
+
+	key := string(entry.Key)
+
+	for evicted := 0; ; {
+		used := e.memory.GetUsedMemory()
+		credit := shard.residentSize(key)
+		if used+size <= maxMemory+credit {
+			return nil
+		}
+		if evicted >= maxEvictionsPerWrite {
+			return ErrOutOfMemory
+		}
+
+		victims := controller.SelectVictims(shard, used+size-credit-maxMemory)
+		if len(victims) == 0 {
+			// The policy has nothing to give. Asking again would only spin.
+			return ErrOutOfMemory
+		}
+
+		for _, victim := range victims {
+			shard.evict(victim)
+
+			// Counted whether or not the key was still there: an attempt that
+			// found nothing is exactly the case the cap has to stop.
+			evicted++
+			if evicted >= maxEvictionsPerWrite {
+				break
+			}
+		}
+	}
+}
+
+// admitAndStore makes room and stores, retrying when the two race.
+//
+// The store is attempted first: only a refused reservation triggers eviction,
+// so a SetNX that a live key blocks never costs a victim. The shard's own
+// reservation stays the authority on the limit — admit works from a sampled
+// view of memory that another writer can invalidate, and the reservation cannot.
+func (e *ShardedEngine) admitAndStore(shard *Shard, key string, entry *Entry, onlyIfAbsent bool) (bool, error) {
+	for attempt := 0; attempt < admitAttempts; attempt++ {
+		stored, err := shard.put(key, entry, onlyIfAbsent)
+		if !errors.Is(err, ErrOutOfMemory) {
+			return stored, err
+		}
+		if err := e.admit(shard, entry); err != nil {
+			break
+		}
+	}
+
+	e.memory.RecordOOMRejection()
+	return false, ErrOutOfMemory
 }
 
 // Set stores a value with optional TTL
@@ -238,18 +440,14 @@ func (e *ShardedEngine) Set(key, value []byte, ttl time.Duration) error {
 		return err
 	}
 
-	if err := e.admit(entry); err != nil {
+	idx, shard := e.shardFor(key)
+	name := string(key)
+
+	if _, err := e.admitAndStore(shard, name, entry, false); err != nil {
 		return err
 	}
 
-	shard := e.getShard(key)
-	old, existed := shard.Set(string(key), entry)
-
-	// Update memory tracker
-	if existed {
-		e.memory.Sub(uint64(old.Size))
-	}
-	e.memory.Add(uint64(entry.Size))
+	e.schedule(idx, name, entry.ExpireAt.Load())
 
 	return nil
 }
@@ -261,22 +459,15 @@ func (e *ShardedEngine) SetNX(key, value []byte, ttl time.Duration) (bool, error
 		return false, err
 	}
 
-	if err := e.admit(entry); err != nil {
+	idx, shard := e.shardFor(key)
+	name := string(key)
+
+	stored, err := e.admitAndStore(shard, name, entry, true)
+	if err != nil || !stored {
 		return false, err
 	}
 
-	shard := e.getShard(key)
-	old, existed := shard.SetNX(string(key), entry)
-	if existed {
-		return false, nil
-	}
-
-	// An expired entry may have been displaced; the shard has already dropped
-	// it from its own counter, so the global tracker has to hear about it too.
-	if old != nil {
-		e.memory.Sub(uint64(old.Size))
-	}
-	e.memory.Add(uint64(entry.Size))
+	e.schedule(idx, name, entry.ExpireAt.Load())
 
 	return true, nil
 }
@@ -288,11 +479,7 @@ func (e *ShardedEngine) Delete(key []byte) bool {
 	}
 
 	shard := e.getShard(key)
-	old, existed := shard.Delete(string(key))
-
-	if existed {
-		e.memory.Sub(uint64(old.Size))
-	}
+	_, existed := shard.Delete(string(key))
 
 	return existed
 }
@@ -328,7 +515,19 @@ func (e *ShardedEngine) SetTTL(key []byte, ttl time.Duration) bool {
 		return false
 	}
 
-	return e.getShard(key).SetTTL(string(key), ttl)
+	idx, shard := e.shardFor(key)
+	name := string(key)
+	if !shard.SetTTL(name, ttl) {
+		return false
+	}
+
+	// Re-read rather than compute the deadline: the entry is the source of
+	// truth for it, and a hint that fires late would delay the reclamation.
+	if expireAt, present := shard.expiryOf(name); present {
+		e.schedule(idx, name, expireAt)
+	}
+
+	return true
 }
 
 // GetEntry returns the entry for internal use
@@ -393,60 +592,58 @@ func matchPattern(pattern, key string) bool {
 	return matched
 }
 
-// Scan iterates over keys with cursor-based pagination
-func (e *ShardedEngine) Scan(cursor uint64, count int) (keys [][]byte, nextCursor uint64) {
+// Scan returns one page of a snapshot scan, and the cursor to present for the
+// page after it.
+//
+// Present ScanCursorStart to begin. The returned cursor is ScanCursorStart when
+// the scan has finished, and any other value is an opaque id to hand back.
+//
+// # What it guarantees
+//
+// Every key present when the scan began is returned exactly once, unless it is
+// deleted or expires mid-scan. Keys created after the scan began may or may not
+// appear. This is weaker than Redis's guarantee; scan.go says why, and what the
+// snapshot costs.
+//
+// # What count means
+//
+// count bounds the work one page does, not the size of the result: it is the
+// number of snapshot entries examined, and entries that have been deleted or
+// have expired since the snapshot was taken are dropped from the page rather
+// than replaced. So a page may be short, or empty, without the scan being over.
+// Only a returned cursor of ScanCursorStart means that. A count above
+// maxScanCount is clamped, and a non-positive one means defaultScanCount.
+//
+// # Errors
+//
+// ErrScanCursorUnknown for a cursor this connection does not hold — never
+// issued, another connection's, already finished, idle past the timeout, or
+// dropped to reclaim snapshot memory. It is an error rather than a silent
+// restart on purpose: a scan that quietly resets hands back duplicates the
+// caller has no way to detect. ErrTooManyScanCursors when the connection is at
+// its cursor limit, and ErrScanMemoryExhausted when a shard's snapshot does not
+// fit under the global cap.
+func (e *ShardedEngine) Scan(owner ScanOwner, cursor string, count int) (keys [][]byte, nextCursor string, err error) {
 	if atomic.LoadInt32(&e.closed) == 1 {
-		return nil, 0
+		return nil, ScanCursorStart, ErrEngineClosed
 	}
 
-	if count <= 0 {
-		count = 10
+	switch {
+	case count <= 0:
+		count = defaultScanCount
+	case count > maxScanCount:
+		count = maxScanCount
 	}
 
-	// Calculate starting shard and position within shard
-	shardIdx := cursor / 1000000
-	posInShard := cursor % 1000000
+	return e.scans.page(e.shards, owner, cursor, count)
+}
 
-	keys = make([][]byte, 0, count)
-
-	for shardIdx < e.shardCount && len(keys) < count {
-		shard := e.shards[shardIdx]
-		shardKeys := shard.Keys()
-
-		// Skip to position in shard
-		start := int(posInShard)
-		if start >= len(shardKeys) {
-			shardIdx++
-			posInShard = 0
-			continue
-		}
-
-		// Collect keys from this shard
-		end := start + count - len(keys)
-		if end > len(shardKeys) {
-			end = len(shardKeys)
-		}
-
-		for i := start; i < end; i++ {
-			keys = append(keys, []byte(shardKeys[i]))
-		}
-
-		// Update position
-		posInShard = uint64(end)
-		if posInShard >= uint64(len(shardKeys)) {
-			shardIdx++
-			posInShard = 0
-		}
-	}
-
-	// Calculate next cursor
-	if shardIdx >= e.shardCount {
-		nextCursor = 0 // Scan complete
-	} else {
-		nextCursor = shardIdx*1000000 + posInShard
-	}
-
-	return keys, nextCursor
+// ReleaseScans drops every scan cursor owned by owner, giving back the snapshot
+// memory immediately rather than at the idle timeout. A connection handler calls
+// it when the connection goes away: an abandoned scan has no one left to finish
+// it, and holding its snapshot for another minute serves nobody.
+func (e *ShardedEngine) ReleaseScans(owner ScanOwner) {
+	e.scans.release(owner)
 }
 
 // Stats returns aggregated statistics
@@ -458,7 +655,11 @@ func (e *ShardedEngine) Stats() Stats {
 	stats.MemoryMax = memStats.Max
 	stats.Evictions = memStats.Evictions
 	stats.OOMRejected = memStats.OOMRejected
-	stats.Expirations = atomic.LoadUint64(&e.expirations)
+
+	// Reported beside the data figures, and deliberately not folded into them.
+	scanStats := e.scans.stats()
+	stats.ScanCursors = scanStats.Cursors
+	stats.ScanSnapshotBytes = scanStats.Bytes
 
 	// One pass, and no traversal within it: every field below is a counter the
 	// shard maintains as it goes, so Stats() costs O(shards) (ISSUE-0012).
@@ -473,6 +674,7 @@ func (e *ShardedEngine) Stats() Stats {
 		stats.Deletes += shardStats.Deletes
 		stats.Hits += shardStats.Hits
 		stats.Misses += shardStats.Misses
+		stats.Expirations += shardStats.Expirations
 	}
 
 	return stats
@@ -493,42 +695,64 @@ func (e *ShardedEngine) SetMaxMemory(max uint64) {
 	e.memory.SetMaxMemory(max)
 }
 
-// RecordExpiration increments the expiration counter
-func (e *ShardedEngine) RecordExpiration() {
-	atomic.AddUint64(&e.expirations, 1)
-}
-
 // RecordEviction records an eviction event
 func (e *ShardedEngine) RecordEviction() {
 	e.memory.RecordEviction()
 }
 
-// DeleteExpired removes an expired key and updates memory
-func (e *ShardedEngine) DeleteExpired(key []byte) bool {
-	shard := e.getShard(key)
-	old, existed := shard.Delete(string(key))
-
-	if existed {
-		e.memory.Sub(uint64(old.Size))
-		atomic.AddUint64(&e.expirations, 1)
+// expireKey reclaims key from shard when it is genuinely expired, reporting
+// whether it deleted anything.
+//
+// This is the engine's half of expiration and it holds no logic of its own: the
+// deletion, the re-check under the write lock, and the accounting all live in
+// Shard.expire, which the passive path in Shard.Get reaches directly. One
+// implementation, two entry points, so the two cannot drift apart.
+func (e *ShardedEngine) expireKey(shard *Shard, key string) bool {
+	if atomic.LoadInt32(&e.closed) == 1 {
+		return false
 	}
 
-	return existed
+	return shard.expire(key)
 }
 
-// ExpireKeysInShard expires keys in a specific shard
-func (e *ShardedEngine) ExpireKeysInShard(shardIdx int, maxCount int) int {
-	if shardIdx < 0 || shardIdx >= len(e.shards) {
-		return 0
+// ExpiryOf reports a key's expiry and presence.
+//
+// It is one half of the ttl.Keyspace seam the TTL manager validates its hints
+// against (ADR-0016). An expired-but-resident entry reports present with an
+// expiry in the past, which is precisely the case the manager acts on.
+func (e *ShardedEngine) ExpiryOf(shard int, key string) (expireAt int64, present bool) {
+	if atomic.LoadInt32(&e.closed) == 1 {
+		return 0, false
 	}
 
-	expired, freed := e.shards[shardIdx].ExpireKeys(maxCount)
-	if expired > 0 {
-		e.memory.Sub(freed)
-		atomic.AddUint64(&e.expirations, uint64(expired))
+	target := e.shardAt(shard)
+	if target == nil {
+		return 0, false
 	}
 
-	return expired
+	return target.expiryOf(key)
+}
+
+// Expire reclaims a key the TTL manager has found expired, reporting whether it
+// removed one.
+//
+// It is the other half of the ttl.Keyspace seam. A false answer is the manager's
+// signal that the hint was stale — the key was overwritten with a live value
+// between the lookup and this call — and is counted as a dropped hint rather
+// than as an expiry.
+func (e *ShardedEngine) Expire(shard int, key string) bool {
+	target := e.shardAt(shard)
+	if target == nil {
+		return false
+	}
+
+	return e.expireKey(target, key)
+}
+
+// DeleteExpired removes a key that has expired, reporting whether it removed
+// one. It runs the same path as active and passive expiration.
+func (e *ShardedEngine) DeleteExpired(key []byte) bool {
+	return e.expireKey(e.getShard(key), string(key))
 }
 
 // Close shuts down the engine
@@ -537,12 +761,12 @@ func (e *ShardedEngine) Close() error {
 		return ErrEngineClosed
 	}
 
-	// Clear all shards
+	// Each shard returns its own bytes to the tracker, so a drift between the
+	// two counters survives Close and shows up rather than being zeroed away.
 	for _, shard := range e.shards {
 		shard.Clear()
 	}
-
-	e.memory.Set(0)
+	e.scans.closeAll()
 
 	return nil
 }

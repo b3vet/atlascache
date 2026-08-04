@@ -10,11 +10,17 @@ by hand, so this file reads as release notes rather than a commit log.
 
 ## [Unreleased]
 
-Nothing here is usable yet. The server starts and answers `PING`; data
-commands arrive in the next phase.
+The cache is usable from `redis-cli`: it stores, expires and evicts, and
+answers `SET`, `GET`, `DEL`, `TTL` and `EXPIRE` exactly as Redis does. The rest
+of the command set arrives in the next phase.
 
 ### Added
 
+- `SET key value [EX seconds | PX milliseconds]`, `GET`, `DEL`, `TTL` and
+  `EXPIRE`, wired to the storage engine, the TTL manager and the eviction
+  controller. Replies match Redis command for command, including a null bulk
+  string for a miss and the `-1`/`-2` distinction `TTL` draws between a key
+  with no expiry and no key at all.
 - A server binary, `atlascache`, that loads configuration, listens on the RESP
   port, answers `PING` and `QUIT`, serves `GET /health`, and shuts down
   gracefully on `SIGTERM`.

@@ -1,0 +1,29 @@
+version: 1
+name: evict-policies
+tier: full
+feature: FEAT-0017
+description: >
+  fifo, lfu and none each behave as specified, driven one after another against
+  the same server through the config hot-reload the policy already supports
+  (P1 section 5.2), since a spec runs one server process.
+
+  Each phase is arranged so the three policies disagree about the victim: the
+  key the active policy must take is not the one the other two would pick. A
+  phase that passed under the wrong policy would prove only that something was
+  evicted.
+
+config:
+  storage:
+    shard_count: 1
+    # Eight entries of 102 bytes fit; the ninth does not.
+    max_memory: "900"
+  eviction:
+    policy: fifo
+    sample_size: 100
+
+steps:
+  - scenario: evict_policies_behave_as_specified
+
+  # lru is covered by its own spec, and is the default the server ships with.
+  - cmd: PING
+    expect: PONG

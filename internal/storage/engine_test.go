@@ -160,34 +160,6 @@ func TestKeys(t *testing.T) {
 	})
 }
 
-func TestScan(t *testing.T) {
-	engine := NewShardedEngine(DefaultEngineConfig())
-	defer engine.Close()
-
-	// Set 100 keys
-	for i := 0; i < 100; i++ {
-		key := []byte(fmt.Sprintf("scan-key:%d", i))
-		require.NoError(t, engine.Set(key, []byte("value"), 0))
-	}
-
-	t.Run("scan all keys", func(t *testing.T) {
-		var allKeys [][]byte
-		var cursor uint64
-
-		for {
-			keys, nextCursor := engine.Scan(cursor, 10)
-			allKeys = append(allKeys, keys...)
-			cursor = nextCursor
-
-			if cursor == 0 {
-				break
-			}
-		}
-
-		assert.Equal(t, 100, len(allKeys))
-	})
-}
-
 func TestMemoryLimit(t *testing.T) {
 	cfg := EngineConfig{
 		ShardCount:   16,

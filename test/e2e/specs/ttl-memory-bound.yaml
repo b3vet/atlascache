@@ -1,0 +1,29 @@
+version: 1
+name: ttl-memory-bound
+tier: soak
+feature: FEAT-0017
+issue: ISSUE-0007
+description: >
+  Sustained TTL churn holds a steady memory footprint. Rounds of short-lived
+  keys are written against a budget that fits about one round, with eviction
+  off, so an engine that failed to reclaim even a fraction of each round would
+  run out of room within a few of them and start refusing writes.
+
+config:
+  storage:
+    shard_count: 1
+    max_memory: "32KB"
+  eviction:
+    policy: none
+  ttl:
+    check_interval: 50ms
+    active_expiration: true
+
+steps:
+  - scenario: ttl_churn_holds_steady_memory
+
+  - cmd: SET afterwards v
+    expect: OK
+
+  - cmd: GET afterwards
+    expect: v

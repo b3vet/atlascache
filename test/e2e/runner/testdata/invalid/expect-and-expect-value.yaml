@@ -1,0 +1,8 @@
+version: 1
+name: expect-and-expect-value
+tier: full
+feature: FEAT-0008
+steps:
+  - cmd: TTL k
+    expect: "5"
+    expect_value: ">= 5"

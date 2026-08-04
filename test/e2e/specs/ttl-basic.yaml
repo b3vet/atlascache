@@ -1,0 +1,73 @@
+version: 1
+name: ttl-basic
+tier: smoke
+feature: FEAT-0017
+issue: ISSUE-0007
+description: >
+  SET with an expiry, TTL counting down, and a key that goes away on its own.
+  Nothing reads the expiring key before it is due, so what removes it is active
+  expiration rather than a read that happened to notice.
+
+config:
+  ttl:
+    check_interval: 50ms
+
+steps:
+  # A key with no expiry reports -1, and a key that does not exist reports -2.
+  # Clients rely on the difference.
+  - cmd: SET plain value
+    expect: OK
+
+  - cmd: TTL plain
+    expect: -1
+
+  - cmd: TTL missing
+    expect: -2
+
+  - cmd: SET session token EX 100
+    expect: OK
+
+  # Rounded to the nearest second, as Redis does, so a key written with EX 100
+  # reads as 100 rather than 99.
+  - cmd: TTL session
+    expect: 100
+
+  - cmd: GET session
+    expect: token
+
+  - cmd: SET millis token PX 30000
+    expect: OK
+
+  - cmd: TTL millis
+    expect: 30
+
+  # The countdown is real: 1.2s later the remaining life has moved by a second.
+  - cmd: SET counting token EX 5
+    expect: OK
+
+  - cmd: TTL counting
+    expect: 5
+
+  - sleep: 1200ms
+
+  - cmd: TTL counting
+    expect: 4
+
+  # A short-lived key nothing ever reads.
+  - cmd: SET vanishing token PX 400
+    expect: OK
+
+  - sleep: 1200ms
+
+  - cmd: GET vanishing
+    expect: NIL
+
+  - cmd: TTL vanishing
+    expect: -2
+
+  # And the keys that were not due are untouched.
+  - cmd: GET plain
+    expect: value
+
+  - cmd: GET session
+    expect: token

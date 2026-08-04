@@ -21,6 +21,7 @@ func TestDefaults(t *testing.T) {
 	assert.Equal(t, 100*time.Millisecond, cfg.TTL.CheckInterval)
 	assert.True(t, cfg.TTL.LazyExpiration)
 	assert.True(t, cfg.TTL.ActiveExpiration)
+	assert.Equal(t, 10000, cfg.TTL.BatchSize)
 	assert.Equal(t, "lru", cfg.Eviction.Policy)
 	assert.Equal(t, 5, cfg.Eviction.SampleSize)
 	assert.Equal(t, "info", cfg.Logging.Level)
@@ -147,6 +148,24 @@ func TestValidation(t *testing.T) {
 		cfg.Logging.Level = "verbose"
 		err := Validate(cfg)
 		assert.Error(t, err)
+	})
+
+	// The batch bounds the work one wheel tick may do. Zero would stop active
+	// expiration reclaiming anything, which is ISSUE-0007 by configuration.
+	t.Run("ttl batch size", func(t *testing.T) {
+		for _, size := range []int{0, -1, 1_000_001} {
+			cfg := Defaults()
+			cfg.TTL.BatchSize = size
+
+			err := Validate(cfg)
+
+			require.Error(t, err, "batch_size %d", size)
+			assert.Contains(t, err.Error(), "ttl.batch_size")
+		}
+
+		cfg := Defaults()
+		cfg.TTL.BatchSize = 1
+		assert.NoError(t, Validate(cfg))
 	})
 
 	t.Run("invalid log format", func(t *testing.T) {

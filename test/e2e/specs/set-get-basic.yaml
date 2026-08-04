@@ -1,0 +1,107 @@
+version: 1
+name: set-get-basic
+tier: smoke
+feature: FEAT-0017
+description: >
+  SET, GET and DEL round-trip through the server: a value comes back byte for
+  byte, a miss is nil rather than an error, DEL counts what it actually removed,
+  and a mistyped command is answered rather than punished with a hang-up.
+
+config:
+  storage:
+    # Small enough that a spec can write a value over the limit without pasting
+    # a megabyte into a YAML file.
+    max_value_size: "64"
+
+steps:
+  - cmd: SET k1 hello
+    expect: OK
+
+  - cmd: GET k1
+    expect: hello
+
+  # A miss is the null bulk string. Clients read nil as "not cached" and an
+  # error as "the server is broken", and those are very different things.
+  - cmd: GET missing
+    expect: NIL
+
+  - cmd: SET k1 "hello world"
+    expect: OK
+
+  - cmd: GET k1
+    expect: hello world
+
+  # An empty value is a value, not an absence.
+  - cmd: SET k2 ""
+    expect: OK
+
+  - cmd: GET k2
+    expect: ""
+
+  # Binary-safe: a length-prefixed protocol carries what a line-based one could
+  # not.
+  - cmd: "SET k3 \"a\\r\\nb\\x00c\""
+    expect: OK
+
+  - cmd: GET k3
+    expect: "a\r\nb\x00c"
+
+  - cmd: DEL k1
+    expect: 1
+
+  - cmd: GET k1
+    expect: NIL
+
+  # Deleting what is not there removes nothing, and says so.
+  - cmd: DEL k1
+    expect: 0
+
+  - cmd: SET a 1
+    expect: OK
+
+  - cmd: SET b 2
+    expect: OK
+
+  # DEL counts only the keys it actually removed.
+  - cmd: DEL a b missing
+    expect: 2
+
+  # Command names are not case sensitive, as with PING in the skeleton.
+  - cmd: set lower case
+    expect: OK
+
+  - cmd: get lower
+    expect: case
+
+  # Every argument error is a reply, and the connection carries on: the steps
+  # after each one are what prove the session survived.
+  - cmd: SET
+    expect_error: "ERR wrong number of arguments for 'set' command"
+
+  - cmd: GET
+    expect_error: "ERR wrong number of arguments for 'get' command"
+
+  - cmd: GET a b
+    expect_error: "ERR wrong number of arguments for 'get' command"
+
+  - cmd: DEL
+    expect_error: "ERR wrong number of arguments for 'del' command"
+
+  - cmd: SET k v EX 1 PX 1000
+    expect_error: "ERR syntax error"
+
+  - cmd: SET k v EX later
+    expect_error: "ERR value is not an integer or out of range"
+
+  # A value over max_value_size is refused, and refusing it changes nothing.
+  - cmd: SET big aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    expect_error: "ERR value exceeds max_value_size"
+
+  - cmd: GET big
+    expect: NIL
+
+  - cmd: GET lower
+    expect: case
+
+  - cmd: PING
+    expect: PONG

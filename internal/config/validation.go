@@ -197,6 +197,22 @@ func validateTTL(cfg *TTLConfig) []*ValidationError {
 		})
 	}
 
+	// The batch bounds how much work one tick may do. A tick that expired
+	// everything it found could stall the wheel behind a mass expiry, and a
+	// batch of zero would never reclaim anything.
+	if cfg.BatchSize < 1 {
+		errs = append(errs, &ValidationError{
+			Field:   "ttl.batch_size",
+			Message: "must be >= 1",
+		})
+	}
+	if cfg.BatchSize > 1_000_000 {
+		errs = append(errs, &ValidationError{
+			Field:   "ttl.batch_size",
+			Message: "must be <= 1000000",
+		})
+	}
+
 	return errs
 }
 

@@ -53,6 +53,7 @@ type TTLConfig struct {
 	CheckInterval    time.Duration `mapstructure:"check_interval"`    // Time wheel tick
 	LazyExpiration   bool          `mapstructure:"lazy_expiration"`   // Check on access
 	ActiveExpiration bool          `mapstructure:"active_expiration"` // Background cleanup
+	BatchSize        int           `mapstructure:"batch_size"`        // Max keys expired per tick
 }
 
 // EvictionConfig contains eviction policy settings
@@ -92,6 +93,9 @@ func Defaults() *Config {
 			CheckInterval:    100 * time.Millisecond,
 			LazyExpiration:   true,
 			ActiveExpiration: true,
+			// Matches ttl.DefaultMaxHintsPerTick, the wheel's own bound on how
+			// much one tick may do.
+			BatchSize: 10000,
 		},
 		Eviction: EvictionConfig{
 			Policy:     "lru",

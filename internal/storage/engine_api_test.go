@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"fmt"
 	"testing"
 	"time"
 
@@ -63,9 +62,10 @@ func TestClosedEngineRejectsEverything(t *testing.T) {
 
 	assert.Nil(t, engine.Keys("*"))
 
-	keys, cursor := engine.Scan(0, 10)
+	keys, cursor, err := engine.Scan(1, ScanCursorStart, 10)
+	assert.ErrorIs(t, err, ErrEngineClosed)
 	assert.Nil(t, keys)
-	assert.Equal(t, uint64(0), cursor)
+	assert.Equal(t, ScanCursorStart, cursor)
 
 	assert.Equal(t, uint64(0), engine.MemoryUsed())
 }
@@ -126,8 +126,14 @@ func TestEngineCounters(t *testing.T) {
 	engine.SetMaxMemory(4096)
 	assert.Equal(t, uint64(4096), engine.MaxMemory())
 
-	engine.RecordExpiration()
-	engine.RecordExpiration()
+	for _, key := range []string{"doomed:1", "doomed:2"} {
+		require.NoError(t, engine.Set([]byte(key), []byte("v"), time.Millisecond))
+	}
+	time.Sleep(5 * time.Millisecond)
+	for _, key := range []string{"doomed:1", "doomed:2"} {
+		require.True(t, engine.DeleteExpired([]byte(key)))
+	}
+
 	engine.RecordEviction()
 
 	stats := engine.Stats()
@@ -136,13 +142,56 @@ func TestEngineCounters(t *testing.T) {
 	assert.Equal(t, uint64(4096), stats.MemoryMax)
 }
 
-func TestExpireKeysInShardBounds(t *testing.T) {
+// TestKeyspaceSeamBounds covers the ttl.Keyspace side of the engine. The shard
+// index comes back from a hint the manager may have held for days, so it is
+// bounds-checked rather than trusted.
+func TestKeyspaceSeamBounds(t *testing.T) {
 	engine := NewShardedEngine(EngineConfig{ShardCount: 4, MaxValueSize: 1024})
-	defer engine.Close()
 
-	assert.Equal(t, 0, engine.ExpireKeysInShard(-1, 0))
-	assert.Equal(t, 0, engine.ExpireKeysInShard(4, 0))
-	assert.Equal(t, 0, engine.ExpireKeysInShard(0, 0), "an empty shard expires nothing")
+	key := []byte("k")
+	require.NoError(t, engine.Set(key, []byte("v"), time.Millisecond))
+	idx := shardIndexOf(engine, key)
+
+	t.Run("out of range indexes answer as absent", func(t *testing.T) {
+		_, present := engine.ExpiryOf(-1, "k")
+		assert.False(t, present)
+
+		_, present = engine.ExpiryOf(4, "k")
+		assert.False(t, present)
+
+		assert.False(t, engine.Expire(-1, "k"))
+		assert.False(t, engine.Expire(4, "k"))
+	})
+
+	t.Run("a resident key reports its expiry", func(t *testing.T) {
+		expireAt, present := engine.ExpiryOf(idx, "k")
+		assert.True(t, present)
+		assert.Positive(t, expireAt)
+
+		_, present = engine.ExpiryOf(idx, "absent")
+		assert.False(t, present)
+	})
+
+	t.Run("a live key is not expired", func(t *testing.T) {
+		assert.False(t, engine.Expire(idx, "k"), "the deadline has not passed yet")
+	})
+
+	t.Run("an expired key is reclaimed once", func(t *testing.T) {
+		time.Sleep(5 * time.Millisecond)
+
+		assert.True(t, engine.Expire(idx, "k"))
+		assert.False(t, engine.Expire(idx, "k"))
+		assert.Equal(t, uint64(0), engine.MemoryUsed())
+	})
+
+	t.Run("a closed engine expires nothing", func(t *testing.T) {
+		require.NoError(t, engine.Close())
+
+		_, present := engine.ExpiryOf(idx, "k")
+		assert.False(t, present)
+		assert.False(t, engine.Expire(idx, "k"))
+		assert.False(t, engine.DeleteExpired(key))
+	})
 }
 
 func TestKeysPatternMatching(t *testing.T) {
@@ -168,44 +217,6 @@ func TestKeysPatternMatching(t *testing.T) {
 		assert.Len(t, engine.Keys("a[b*"), 1, "prefix")
 		assert.Len(t, engine.Keys("a[b"), 1, "equality")
 		assert.Empty(t, engine.Keys("z[q"))
-	})
-}
-
-func TestScanEdgeCases(t *testing.T) {
-	engine := NewShardedEngine(EngineConfig{ShardCount: 4, MaxValueSize: 1024})
-	defer engine.Close()
-
-	for i := 0; i < 20; i++ {
-		require.NoError(t, engine.Set([]byte(fmt.Sprintf("k%d", i)), []byte("v"), 0))
-	}
-
-	t.Run("non-positive count falls back to a default", func(t *testing.T) {
-		keys, _ := engine.Scan(0, 0)
-		assert.NotEmpty(t, keys)
-	})
-
-	t.Run("a cursor past the end terminates", func(t *testing.T) {
-		keys, cursor := engine.Scan(4*1000000, 10)
-		assert.Empty(t, keys)
-		assert.Equal(t, uint64(0), cursor)
-	})
-
-	// Iteration terminates and yields keys. It is deliberately not asserted to
-	// be duplicate-free: the positional cursor indexes into an unordered map
-	// walk, which is ISSUE-0011 and belongs to FEAT-0016.
-	t.Run("iteration terminates", func(t *testing.T) {
-		var yielded int
-		var cursor uint64
-		for i := 0; i < 100; i++ {
-			keys, next := engine.Scan(cursor, 3)
-			yielded += len(keys)
-			cursor = next
-			if cursor == 0 {
-				break
-			}
-		}
-		assert.Equal(t, uint64(0), cursor, "the scan ran to completion")
-		assert.Positive(t, yielded)
 	})
 }
 

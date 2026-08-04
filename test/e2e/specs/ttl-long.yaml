@@ -1,0 +1,91 @@
+version: 1
+name: ttl-long
+tier: full
+feature: FEAT-0017
+description: >
+  TTLs beyond the first wheel level are stored, reported and honoured through
+  the levels above it. The tick is 10ms here, which puts L0's span at 2.56s,
+  L1's at ~164s, L2's at ~2.9h and L3's at ~3.9d, so a spec can reach every
+  level and the overflow list without waiting days for one.
+
+  The scenario is the part with teeth: keys scheduled beyond L0 must be
+  reclaimed by the cascade, not merely reported as gone.
+
+config:
+  storage:
+    shard_count: 1
+    max_memory: "64KB"
+  eviction:
+    # Nothing may make room by evicting, so the only way memory comes back is
+    # for the wheel to reclaim what expired.
+    policy: none
+  ttl:
+    check_interval: 10ms
+
+steps:
+  # One key per level, each written with a TTL that cannot fit the level below.
+  - cmd: SET lvl0 v PX 600
+    expect: OK
+
+  - cmd: SET lvl1 v PX 5000
+    expect: OK
+
+  - cmd: TTL lvl1
+    expect: 5
+
+  - cmd: SET lvl2 v EX 300
+    expect: OK
+
+  - cmd: TTL lvl2
+    expect: 300
+
+  - cmd: SET lvl3 v EX 20000
+    expect: OK
+
+  - cmd: TTL lvl3
+    expect: 20000
+
+  # Past L3's span entirely: the overflow list, re-inserted as it comes into
+  # range.
+  - cmd: SET overflow v EX 400000
+    expect: OK
+
+  - cmd: TTL overflow
+    expect: 400000
+
+  # L0's key is due; nothing above it is.
+  - sleep: 1s
+
+  - cmd: GET lvl0
+    expect: NIL
+
+  - cmd: GET lvl1
+    expect: v
+
+  - cmd: GET lvl2
+    expect: v
+
+  - cmd: GET lvl3
+    expect: v
+
+  - cmd: GET overflow
+    expect: v
+
+  # And the L1 key expires when it is due, rather than early or never.
+  - sleep: 4500ms
+
+  - cmd: GET lvl1
+    expect: NIL
+
+  - cmd: GET lvl2
+    expect: v
+
+  - cmd: GET overflow
+    expect: v
+
+  # Memory scheduled through L1 comes back on its own, which only the cascade
+  # into L0 can do.
+  - scenario: ttl_reclaims_memory_through_higher_levels
+
+  - cmd: GET lvl3
+    expect: v

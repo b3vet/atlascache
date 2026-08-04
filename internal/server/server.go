@@ -5,23 +5,35 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 
 	"github.com/rs/zerolog"
 
 	"github.com/b3vet/atlascache/internal/protocol"
 )
 
-// Server serves RESP commands over a Transport. The walking skeleton answers
-// PING and QUIT only; every other command is an error (FEAT-0010).
+// Server serves RESP commands over a Transport, against the keyspace it is
+// given. The skeleton answered PING and QUIT only (FEAT-0010); P1 adds the five
+// data commands that make the engine observable from outside the process
+// (FEAT-0017).
 type Server struct {
 	transport Transport
 	codec     protocol.Codec
+	store     Store
 	addr      string
 	log       zerolog.Logger
 }
 
-// New binds the client port and returns a server ready to Serve
-func New(ctx context.Context, addr string, log zerolog.Logger) (*Server, error) {
+// New binds the client port and returns a server ready to Serve.
+//
+// The store is required: a server with no keyspace could answer PING and
+// nothing else, which is a wiring mistake worth failing at startup rather than
+// discovering one GET later.
+func New(ctx context.Context, addr string, log zerolog.Logger, store Store) (*Server, error) {
+	if store == nil {
+		return nil, errors.New("server: a keyspace is required")
+	}
+
 	transport, err := newNetTransport(ctx, addr, log)
 	if err != nil {
 		return nil, err
@@ -30,6 +42,7 @@ func New(ctx context.Context, addr string, log zerolog.Logger) (*Server, error) 
 	return &Server{
 		transport: transport,
 		codec:     protocol.NewRESP(),
+		store:     store,
 		addr:      transport.Addr(),
 		log:       log,
 	}, nil
@@ -77,25 +90,22 @@ func (s *Server) Handle(ctx context.Context, c Conn) {
 }
 
 // dispatch resolves a command to a reply, reporting whether the connection
-// should close afterwards
+// should close afterwards.
+//
+// Every failure here is a reply and not a hang-up: an unknown command, a wrong
+// argument count and a malformed argument all leave the session usable, because
+// a client that mistypes one command has not lost the right to send the next
+// one. Only a request the codec cannot resynchronize after closes a connection.
 func (s *Server) dispatch(cmd protocol.Command) (protocol.Reply, bool) {
-	switch cmd.Name {
-	case "PING":
-		switch len(cmd.Args) {
-		case 0:
-			return protocol.SimpleString("PONG"), false
-		case 1:
-			return protocol.BulkString(cmd.Args[0]), false
-		default:
-			return protocol.Errorf("wrong number of arguments for 'ping' command"), false
-		}
-
-	case "QUIT":
-		return protocol.SimpleString("OK"), true
-
-	default:
+	spec, known := commands[cmd.Name]
+	if !known {
 		return protocol.Errorf("unknown command '%s'", cmd.Name), false
 	}
+	if !spec.accepts(len(cmd.Args)) {
+		return protocol.Errorf("wrong number of arguments for '%s' command", strings.ToLower(cmd.Name)), false
+	}
+
+	return spec.handler(s, cmd), spec.closes
 }
 
 func (s *Server) reply(c Conn, reply protocol.Reply) error {

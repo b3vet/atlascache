@@ -1,0 +1,29 @@
+version: 1
+name: ttl-update
+tier: full
+feature: FEAT-0017
+description: >
+  Extending a TTL keeps the key alive past the deadline it was first given.
+  The wheel still holds a hint for the original deadline — there is no way to
+  remove one (ADR-0016) — so this is the stale-hint path: the manager must
+  re-read the entry when the hint fires and drop it, rather than expiring live
+  data on a schedule that has since changed.
+
+config:
+  ttl:
+    # Fast enough that the stale hint has certainly fired inside the scenario's
+    # window rather than merely being due.
+    check_interval: 20ms
+
+steps:
+  - cmd: SET before v
+    expect: OK
+
+  - scenario: ttl_extension_outlives_its_hint
+
+  # A key that was never given an expiry is not disturbed by any of it.
+  - cmd: GET before
+    expect: v
+
+  - cmd: TTL before
+    expect: -1

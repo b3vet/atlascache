@@ -131,9 +131,36 @@ func assertReply(step Step, reply Reply) assertion {
 	case len(step.ExpectField) > 0:
 		return assertFields(step.ExpectField, reply)
 
+	case step.ExpectValue.Set:
+		return assertValue(step.ExpectValue.Text, reply)
+
 	default:
 		return assertionFailed("step has no assertion", "", reply.String())
 	}
+}
+
+// assertValue applies a comparator to the whole reply, for scalars that are
+// correct within a range rather than exactly. A TTL read back a moment after it
+// was set is the motivating case: asserting it equals exactly what was written
+// races the second boundary, and a gate that fails at random gets rerun rather
+// than read.
+func assertValue(expr string, reply Reply) assertion {
+	if reply.Kind == KindError {
+		return assertionFailed("the server returned an error", expr, "error: "+reply.Text)
+	}
+	cmp, err := parseComparison(expr)
+	if err != nil {
+		return assertionFailed("expect_value: "+err.Error(), expr, "")
+	}
+	actual := reply.String()
+	ok, err := cmp.match(actual)
+	if err != nil {
+		return assertionFailed("expect_value: "+err.Error(), cmp.describe(), actual)
+	}
+	if !ok {
+		return assertionFailed("value did not match expect_value", cmp.describe(), actual)
+	}
+	return assertionPassed()
 }
 
 func assertFields(want map[string]Value, reply Reply) assertion {

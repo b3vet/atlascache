@@ -1,0 +1,20 @@
+version: 1
+name: storage-buffer-reuse
+tier: full
+feature: FEAT-0017
+issue: ISSUE-0009
+description: >
+  Values larger than a connection's read buffer, written one after another down
+  the same connection, must not overwrite each other. An engine that retained
+  the caller's slice rather than copying it would corrupt stored data silently
+  as later requests reuse the buffer.
+
+steps:
+  - scenario: stored_values_survive_buffer_reuse
+
+  # The connection that carried 24KB values is still good for ordinary traffic.
+  - cmd: SET buf:z small
+    expect: OK
+
+  - cmd: GET buf:z
+    expect: small

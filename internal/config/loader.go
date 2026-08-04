@@ -118,6 +118,7 @@ func (l *Loader) setDefaults() {
 	l.v.SetDefault("ttl.check_interval", defaults.TTL.CheckInterval)
 	l.v.SetDefault("ttl.lazy_expiration", defaults.TTL.LazyExpiration)
 	l.v.SetDefault("ttl.active_expiration", defaults.TTL.ActiveExpiration)
+	l.v.SetDefault("ttl.batch_size", defaults.TTL.BatchSize)
 
 	// Eviction defaults
 	l.v.SetDefault("eviction.policy", defaults.Eviction.Policy)

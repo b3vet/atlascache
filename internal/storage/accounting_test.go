@@ -36,6 +36,11 @@ func assertAccounting(t *testing.T, engine *ShardedEngine) {
 	assert.Equal(t, actual, counted,
 		"keysWithTTL must equal the number of resident entries with an expiry")
 	assert.Equal(t, uint64(actual), engine.Stats().KeysWithTTL)
+
+	if limit := engine.MaxMemory(); limit > 0 {
+		assert.LessOrEqual(t, engine.MemoryUsed(), limit,
+			"max_memory is a hard limit, so no path may leave it exceeded")
+	}
 }
 
 func TestAccountingInvariant(t *testing.T) {
@@ -123,10 +128,27 @@ func TestAccountingInvariant(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 
 		reaped := 0
-		for idx := range engine.GetAllShards() {
-			reaped += engine.ExpireKeysInShard(idx, 0)
+		for i := 0; i < 20; i++ {
+			key := []byte(fmt.Sprintf("doomed:%d", i))
+			if engine.Expire(shardIndexOf(engine, key), string(key)) {
+				reaped++
+			}
 		}
 		assert.Equal(t, 20, reaped)
+		assertAccounting(t, engine)
+	})
+
+	t.Run("after evict", func(t *testing.T) {
+		for i := 0; i < 20; i++ {
+			require.NoError(t, engine.Set([]byte(fmt.Sprintf("victim:%d", i)), []byte("value"), 0))
+		}
+		assertAccounting(t, engine)
+
+		for i := 0; i < 20; i++ {
+			key := []byte(fmt.Sprintf("victim:%d", i))
+			assert.True(t, engine.GetShard(key).evict(string(key)))
+		}
+		assert.Equal(t, uint64(20), engine.Stats().Evictions)
 		assertAccounting(t, engine)
 	})
 
@@ -144,7 +166,10 @@ func TestAccountingInvariant(t *testing.T) {
 		for _, shard := range engine.GetAllShards() {
 			shard.Clear()
 		}
-		engine.memory.Set(0)
+		// Deliberately not zeroing the tracker by hand: Clear returns each
+		// shard's bytes to it, and this is where that would show up if it did
+		// not.
+		assert.Equal(t, uint64(0), engine.MemoryUsed())
 		assertAccounting(t, engine)
 		assert.Equal(t, uint64(0), engine.Stats().KeysWithTTL)
 	})
@@ -241,34 +266,35 @@ func TestStatsKeysWithTTLTransitionsThroughEngine(t *testing.T) {
 // replaced skipped expired ones — so an expired-but-unreaped key is the visible
 // fingerprint of which implementation is in place. Stats().Keys has always
 // counted such entries, so this also makes the two figures agree.
+//
+// Lazy expiration is off here for the same reason: with it on the read would
+// reclaim the entry, and there would be no unreaped key to tell the two
+// implementations apart.
 func TestStatsCountsFromCountersNotTraversal(t *testing.T) {
-	engine := NewShardedEngine(EngineConfig{ShardCount: 4, MaxValueSize: 1024})
+	engine := NewShardedEngine(EngineConfig{ShardCount: 4, MaxValueSize: 1024, DisableLazyExpiration: true})
 	defer engine.Close()
 
-	require.NoError(t, engine.Set([]byte("resident"), []byte("value"), time.Millisecond))
+	key := []byte("resident")
+	require.NoError(t, engine.Set(key, []byte("value"), time.Millisecond))
 	time.Sleep(5 * time.Millisecond)
 
-	_, _, exists := engine.Get([]byte("resident"))
+	_, _, exists := engine.Get(key)
 	require.False(t, exists, "the key reads as gone")
 
 	stats := engine.Stats()
 	assert.Equal(t, uint64(1), stats.Keys, "but it is still resident until reaped")
 	assert.Equal(t, uint64(1), stats.KeysWithTTL, "so it still counts toward KeysWithTTL")
 
-	require.Equal(t, 1, engine.ExpireKeysInShard(int(xxhashShard(engine, []byte("resident"))), 0))
+	require.True(t, engine.Expire(shardIndexOf(engine, key), string(key)))
 
 	stats = engine.Stats()
 	assert.Equal(t, uint64(0), stats.Keys)
 	assert.Equal(t, uint64(0), stats.KeysWithTTL)
 }
 
-// xxhashShard reports the index of the shard a key lands in.
-func xxhashShard(engine *ShardedEngine, key []byte) uint64 {
-	target := engine.GetShard(key)
-	for i, shard := range engine.GetAllShards() {
-		if shard == target {
-			return uint64(i)
-		}
-	}
-	return 0
+// shardIndexOf reports the index of the shard a key lands in, which is what the
+// TTL manager is handed and hands back.
+func shardIndexOf(engine *ShardedEngine, key []byte) int {
+	idx, _ := engine.shardFor(key)
+	return idx
 }

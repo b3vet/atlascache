@@ -1,0 +1,36 @@
+version: 1
+name: ttl-reclaim
+tier: full
+feature: FEAT-0017
+issue: ISSUE-0007
+description: >
+  Expired keys give their memory back. This is the ISSUE-0007 regression: the
+  engine used to detect expiry on read and report a miss while leaving the entry
+  in place, so every TTL'd key leaked permanently and max_memory was eventually
+  consumed by keys that no longer existed.
+
+  Memory has no command of its own until P2, so it is measured the way a client
+  feels it: eviction is off and max_memory is small, making the keyspace a fixed
+  budget that the scenario spends, waits out, and spends again. Nothing reads
+  the expiring keys, so active expiration is the only thing that can reclaim
+  them — turn ttl.active_expiration off and this spec fails.
+
+config:
+  storage:
+    shard_count: 1
+    max_memory: "128KB"
+  eviction:
+    policy: none
+  ttl:
+    check_interval: 50ms
+    active_expiration: true
+
+steps:
+  - scenario: ttl_reclaims_memory
+
+  # The server is still healthy on the far side of a full cache twice over.
+  - cmd: SET afterwards v
+    expect: OK
+
+  - cmd: GET afterwards
+    expect: v

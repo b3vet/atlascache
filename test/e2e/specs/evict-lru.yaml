@@ -1,0 +1,92 @@
+version: 1
+name: evict-lru
+tier: full
+feature: FEAT-0017
+description: >
+  Under max_memory the lru policy drops the key nothing has read for longest.
+
+  One shard and a sample size larger than the keyspace make the choice exact:
+  eviction samples rather than orders (ADR-0012), and a sample that covers
+  everything resident turns "the worst of a sample" into "the worst there is",
+  which is the only way to assert a specific victim rather than merely that
+  something was taken.
+
+config:
+  storage:
+    shard_count: 1
+    # Eight entries of 102 bytes fit; the ninth does not.
+    max_memory: "900"
+  eviction:
+    policy: lru
+    sample_size: 100
+
+steps:
+  - cmd: SET k1 vvvvvvvvvvvvvvvvvvvv
+    expect: OK
+  - cmd: SET k2 vvvvvvvvvvvvvvvvvvvv
+    expect: OK
+  - cmd: SET k3 vvvvvvvvvvvvvvvvvvvv
+    expect: OK
+  - cmd: SET k4 vvvvvvvvvvvvvvvvvvvv
+    expect: OK
+  - cmd: SET k5 vvvvvvvvvvvvvvvvvvvv
+    expect: OK
+  - cmd: SET k6 vvvvvvvvvvvvvvvvvvvv
+    expect: OK
+  - cmd: SET k7 vvvvvvvvvvvvvvvvvvvv
+    expect: OK
+  - cmd: SET k8 vvvvvvvvvvvvvvvvvvvv
+    expect: OK
+
+  # Everything still fits, so nothing has been evicted yet.
+  - cmd: GET k8
+    expect: vvvvvvvvvvvvvvvvvvvv
+
+  # Read every key except k8, oldest first. k8 was written last but has now gone
+  # longest without a read, which is what makes it the victim.
+  - cmd: GET k1
+    expect: vvvvvvvvvvvvvvvvvvvv
+  - cmd: GET k2
+    expect: vvvvvvvvvvvvvvvvvvvv
+  - cmd: GET k3
+    expect: vvvvvvvvvvvvvvvvvvvv
+  - cmd: GET k4
+    expect: vvvvvvvvvvvvvvvvvvvv
+  - cmd: GET k5
+    expect: vvvvvvvvvvvvvvvvvvvv
+  - cmd: GET k6
+    expect: vvvvvvvvvvvvvvvvvvvv
+  - cmd: GET k7
+    expect: vvvvvvvvvvvvvvvvvvvv
+
+  # The ninth entry does not fit, so this write makes room for itself.
+  - cmd: SET k9 vvvvvvvvvvvvvvvvvvvv
+    expect: OK
+
+  - cmd: GET k8
+    expect: NIL
+
+  # And it took exactly what it needed: everything else is still here.
+  - cmd: GET k1
+    expect: vvvvvvvvvvvvvvvvvvvv
+  - cmd: GET k7
+    expect: vvvvvvvvvvvvvvvvvvvv
+  - cmd: GET k9
+    expect: vvvvvvvvvvvvvvvvvvvv
+
+  # The reads above moved k1, k7 and k9 to the front, so k2 is now the coldest
+  # resident key and is the next to go.
+  - cmd: SET k10 vvvvvvvvvvvvvvvvvvvv
+    expect: OK
+
+  - cmd: GET k2
+    expect: NIL
+
+  - cmd: GET k1
+    expect: vvvvvvvvvvvvvvvvvvvv
+
+  - cmd: GET k9
+    expect: vvvvvvvvvvvvvvvvvvvv
+
+  - cmd: GET k10
+    expect: vvvvvvvvvvvvvvvvvvvv

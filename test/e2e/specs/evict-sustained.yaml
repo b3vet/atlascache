@@ -1,0 +1,24 @@
+version: 1
+name: evict-sustained
+tier: soak
+feature: FEAT-0017
+description: >
+  Writes at the memory limit, sustained over time rather than in one burst, stay
+  bounded. A leak in the accounting between the shard counters and the global
+  tracker would show up here as a resident set that keeps growing, or as writes
+  that start being refused once the tracker has drifted past a limit the cache
+  is not really at.
+
+config:
+  storage:
+    shard_count: 1
+    max_memory: "900"
+  eviction:
+    policy: lru
+    sample_size: 100
+
+steps:
+  - scenario: evict_sustained_writes_stay_bounded
+
+  - cmd: PING
+    expect: PONG
