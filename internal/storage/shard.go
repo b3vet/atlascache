@@ -3,6 +3,7 @@ package storage
 import (
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Shard represents a single partition of the storage
@@ -12,6 +13,14 @@ type Shard struct {
 
 	// Memory tracking
 	memoryUsed uint64
+
+	// keysWithTTL counts resident entries carrying an expiry. It is maintained
+	// incrementally at every transition rather than recomputed, so Stats() does
+	// not walk the keyspace (ISSUE-0012). Every adjustment happens under the
+	// write lock; it is atomic only so readers need not take the lock. Signed
+	// deliberately: a missed transition then shows up as a negative count
+	// rather than as an enormous unsigned one.
+	keysWithTTL atomic.Int64
 
 	// Statistics (atomic)
 	gets    uint64
@@ -23,13 +32,14 @@ type Shard struct {
 
 // ShardStats holds statistics for a single shard
 type ShardStats struct {
-	Keys       int
-	MemoryUsed uint64
-	Gets       uint64
-	Sets       uint64
-	Deletes    uint64
-	Hits       uint64
-	Misses     uint64
+	Keys        int
+	KeysWithTTL int64
+	MemoryUsed  uint64
+	Gets        uint64
+	Sets        uint64
+	Deletes     uint64
+	Hits        uint64
+	Misses      uint64
 }
 
 // NewShard creates a new shard with the given initial capacity
@@ -67,46 +77,96 @@ func (s *Shard) Get(key string) (*Entry, bool) {
 	return entry, true
 }
 
-// Set stores a value in the shard
-// Returns the old entry if it existed, and whether an old entry was replaced
-func (s *Shard) Set(key string, entry *Entry) (*Entry, bool) {
+// Set stores a value in the shard, replacing whatever held the key.
+//
+// Returns the entry that was already under the key and whether there was one.
+// SetNX returns the same shape and gives the two results the same meaning; the
+// asymmetry between them was the root cause of ISSUE-0010.
+func (s *Shard) Set(key string, entry *Entry) (old *Entry, existed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	old, existed := s.data[key]
-	s.data[key] = entry
-
-	// Update memory tracking
+	old, existed = s.data[key]
 	if existed {
-		s.memoryUsed -= uint64(old.Size)
+		s.release(old)
 	}
-	s.memoryUsed += uint64(entry.Size)
+	s.store(key, entry)
 
 	atomic.AddUint64(&s.sets, 1)
 
 	return old, existed
 }
 
-// SetNX stores a value only if the key does not exist
-// Returns true if the value was set, false if key already exists
-func (s *Shard) SetNX(key string, entry *Entry) bool {
+// SetNX stores a value only if no live entry holds the key.
+//
+// Returns the entry that was already under the key and whether that entry
+// blocked the write. An expired entry does not block: it is displaced and
+// returned with existed false, so the caller can subtract its size from the
+// global tracker the way it does after Set. Nothing is stored when existed is
+// true, and the returned entry must not be subtracted in that case.
+func (s *Shard) SetNX(key string, entry *Entry) (old *Entry, existed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	existing, exists := s.data[key]
-	if exists && !existing.IsExpired() {
+	old, present := s.data[key]
+	if present && !old.IsExpired() {
+		return old, true
+	}
+
+	if present {
+		s.release(old)
+	}
+	s.store(key, entry)
+
+	atomic.AddUint64(&s.sets, 1)
+
+	return old, false
+}
+
+// store inserts an entry and takes on its accounting.
+// The caller must hold the write lock and have released any entry it displaces.
+func (s *Shard) store(key string, entry *Entry) {
+	s.data[key] = entry
+	s.memoryUsed += uint64(entry.Size)
+	if entry.HasTTL() {
+		s.keysWithTTL.Add(1)
+	}
+}
+
+// release drops the accounting for an entry leaving the shard.
+// The caller must hold the write lock and remove the entry itself: release is
+// used both by deletion and by the overwrite paths, which replace rather than
+// delete the map slot.
+func (s *Shard) release(entry *Entry) {
+	s.memoryUsed -= uint64(entry.Size)
+	if entry.HasTTL() {
+		s.keysWithTTL.Add(-1)
+	}
+}
+
+// SetTTL updates the expiry of a live entry, reporting whether it found one.
+//
+// This runs under the write lock rather than beside it: keysWithTTL is derived
+// from the before/after state of the entry's expiry, and two concurrent
+// updates reading the same "had no TTL" would each add one.
+func (s *Shard) SetTTL(key string, ttl time.Duration) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	entry, exists := s.data[key]
+	if !exists || entry.IsExpired() {
 		return false
 	}
 
-	// If there was an expired entry, clean it up
-	if exists {
-		s.memoryUsed -= uint64(existing.Size)
+	had := entry.HasTTL()
+	entry.UpdateExpiry(ttl)
+
+	switch has := entry.HasTTL(); {
+	case !had && has:
+		s.keysWithTTL.Add(1)
+	case had && !has:
+		s.keysWithTTL.Add(-1)
 	}
-
-	s.data[key] = entry
-	s.memoryUsed += uint64(entry.Size)
-
-	atomic.AddUint64(&s.sets, 1)
 
 	return true
 }
@@ -120,7 +180,7 @@ func (s *Shard) Delete(key string) (*Entry, bool) {
 	entry, exists := s.data[key]
 	if exists {
 		delete(s.data, key)
-		s.memoryUsed -= uint64(entry.Size)
+		s.release(entry)
 		atomic.AddUint64(&s.deletes, 1)
 	}
 
@@ -167,6 +227,12 @@ func (s *Shard) MemoryUsed() uint64 {
 	return s.memoryUsed
 }
 
+// KeysWithTTL returns the number of resident entries carrying an expiry,
+// including entries that have expired but not yet been reaped.
+func (s *Shard) KeysWithTTL() int64 {
+	return s.keysWithTTL.Load()
+}
+
 // Keys returns all non-expired keys in this shard
 func (s *Shard) Keys() []string {
 	s.mu.RLock()
@@ -193,23 +259,25 @@ func (s *Shard) AllKeys() []string {
 	return keys
 }
 
-// ExpireKeys removes expired keys and returns count
-func (s *Shard) ExpireKeys(maxCount int) int {
+// ExpireKeys removes expired keys, returning how many went and how many bytes
+// they freed so the caller can settle the global memory tracker.
+func (s *Shard) ExpireKeys(maxCount int) (expired int, freed uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	expired := 0
 	for key, entry := range s.data {
-		if entry.IsExpired() {
-			delete(s.data, key)
-			s.memoryUsed -= uint64(entry.Size)
-			expired++
-			if maxCount > 0 && expired >= maxCount {
-				break
-			}
+		if !entry.IsExpired() {
+			continue
+		}
+		delete(s.data, key)
+		s.release(entry)
+		freed += uint64(entry.Size)
+		expired++
+		if maxCount > 0 && expired >= maxCount {
+			break
 		}
 	}
-	return expired
+	return expired, freed
 }
 
 // Sample returns a random sample of entries for eviction
@@ -252,13 +320,14 @@ func (s *Shard) Stats() ShardStats {
 	s.mu.RUnlock()
 
 	return ShardStats{
-		Keys:       keyCount,
-		MemoryUsed: memUsed,
-		Gets:       atomic.LoadUint64(&s.gets),
-		Sets:       atomic.LoadUint64(&s.sets),
-		Deletes:    atomic.LoadUint64(&s.deletes),
-		Hits:       atomic.LoadUint64(&s.hits),
-		Misses:     atomic.LoadUint64(&s.misses),
+		Keys:        keyCount,
+		KeysWithTTL: s.keysWithTTL.Load(),
+		MemoryUsed:  memUsed,
+		Gets:        atomic.LoadUint64(&s.gets),
+		Sets:        atomic.LoadUint64(&s.sets),
+		Deletes:     atomic.LoadUint64(&s.deletes),
+		Hits:        atomic.LoadUint64(&s.hits),
+		Misses:      atomic.LoadUint64(&s.misses),
 	}
 }
 
@@ -269,4 +338,5 @@ func (s *Shard) Clear() {
 
 	s.data = make(map[string]*Entry)
 	s.memoryUsed = 0
+	s.keysWithTTL.Store(0)
 }

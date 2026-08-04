@@ -9,12 +9,46 @@ import (
 	"github.com/cespare/xxhash/v2"
 )
 
-// StorageEngine defines the interface for the key-value storage
+// StorageEngine defines the interface for the key-value storage.
+//
+// # Ownership of key and value bytes (ADR-0013)
+//
+// Writes copy. Set and SetNX copy the key and value into memory the entry
+// owns, so a caller may reuse its buffers the instant the call returns — which
+// is what a connection handler reading into a shared buffer needs.
+//
+// Reads do not copy. Get returns the engine's own slice, under a contract the
+// caller must honor:
+//
+//   - do not mutate the returned slice; it is the stored value, and writing to
+//     it corrupts the cache from what looks like a read-only operation;
+//   - do not retain it past the current operation; copy it if it must outlive
+//     the request.
+//
+// This is safe because no code path mutates a live entry's backing array. Set
+// builds a new Entry and swaps the map pointer rather than writing over the
+// old one, so a reader holding a superseded view sees valid, if stale, bytes,
+// and the garbage collector keeps the array alive for as long as the view
+// does. Expiration and eviction likewise only drop references.
+//
+// That invariant is load-bearing, not incidental. Any in-place update path — an
+// APPEND command, a value patched in place, a pooled entry buffer — breaks the
+// read contract for every concurrent reader and cannot be added without
+// revisiting ADR-0013.
 type StorageEngine interface {
-	// Basic operations
+	// Get returns the stored value as a read-only view owned by the engine.
+	// The caller must neither mutate the result nor retain it past the current
+	// operation. See the ownership note on this interface.
 	Get(key []byte) (value []byte, ttl time.Duration, exists bool)
+
+	// Set stores a copy of key and value. The caller may reuse both buffers as
+	// soon as it returns.
 	Set(key, value []byte, ttl time.Duration) error
+
+	// SetNX stores a copy of key and value if no live entry holds the key,
+	// under the same memory limit as Set.
 	SetNX(key, value []byte, ttl time.Duration) (bool, error)
+
 	Delete(key []byte) bool
 	Exists(key []byte) bool
 
@@ -73,6 +107,8 @@ func DefaultEngineConfig() EngineConfig {
 		MaxValueSize: 1 * 1024 * 1024, // 1MB
 	}
 }
+
+var _ StorageEngine = (*ShardedEngine)(nil)
 
 // ShardedEngine implements StorageEngine with sharding for concurrency
 type ShardedEngine struct {
@@ -135,7 +171,9 @@ func (e *ShardedEngine) getShard(key []byte) *Shard {
 	return e.shards[hash&e.shardMask]
 }
 
-// Get retrieves a value from the storage
+// Get retrieves a value from the storage.
+// The returned slice is the engine's own memory: read-only to the caller, and
+// valid only for the current operation. See the StorageEngine ownership note.
 func (e *ShardedEngine) Get(key []byte) (value []byte, ttl time.Duration, exists bool) {
 	if atomic.LoadInt32(&e.closed) == 1 {
 		return nil, 0, false
@@ -150,34 +188,58 @@ func (e *ShardedEngine) Get(key []byte) (value []byte, ttl time.Duration, exists
 	return entry.Value, entry.TTL(), true
 }
 
-// Set stores a value with optional TTL
-func (e *ShardedEngine) Set(key, value []byte, ttl time.Duration) error {
+// validateWrite runs the checks Set and SetNX share, and builds the entry.
+func (e *ShardedEngine) validateWrite(key, value []byte, ttl time.Duration) (*Entry, error) {
 	if atomic.LoadInt32(&e.closed) == 1 {
-		return ErrEngineClosed
+		return nil, ErrEngineClosed
 	}
 
 	if len(key) == 0 {
-		return ErrInvalidKey
+		return nil, ErrInvalidKey
 	}
 
 	if uint64(len(value)) > e.maxValueSize {
-		return ErrValueTooLarge
+		return nil, ErrValueTooLarge
 	}
 
 	if ttl < 0 {
-		return ErrInvalidTTL
+		return nil, ErrInvalidTTL
 	}
 
-	entry := NewEntry(key, value, ttl)
+	return NewEntry(key, value, ttl), nil
+}
 
-	// Check memory before setting
-	if e.memory.GetMaxMemory() > 0 {
-		newSize := uint64(entry.Size)
-		if e.memory.GetUsedMemory()+newSize > e.memory.GetMaxMemory() {
-			// Memory would exceed limit - caller should handle eviction
-			e.memory.RecordOOMRejection()
-			return ErrOutOfMemory
-		}
+// admit is the single place max_memory is enforced, shared by Set and SetNX so
+// the two cannot diverge the way they did in ISSUE-0010.
+//
+// FEAT-0013 takes this over: it makes room by evicting instead of rejecting,
+// and widens the signature to admit(shard *Shard, entry *Entry) error so the
+// eviction controller can sample the shard the entry is bound for. Both call
+// sites already pass through here, so that change stays inside this function.
+func (e *ShardedEngine) admit(entry *Entry) error {
+	maxMemory := e.memory.GetMaxMemory()
+	if maxMemory == 0 {
+		return nil
+	}
+
+	if e.memory.GetUsedMemory()+uint64(entry.Size) > maxMemory {
+		// Memory would exceed limit - caller should handle eviction
+		e.memory.RecordOOMRejection()
+		return ErrOutOfMemory
+	}
+
+	return nil
+}
+
+// Set stores a value with optional TTL
+func (e *ShardedEngine) Set(key, value []byte, ttl time.Duration) error {
+	entry, err := e.validateWrite(key, value, ttl)
+	if err != nil {
+		return err
+	}
+
+	if err := e.admit(entry); err != nil {
+		return err
 	}
 
 	shard := e.getShard(key)
@@ -192,32 +254,30 @@ func (e *ShardedEngine) Set(key, value []byte, ttl time.Duration) error {
 	return nil
 }
 
-// SetNX sets a value only if the key does not exist
+// SetNX sets a value only if no live entry holds the key
 func (e *ShardedEngine) SetNX(key, value []byte, ttl time.Duration) (bool, error) {
-	if atomic.LoadInt32(&e.closed) == 1 {
-		return false, ErrEngineClosed
+	entry, err := e.validateWrite(key, value, ttl)
+	if err != nil {
+		return false, err
 	}
 
-	if len(key) == 0 {
-		return false, ErrInvalidKey
+	if err := e.admit(entry); err != nil {
+		return false, err
 	}
-
-	if uint64(len(value)) > e.maxValueSize {
-		return false, ErrValueTooLarge
-	}
-
-	if ttl < 0 {
-		return false, ErrInvalidTTL
-	}
-
-	entry := NewEntry(key, value, ttl)
 
 	shard := e.getShard(key)
-	if !shard.SetNX(string(key), entry) {
+	old, existed := shard.SetNX(string(key), entry)
+	if existed {
 		return false, nil
 	}
 
+	// An expired entry may have been displaced; the shard has already dropped
+	// it from its own counter, so the global tracker has to hear about it too.
+	if old != nil {
+		e.memory.Sub(uint64(old.Size))
+	}
 	e.memory.Add(uint64(entry.Size))
+
 	return true, nil
 }
 
@@ -268,14 +328,7 @@ func (e *ShardedEngine) SetTTL(key []byte, ttl time.Duration) bool {
 		return false
 	}
 
-	shard := e.getShard(key)
-	entry, exists := shard.GetEntry(string(key))
-	if !exists {
-		return false
-	}
-
-	entry.UpdateExpiry(ttl)
-	return true
+	return e.getShard(key).SetTTL(string(key), ttl)
 }
 
 // GetEntry returns the entry for internal use
@@ -407,24 +460,19 @@ func (e *ShardedEngine) Stats() Stats {
 	stats.OOMRejected = memStats.OOMRejected
 	stats.Expirations = atomic.LoadUint64(&e.expirations)
 
+	// One pass, and no traversal within it: every field below is a counter the
+	// shard maintains as it goes, so Stats() costs O(shards) (ISSUE-0012).
 	for _, shard := range e.shards {
 		shardStats := shard.Stats()
 		stats.Keys += uint64(shardStats.Keys) //nolint:gosec // len() of a map, never negative
+		if shardStats.KeysWithTTL > 0 {
+			stats.KeysWithTTL += uint64(shardStats.KeysWithTTL)
+		}
 		stats.Gets += shardStats.Gets
 		stats.Sets += shardStats.Sets
 		stats.Deletes += shardStats.Deletes
 		stats.Hits += shardStats.Hits
 		stats.Misses += shardStats.Misses
-	}
-
-	// Count keys with TTL
-	for _, shard := range e.shards {
-		shard.ForEach(func(key string, entry *Entry) bool {
-			if entry.ExpireAt > 0 {
-				stats.KeysWithTTL++
-			}
-			return true
-		})
 	}
 
 	return stats
@@ -474,24 +522,11 @@ func (e *ShardedEngine) ExpireKeysInShard(shardIdx int, maxCount int) int {
 		return 0
 	}
 
-	shard := e.shards[shardIdx]
-
-	// Get expired keys
-	shard.mu.Lock()
-	expired := 0
-	for key, entry := range shard.data {
-		if entry.IsExpired() {
-			delete(shard.data, key)
-			shard.memoryUsed -= uint64(entry.Size)
-			e.memory.Sub(uint64(entry.Size))
-			atomic.AddUint64(&e.expirations, 1)
-			expired++
-			if maxCount > 0 && expired >= maxCount {
-				break
-			}
-		}
+	expired, freed := e.shards[shardIdx].ExpireKeys(maxCount)
+	if expired > 0 {
+		e.memory.Sub(freed)
+		atomic.AddUint64(&e.expirations, uint64(expired))
 	}
-	shard.mu.Unlock()
 
 	return expired
 }

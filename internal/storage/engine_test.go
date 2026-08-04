@@ -313,3 +313,47 @@ func TestClose(t *testing.T) {
 	err = engine.Close()
 	assert.Equal(t, ErrEngineClosed, err)
 }
+
+// TestConcurrentSetTTLAndGet is the regression test for ISSUE-0008: ExpireAt was
+// written with atomic.StoreInt64 and read with a plain load, which the race
+// detector reports the moment one goroutine updates a TTL while another reads it.
+func TestConcurrentSetTTLAndGet(t *testing.T) {
+	engine := NewShardedEngine(DefaultEngineConfig())
+	defer engine.Close()
+
+	key := []byte("ttl-race-key")
+	require.NoError(t, engine.Set(key, []byte("value"), time.Hour))
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 1; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			engine.SetTTL(key, time.Duration(i%600+1)*time.Second)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, ttl, ok := engine.Get(key); ok {
+				assert.Positive(t, ttl)
+			}
+		}
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+}
