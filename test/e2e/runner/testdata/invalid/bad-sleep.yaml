@@ -1,0 +1,6 @@
+version: 1
+name: bad-sleep
+tier: smoke
+feature: FEAT-0010
+steps:
+  - sleep: 1200

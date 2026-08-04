@@ -1,0 +1,39 @@
+version: 1
+name: ping-basic
+tier: smoke
+feature: FEAT-0010
+description: >
+  The server starts, answers PING, echoes a PING argument, rejects a command it
+  does not know, and closes the connection on QUIT.
+
+steps:
+  - cmd: PING
+    expect: PONG
+
+  # PING with an argument answers with the argument, as a bulk string. It is the
+  # only path in the skeleton that exercises bulk encoding in both directions.
+  - cmd: PING hello
+    expect: hello
+
+  - cmd: "PING \"hello world\""
+    expect: hello world
+
+  # Command names are not case sensitive.
+  - cmd: ping
+    expect: PONG
+
+  # An unknown command is an error reply, not a dropped connection: the next
+  # step proves the connection survived it.
+  - cmd: FROB
+    expect_error: "ERR unknown command 'FROB'"
+
+  - cmd: PING
+    expect: PONG
+
+  - cmd: QUIT
+    expect: OK
+
+  # QUIT closed the connection. The harness reconnects transparently, so a spec
+  # can carry on — and this step is what proves it does.
+  - cmd: PING
+    expect: PONG

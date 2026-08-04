@@ -1,0 +1,20 @@
+version: 1
+name: health-endpoint
+tier: smoke
+feature: FEAT-0010
+description: >
+  The admin API answers GET /health with 200 and a JSON ok status once the
+  server is ready, and the client port is serving by the time it does.
+
+steps:
+  # The harness will not have got this far unless /health already answered 200,
+  # since that is what it polls for readiness. The scenario asserts the shape of
+  # the response as well as its status, which readiness polling does not.
+  - scenario: health_endpoint_ready
+
+  # /health reporting ready while the client port is not yet serving would make
+  # every later spec racy, so the two are checked together.
+  - cmd: PING
+    expect: PONG
+
+  - scenario: health_endpoint_ready

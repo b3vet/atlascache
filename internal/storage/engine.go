@@ -3,7 +3,6 @@ package storage
 import (
 	"path/filepath"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -45,18 +44,18 @@ type StorageEngine interface {
 
 // Stats contains storage statistics
 type Stats struct {
-	Keys           uint64 // Total number of keys
-	KeysWithTTL    uint64 // Keys with TTL set
-	MemoryUsed     uint64 // Bytes used by entries
-	MemoryMax      uint64 // Maximum memory (0 = unlimited)
-	Gets           uint64 // Total GET operations
-	Sets           uint64 // Total SET operations
-	Deletes        uint64 // Total DELETE operations
-	Hits           uint64 // Cache hits
-	Misses         uint64 // Cache misses
-	Evictions      uint64 // Keys evicted
-	Expirations    uint64 // Keys expired
-	OOMRejected    uint64 // Requests rejected due to OOM
+	Keys        uint64 // Total number of keys
+	KeysWithTTL uint64 // Keys with TTL set
+	MemoryUsed  uint64 // Bytes used by entries
+	MemoryMax   uint64 // Maximum memory (0 = unlimited)
+	Gets        uint64 // Total GET operations
+	Sets        uint64 // Total SET operations
+	Deletes     uint64 // Total DELETE operations
+	Hits        uint64 // Cache hits
+	Misses      uint64 // Cache misses
+	Evictions   uint64 // Keys evicted
+	Expirations uint64 // Keys expired
+	OOMRejected uint64 // Requests rejected due to OOM
 }
 
 // EngineConfig holds configuration for the storage engine
@@ -70,7 +69,7 @@ type EngineConfig struct {
 func DefaultEngineConfig() EngineConfig {
 	return EngineConfig{
 		ShardCount:   64,
-		MaxMemory:    0, // Unlimited
+		MaxMemory:    0,               // Unlimited
 		MaxValueSize: 1 * 1024 * 1024, // 1MB
 	}
 }
@@ -89,7 +88,6 @@ type ShardedEngine struct {
 
 	// Lifecycle
 	closed int32
-	mu     sync.RWMutex
 }
 
 // NewShardedEngine creates a new sharded storage engine
@@ -106,10 +104,11 @@ func NewShardedEngine(cfg EngineConfig) *ShardedEngine {
 		shards[i] = NewShard(1024)
 	}
 
+	// nextPowerOfTwo guarantees shardCount >= 1, so these conversions cannot wrap.
 	return &ShardedEngine{
 		shards:       shards,
-		shardCount:   uint64(shardCount),
-		shardMask:    uint64(shardCount - 1),
+		shardCount:   uint64(shardCount),     //nolint:gosec // bounded positive by nextPowerOfTwo
+		shardMask:    uint64(shardCount - 1), //nolint:gosec // bounded positive by nextPowerOfTwo
 		maxValueSize: cfg.MaxValueSize,
 		memory:       NewMemoryTracker(cfg.MaxMemory),
 	}
@@ -133,12 +132,6 @@ func nextPowerOfTwo(n int) int {
 // getShard returns the shard for a given key using xxhash
 func (e *ShardedEngine) getShard(key []byte) *Shard {
 	hash := xxhash.Sum64(key)
-	return e.shards[hash&e.shardMask]
-}
-
-// getShardByString returns the shard for a string key
-func (e *ShardedEngine) getShardByString(key string) *Shard {
-	hash := xxhash.Sum64String(key)
 	return e.shards[hash&e.shardMask]
 }
 
@@ -416,7 +409,7 @@ func (e *ShardedEngine) Stats() Stats {
 
 	for _, shard := range e.shards {
 		shardStats := shard.Stats()
-		stats.Keys += uint64(shardStats.Keys)
+		stats.Keys += uint64(shardStats.Keys) //nolint:gosec // len() of a map, never negative
 		stats.Gets += shardStats.Gets
 		stats.Sets += shardStats.Sets
 		stats.Deletes += shardStats.Deletes

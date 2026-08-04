@@ -1,0 +1,8 @@
+version: 1
+name: unknown-field
+tier: smoke
+feature: FEAT-0010
+descriptoin: a typo'd top-level key must be rejected
+steps:
+  - cmd: PING
+    expect: PONG

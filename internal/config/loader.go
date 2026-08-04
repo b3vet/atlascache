@@ -101,6 +101,14 @@ func (l *Loader) setDefaults() {
 	l.v.SetDefault("node.name", defaults.Node.Name)
 	l.v.SetDefault("node.data_dir", defaults.Node.DataDir)
 
+	// Server defaults
+	l.v.SetDefault("server.bind_addr", defaults.Server.BindAddr)
+	l.v.SetDefault("server.client_port", defaults.Server.ClientPort)
+
+	// Admin defaults
+	l.v.SetDefault("admin.bind_addr", defaults.Admin.BindAddr)
+	l.v.SetDefault("admin.port", defaults.Admin.Port)
+
 	// Storage defaults
 	l.v.SetDefault("storage.shard_count", defaults.Storage.ShardCount)
 	l.v.SetDefault("storage.max_memory", defaults.Storage.MaxMemory)
@@ -176,7 +184,9 @@ func ResolveConfigPath() string {
 	}
 
 	for _, loc := range locations {
-		if _, err := os.Stat(loc); err == nil {
+		// The only non-literal element is built from $HOME, and this probes a
+		// fixed set of well-known locations rather than acting on user input.
+		if _, err := os.Stat(loc); err == nil { //nolint:gosec // fixed candidate list, not attacker-controlled
 			return loc
 		}
 	}

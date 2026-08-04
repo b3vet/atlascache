@@ -1,0 +1,30 @@
+version: 1
+name: restart-clean
+tier: full
+feature: FEAT-0009
+description: >
+  The server survives a restart against the same data directory and serves
+  again afterwards. The skeleton stores nothing, so this asserts the lifecycle
+  rather than persistence; it exists because P5's crash-recovery specs are built
+  on the harness's restart path, and this is what keeps that path working.
+
+steps:
+  - cmd: PING
+    expect: PONG
+
+  # The harness's own restart step: stop, then start against the same data dir.
+  - restart: true
+
+  - cmd: PING
+    expect: PONG
+
+  # The scenario asserts what the step form cannot: that the data directory is
+  # the same one, that the process really is a new one, and that a file written
+  # before the restart is still there afterwards.
+  - scenario: restart_preserves_data_dir
+
+  # A killed server comes back too, which is the path P5 depends on.
+  - scenario: crash_and_recover
+
+  - cmd: PING
+    expect: PONG

@@ -1,0 +1,7 @@
+version: 1
+name: repeated-name
+tier: full
+feature: FEAT-0011
+steps:
+  - cmd: PING
+    expect: PONG

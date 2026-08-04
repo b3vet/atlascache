@@ -139,11 +139,11 @@ func TestKeys(t *testing.T) {
 	// Set some keys
 	for i := 0; i < 10; i++ {
 		key := []byte(fmt.Sprintf("key:%d", i))
-		engine.Set(key, []byte("value"), 0)
+		require.NoError(t, engine.Set(key, []byte("value"), 0))
 	}
 	for i := 0; i < 5; i++ {
 		key := []byte(fmt.Sprintf("other:%d", i))
-		engine.Set(key, []byte("value"), 0)
+		require.NoError(t, engine.Set(key, []byte("value"), 0))
 	}
 
 	t.Run("all keys", func(t *testing.T) {
@@ -167,7 +167,7 @@ func TestScan(t *testing.T) {
 	// Set 100 keys
 	for i := 0; i < 100; i++ {
 		key := []byte(fmt.Sprintf("scan-key:%d", i))
-		engine.Set(key, []byte("value"), 0)
+		require.NoError(t, engine.Set(key, []byte("value"), 0))
 	}
 
 	t.Run("scan all keys", func(t *testing.T) {
@@ -272,7 +272,7 @@ func TestStats(t *testing.T) {
 	// Perform operations
 	for i := 0; i < 100; i++ {
 		key := []byte(fmt.Sprintf("key:%d", i))
-		engine.Set(key, []byte("value"), 0)
+		require.NoError(t, engine.Set(key, []byte("value"), 0))
 	}
 
 	for i := 0; i < 50; i++ {
@@ -296,7 +296,7 @@ func TestClose(t *testing.T) {
 	engine := NewShardedEngine(DefaultEngineConfig())
 
 	// Set some data
-	engine.Set([]byte("key"), []byte("value"), 0)
+	require.NoError(t, engine.Set([]byte("key"), []byte("value"), 0))
 
 	// Close
 	err := engine.Close()

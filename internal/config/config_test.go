@@ -217,3 +217,159 @@ func TestEnvOverrides(t *testing.T) {
 	assert.Equal(t, 128, cfg.Storage.ShardCount)
 	assert.Equal(t, "fifo", cfg.Eviction.Policy)
 }
+
+func TestServerAndAdminDefaults(t *testing.T) {
+	cfg := Defaults()
+
+	assert.Equal(t, "0.0.0.0", cfg.Server.BindAddr)
+	assert.Equal(t, 6379, cfg.Server.ClientPort)
+	// Admin binds loopback by default (ADR-0023)
+	assert.Equal(t, "127.0.0.1", cfg.Admin.BindAddr)
+	assert.Equal(t, 8080, cfg.Admin.Port)
+
+	assert.Equal(t, "0.0.0.0:6379", cfg.ClientAddr())
+	assert.Equal(t, "127.0.0.1:8080", cfg.AdminAddr())
+	assert.True(t, cfg.AdminIsLoopback())
+}
+
+func TestAdminIsLoopback(t *testing.T) {
+	tests := []struct {
+		addr string
+		want bool
+	}{
+		{addr: "127.0.0.1", want: true},
+		{addr: "127.0.0.53", want: true},
+		{addr: "::1", want: true},
+		{addr: "localhost", want: true},
+		{addr: "0.0.0.0", want: false},
+		{addr: "10.0.0.5", want: false},
+		{addr: "cache.internal", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.addr, func(t *testing.T) {
+			cfg := Defaults()
+			cfg.Admin.BindAddr = tt.addr
+			assert.Equal(t, tt.want, cfg.AdminIsLoopback())
+		})
+	}
+}
+
+func TestServerAdminValidation(t *testing.T) {
+	tests := []struct {
+		name      string
+		mutate    func(*Config)
+		wantField string
+	}{
+		{
+			name:      "empty server bind addr",
+			mutate:    func(c *Config) { c.Server.BindAddr = "" },
+			wantField: "server.bind_addr",
+		},
+		{
+			name:      "malformed server bind addr",
+			mutate:    func(c *Config) { c.Server.BindAddr = "not a host" },
+			wantField: "server.bind_addr",
+		},
+		{
+			name:      "client port zero",
+			mutate:    func(c *Config) { c.Server.ClientPort = 0 },
+			wantField: "server.client_port",
+		},
+		{
+			name:      "client port too large",
+			mutate:    func(c *Config) { c.Server.ClientPort = 70000 },
+			wantField: "server.client_port",
+		},
+		{
+			name:      "negative client port",
+			mutate:    func(c *Config) { c.Server.ClientPort = -1 },
+			wantField: "server.client_port",
+		},
+		{
+			name:      "empty admin bind addr",
+			mutate:    func(c *Config) { c.Admin.BindAddr = "" },
+			wantField: "admin.bind_addr",
+		},
+		{
+			name:      "admin port out of range",
+			mutate:    func(c *Config) { c.Admin.Port = 65536 },
+			wantField: "admin.port",
+		},
+		{
+			name:      "admin port collides with client port",
+			mutate:    func(c *Config) { c.Admin.Port = c.Server.ClientPort },
+			wantField: "admin.port",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Defaults()
+			tt.mutate(cfg)
+
+			err := Validate(cfg)
+			require.Error(t, err)
+			// The message must name the offending field (FEAT-0010)
+			assert.Contains(t, err.Error(), tt.wantField)
+		})
+	}
+}
+
+func TestServerAdminValidationAccepts(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{name: "hostname bind addr", mutate: func(c *Config) { c.Server.BindAddr = "localhost" }},
+		{name: "dotted hostname", mutate: func(c *Config) { c.Admin.BindAddr = "cache.internal" }},
+		{name: "ipv6 bind addr", mutate: func(c *Config) { c.Server.BindAddr = "::" }},
+		{name: "boundary ports", mutate: func(c *Config) { c.Server.ClientPort = 1; c.Admin.Port = 65535 }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Defaults()
+			tt.mutate(cfg)
+			assert.NoError(t, Validate(cfg))
+		})
+	}
+}
+
+func TestLoadServerAdminSections(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	t.Run("values are read from file", func(t *testing.T) {
+		configPath := filepath.Join(tmpDir, "config.yaml")
+		content := `
+server:
+  bind_addr: "127.0.0.1"
+  client_port: 7777
+admin:
+  bind_addr: "127.0.0.1"
+  port: 7778
+`
+		require.NoError(t, os.WriteFile(configPath, []byte(content), 0o644))
+
+		cfg, err := NewLoader().LoadFromFile(configPath)
+		require.NoError(t, err)
+		assert.Equal(t, "127.0.0.1:7777", cfg.ClientAddr())
+		assert.Equal(t, "127.0.0.1:7778", cfg.AdminAddr())
+	})
+
+	t.Run("invalid values fail the load naming the field", func(t *testing.T) {
+		configPath := filepath.Join(tmpDir, "invalid.yaml")
+		content := `
+server:
+  client_port: 99999
+`
+		require.NoError(t, os.WriteFile(configPath, []byte(content), 0o644))
+
+		_, err := NewLoader().LoadFromFile(configPath)
+		require.Error(t, err)
+
+		var multiErr *MultiValidationError
+		require.ErrorAs(t, err, &multiErr)
+		assert.Contains(t, err.Error(), "server.client_port")
+	})
+}

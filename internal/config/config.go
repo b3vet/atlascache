@@ -2,7 +2,10 @@
 package config
 
 import (
+	"net"
 	"runtime"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -11,6 +14,8 @@ import (
 // Config represents the AtlasCache configuration
 type Config struct {
 	Node     NodeConfig     `mapstructure:"node"`
+	Server   ServerConfig   `mapstructure:"server"`
+	Admin    AdminConfig    `mapstructure:"admin"`
 	Storage  StorageConfig  `mapstructure:"storage"`
 	TTL      TTLConfig      `mapstructure:"ttl"`
 	Eviction EvictionConfig `mapstructure:"eviction"`
@@ -22,6 +27,18 @@ type NodeConfig struct {
 	ID      string `mapstructure:"id"`       // Auto-generated if empty
 	Name    string `mapstructure:"name"`     // Human-readable name
 	DataDir string `mapstructure:"data_dir"` // Data directory path
+}
+
+// ServerConfig contains client-facing listener settings
+type ServerConfig struct {
+	BindAddr   string `mapstructure:"bind_addr"`   // Interface to bind, e.g. "0.0.0.0"
+	ClientPort int    `mapstructure:"client_port"` // RESP client port
+}
+
+// AdminConfig contains admin HTTP API settings
+type AdminConfig struct {
+	BindAddr string `mapstructure:"bind_addr"` // Loopback by default (ADR-0023)
+	Port     int    `mapstructure:"port"`      // Admin HTTP port
 }
 
 // StorageConfig contains storage engine settings
@@ -58,9 +75,17 @@ func Defaults() *Config {
 			Name:    "",
 			DataDir: "/var/lib/atlascache",
 		},
+		Server: ServerConfig{
+			BindAddr:   "0.0.0.0",
+			ClientPort: 6379,
+		},
+		Admin: AdminConfig{
+			BindAddr: "127.0.0.1",
+			Port:     8080,
+		},
 		Storage: StorageConfig{
-			ShardCount:   0,     // Auto-detect
-			MaxMemory:    "0",   // Unlimited
+			ShardCount:   0,   // Auto-detect
+			MaxMemory:    "0", // Unlimited
 			MaxValueSize: "1MB",
 		},
 		TTL: TTLConfig{
@@ -106,4 +131,22 @@ func (c *Config) GetNodeID() string {
 		return c.Node.ID
 	}
 	return uuid.New().String()
+}
+
+// ClientAddr returns the host:port the client listener binds to
+func (c *Config) ClientAddr() string {
+	return net.JoinHostPort(c.Server.BindAddr, strconv.Itoa(c.Server.ClientPort))
+}
+
+// AdminAddr returns the host:port the admin HTTP server binds to
+func (c *Config) AdminAddr() string {
+	return net.JoinHostPort(c.Admin.BindAddr, strconv.Itoa(c.Admin.Port))
+}
+
+// AdminIsLoopback reports whether the admin API is bound to a loopback address
+func (c *Config) AdminIsLoopback() bool {
+	if ip := net.ParseIP(c.Admin.BindAddr); ip != nil {
+		return ip.IsLoopback()
+	}
+	return strings.EqualFold(c.Admin.BindAddr, "localhost")
 }

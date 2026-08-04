@@ -1,0 +1,8 @@
+version: 1
+name: unknown-scenario
+tier: full
+feature: FEAT-0010
+steps:
+  - cmd: PING
+    expect: PONG
+  - scenario: crash_and_recovr

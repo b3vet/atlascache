@@ -1,0 +1,29 @@
+version: 1
+name: startup-config
+tier: full
+feature: FEAT-0010
+description: >
+  A config the server cannot honour is rejected before anything starts, with a
+  message naming the field at fault; a config file that was asked for and does
+  not exist is an error rather than a silent fall back to defaults; and
+  --version reports enough to trace a build.
+
+config:
+  # Proof that a spec's config block reaches the server: this is not the
+  # default policy, and an unknown one would fail the start outright.
+  eviction:
+    policy: lfu
+
+steps:
+  # The server is up, which is the positive control: the checks below fail the
+  # binary for the config it was given, not for being unable to start at all.
+  - cmd: PING
+    expect: PONG
+
+  - scenario: invalid_config_fails_fast
+
+  - scenario: version_flag_reports_build
+
+  # Rejecting bad configs out of band left the running server untouched.
+  - cmd: PING
+    expect: PONG

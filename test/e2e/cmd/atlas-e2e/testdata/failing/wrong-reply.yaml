@@ -1,0 +1,12 @@
+version: 1
+name: wrong-reply
+tier: smoke
+feature: FEAT-0008
+description: >
+  Expects a reply the fake harness does not give, so the failure output can be
+  seen.
+steps:
+  - cmd: PING
+    expect: PONG
+  - cmd: GET missing
+    expect: NIL

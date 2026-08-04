@@ -1,0 +1,7 @@
+version: 1
+name: bad-feature
+tier: smoke
+feature: FEAT-10
+steps:
+  - cmd: PING
+    expect: PONG

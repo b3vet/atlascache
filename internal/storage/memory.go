@@ -106,15 +106,15 @@ func (m *MemoryTracker) GetOOMRejections() uint64 {
 
 // MemoryStats holds memory statistics
 type MemoryStats struct {
-	Used         uint64
-	Max          uint64
-	Available    uint64
-	Evictions    uint64
-	OOMRejected  uint64
-	HeapAlloc    uint64
-	HeapSys      uint64
-	HeapInuse    uint64
-	NumGC        uint32
+	Used        uint64
+	Max         uint64
+	Available   uint64
+	Evictions   uint64
+	OOMRejected uint64
+	HeapAlloc   uint64
+	HeapSys     uint64
+	HeapInuse   uint64
+	NumGC       uint32
 }
 
 // Stats returns memory statistics

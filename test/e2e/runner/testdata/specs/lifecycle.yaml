@@ -1,0 +1,15 @@
+version: 1
+name: lifecycle
+tier: full
+feature: FEAT-0010
+description: >
+  Every non-command step form, in one spec.
+steps:
+  - cmd: PING
+    expect: PONG
+  - sleep: 5ms
+  - scenario: noop
+  - restart: true
+  - cmd: PING
+    expect: PONG
+  - kill: true

@@ -1,0 +1,94 @@
+# git-cliff configuration — drafts CHANGELOG.md from Conventional Commits.
+#
+# Per dev/ADR-0008 the changelog is drafted mechanically and then edited by hand
+# before tagging: the draft removes the grunt work, the edit keeps CHANGELOG.md
+# readable by users rather than a dump of commit subjects.
+#
+#   git cliff --unreleased                          # draft to stdout, then edit in
+#   git cliff --unreleased --prepend CHANGELOG.md   # draft straight into the file
+#   git cliff --tag v0.1.0 --unreleased             # preview a tagged release
+#   git cliff --bumped-version                      # what SemVer bump is implied
+#
+# --prepend inserts a second "## [Unreleased]" heading above the existing one;
+# merging the two by hand is the curation step ADR-0008 asks for.
+#
+# https://git-cliff.org/docs/configuration
+
+[changelog]
+header = """\
+# Changelog
+
+All notable changes to AtlasCache are documented here.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+Entries are drafted from Conventional Commits with `git cliff` and then edited
+by hand, so this file reads as release notes rather than a commit log.
+"""
+
+# Section order is carried by the "<!-- n -->" prefixes on group names below and
+# stripped again by the postprocessor, since groups otherwise sort by name.
+body = """\
+{% if commits %}\
+{% if version %}\
+## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}\
+## [Unreleased]
+{% endif %}
+{% for group, commits in commits | group_by(attribute="group") %}\
+### {{ group | upper_first }}
+
+{% for commit in commits %}\
+- {% if commit.breaking %}**BREAKING** {% endif %}\
+{% if commit.scope %}**{{ commit.scope }}**: {% endif %}\
+{{ commit.message | upper_first }}
+{% endfor %}
+{% endfor %}\
+{% endif %}\
+"""
+
+footer = """\
+<!-- drafted by git-cliff; curate before tagging (dev/ADR-0008) -->
+"""
+
+# Whitespace is controlled explicitly by the templates above.
+trim = false
+
+postprocessors = [
+  # Strip the ordering prefixes from the rendered group headings.
+  { pattern = "<!-- [0-9]+ -->", replace = "" },
+]
+
+[git]
+conventional_commits = true
+# Anything that is not a Conventional Commit never reaches a user-facing draft.
+filter_unconventional = true
+split_commits = false
+protect_breaking_commits = true
+filter_commits = false
+tag_pattern = "v[0-9]*"
+topo_order = false
+sort_commits = "oldest"
+
+commit_preprocessors = [
+  # "refs FEAT-0007" points at dev/, which is private. Useful in history,
+  # meaningless to a reader of the changelog.
+  { pattern = "\\n+refs [A-Z]+-[0-9]{4}", replace = "" },
+]
+
+commit_parsers = [
+  { message = "^feat", group = "<!-- 0 -->Added" },
+  { message = "^refactor", group = "<!-- 1 -->Changed" },
+  { message = "^fix", group = "<!-- 2 -->Fixed" },
+  { message = "^perf", group = "<!-- 3 -->Performance" },
+  { message = "^docs", group = "<!-- 4 -->Documentation" },
+  { message = "^test", group = "<!-- 5 -->Testing" },
+  { message = "^build", group = "<!-- 6 -->Build" },
+  { message = "^ci", group = "<!-- 6 -->Build" },
+  # Release chores are bookkeeping; they say nothing to a user.
+  { message = "^chore\\(release\\)", skip = true },
+  { message = "^chore\\(deps\\)", group = "<!-- 6 -->Build" },
+  { message = "^chore", group = "<!-- 7 -->Chores" },
+  { message = ".*", skip = true },
+]

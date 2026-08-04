@@ -10,6 +10,21 @@ node:
   # Data directory for persistence (Phase 4)
   data_dir: "/var/lib/atlascache"
 
+# Client-facing server configuration
+server:
+  # Interface to bind the RESP client listener to ("0.0.0.0" = all interfaces)
+  bind_addr: "0.0.0.0"
+  # RESP client port
+  client_port: 6379
+
+# Admin HTTP API configuration
+admin:
+  # Bound to loopback by default; the admin API is more powerful than the
+  # data port, so it is not remotely reachable unless changed deliberately
+  bind_addr: "127.0.0.1"
+  # Admin HTTP port (must differ from server.client_port)
+  port: 8080
+
 # Storage engine configuration
 storage:
   # Number of shards (0 = auto-detect based on CPU cores)

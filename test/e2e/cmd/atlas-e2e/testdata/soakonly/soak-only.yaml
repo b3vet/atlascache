@@ -1,0 +1,11 @@
+version: 1
+name: soak-only
+tier: soak
+feature: FEAT-0008
+description: >
+  Fixture holding a single soak spec, so selecting a lower tier matches
+  nothing. Tiers are cumulative, so an empty selection can only be produced
+  from below, never from above.
+steps:
+  - cmd: PING
+    expect: PONG

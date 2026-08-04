@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"regexp"
 	"strconv"
 	"strings"
@@ -36,8 +37,20 @@ func (e *MultiValidationError) Error() string {
 }
 
 // Validate checks if the configuration is valid
+const fieldAdminPort = "admin.port"
+
 func Validate(cfg *Config) error {
 	var errs []*ValidationError
+
+	// Validate server config
+	if err := validateServer(&cfg.Server); err != nil {
+		errs = append(errs, err...)
+	}
+
+	// Validate admin config
+	if err := validateAdmin(&cfg.Admin, &cfg.Server); err != nil {
+		errs = append(errs, err...)
+	}
 
 	// Validate storage config
 	if err := validateStorage(&cfg.Storage); err != nil {
@@ -63,6 +76,66 @@ func Validate(cfg *Config) error {
 		return &MultiValidationError{Errors: errs}
 	}
 
+	return nil
+}
+
+func validateServer(cfg *ServerConfig) []*ValidationError {
+	var errs []*ValidationError
+
+	if err := validateBindAddr("server.bind_addr", cfg.BindAddr); err != nil {
+		errs = append(errs, err)
+	}
+	if err := validatePort("server.client_port", cfg.ClientPort); err != nil {
+		errs = append(errs, err)
+	}
+
+	return errs
+}
+
+func validateAdmin(cfg *AdminConfig, server *ServerConfig) []*ValidationError {
+	var errs []*ValidationError
+
+	if err := validateBindAddr("admin.bind_addr", cfg.BindAddr); err != nil {
+		errs = append(errs, err)
+	}
+	if err := validatePort("admin.port", cfg.Port); err != nil {
+		errs = append(errs, err)
+	}
+
+	// The two listeners cannot share a port
+	if cfg.Port > 0 && cfg.Port == server.ClientPort {
+		errs = append(errs, &ValidationError{
+			Field:   fieldAdminPort,
+			Message: "must differ from server.client_port",
+		})
+	}
+
+	return errs
+}
+
+func validateBindAddr(field, addr string) *ValidationError {
+	if strings.TrimSpace(addr) == "" {
+		return &ValidationError{
+			Field:   field,
+			Message: "must not be empty (use \"0.0.0.0\" for all interfaces)",
+		}
+	}
+	if net.ParseIP(addr) != nil || hostnameRegex.MatchString(addr) {
+		return nil
+	}
+	return &ValidationError{
+		Field:   field,
+		Message: "must be a valid IP address or hostname",
+	}
+}
+
+func validatePort(field string, port int) *ValidationError {
+	if port < 1 || port > 65535 {
+		return &ValidationError{
+			Field:   field,
+			Message: "must be between 1 and 65535",
+		}
+	}
 	return nil
 }
 
@@ -197,6 +270,9 @@ func validateLogging(cfg *LoggingConfig) []*ValidationError {
 
 	return errs
 }
+
+// hostnameRegex matches DNS hostnames like "localhost" or "cache.internal"
+var hostnameRegex = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$`)
 
 // sizeRegex matches size strings like "1GB", "512MB", "100KB", "1024", "0"
 var sizeRegex = regexp.MustCompile(`^(\d+)\s*(B|KB|MB|GB|TB)?$`)

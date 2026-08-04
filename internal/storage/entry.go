@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"math"
 	"sync/atomic"
 	"time"
 )
@@ -86,7 +87,13 @@ func (e *Entry) UpdateExpiry(ttl time.Duration) {
 // Calculated as: struct fields + map entry overhead + slice headers
 const EntryOverhead = 80 // Approximate: 24 (key slice) + 24 (value slice) + 8+8+8+4+4 + map overhead (~10)
 
-// CalculateSize computes the total memory footprint of an entry
+// CalculateSize computes the total memory footprint of an entry.
+// Saturates at MaxUint32 rather than wrapping: an entry large enough to wrap
+// would otherwise be accounted as tiny and slip past the memory limit.
 func CalculateSize(key, value []byte) uint32 {
-	return uint32(len(key) + len(value) + EntryOverhead)
+	total := len(key) + len(value) + EntryOverhead
+	if total < 0 || total > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return uint32(total)
 }

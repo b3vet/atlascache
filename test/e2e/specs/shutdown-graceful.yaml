@@ -1,0 +1,16 @@
+version: 1
+name: shutdown-graceful
+tier: full
+feature: FEAT-0010
+description: >
+  SIGTERM stops the server within the graceful window and closes the connections
+  it was serving, rather than leaving clients on a socket nobody will answer.
+
+steps:
+  - cmd: PING
+    expect: PONG
+
+  # The scenario holds an idle connection open, sends SIGTERM, and asserts both
+  # halves of a graceful shutdown: the process exits inside the window, and the
+  # connection is closed by the server rather than timing out later.
+  - scenario: graceful_shutdown_closes_connections

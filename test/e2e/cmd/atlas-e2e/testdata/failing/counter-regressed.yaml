@@ -1,0 +1,13 @@
+version: 1
+name: counter-regressed
+tier: smoke
+feature: FEAT-0008
+description: >
+  Asserts a counter the fake harness does not report at that value, so the
+  failure output can be seen.
+steps:
+  - cmd: PING
+    expect: PONG
+  - cmd: STATS
+    expect_field:
+      expirations: ">= 99"

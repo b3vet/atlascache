@@ -1,0 +1,14 @@
+version: 1
+name: ping-basic
+tier: smoke
+feature: FEAT-0010
+description: >
+  Server answers PING and closes cleanly on QUIT.
+config:
+  auth:
+    enabled: false
+steps:
+  - cmd: PING
+    expect: PONG
+  - cmd: QUIT
+    expect: OK

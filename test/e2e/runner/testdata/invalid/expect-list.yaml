@@ -1,0 +1,9 @@
+version: 1
+name: expect-list
+tier: smoke
+feature: FEAT-0010
+steps:
+  - cmd: KEYS *
+    expect:
+      - k1
+      - k2

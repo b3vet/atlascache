@@ -2,90 +2,115 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main]
   pull_request:
-    branches: [main, master]
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  # The floor declared in go.mod (ADR-0011). CI also builds against `stable`
+  # so forward-compatibility breakage surfaces here rather than in a bug report.
+  GO_FLOOR: "1.24"
 
 jobs:
-  test:
-    name: Test
+  build:
+    name: Build (go ${{ matrix.go }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.24", "stable"]
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: ${{ matrix.go }}
           cache: true
 
-      - name: Download dependencies
-        run: go mod download
+      - name: Build server binary
+        run: make build
 
-      - name: Run tests
-        run: go test -v -race -coverprofile=coverage.out ./...
+      - name: Build e2e runner
+        run: make build-e2e
 
-      - name: Upload coverage
-        uses: codecov/codecov-action@v4
+      - name: Verify the binary runs
+        run: ./bin/atlascache --version
+
+  test:
+    name: Test (go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.24", "stable"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
         with:
-          files: ./coverage.out
-          fail_ci_if_error: false
+          go-version: ${{ matrix.go }}
+          cache: true
+
+      - name: Unit tests with race detection (both modules)
+        run: make test
+
+      # `go mod tidy -diff` answers "is it tidy?" directly, without depending on
+      # git state the way a `make deps` + `git diff` pair would.
+      - name: Verify go.mod and go.sum are tidy
+        run: make tidy-check
 
   lint:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: ${{ env.GO_FLOOR }}
           cache: true
 
-      - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v6
-        with:
-          version: latest
-          args: --timeout=5m
+      # Installed directly rather than via golangci-lint-action so CI runs the
+      # exact same binary and config as `make lint` locally.
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
 
-  build:
-    name: Build
+      - name: Lint both modules
+        run: make lint
+
+  e2e:
+    name: E2E gate
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: ${{ env.GO_FLOOR }}
           cache: true
 
-      - name: Build
-        run: go build -o bin/atlascache ./cmd/atlascache
+      # The regression gate. A previously-green run that fails here means a
+      # regression was just introduced -- see ADR-0003.
+      - name: Run the full E2E tier
+        run: make e2e-full
 
-  benchmark:
-    name: Benchmark
+  commit-lint:
+    name: Commit convention
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.22'
-          cache: true
-
-      - name: Run benchmarks
-        run: go test -bench=. -benchmem -run=^$ ./... | tee benchmark.txt
-
-      - name: Upload benchmark results
-        uses: actions/upload-artifact@v4
-        with:
-          name: benchmark-results
-          path: benchmark.txt
+      - name: Validate PR title against Conventional Commits
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          pattern='^(feat|fix|perf|refactor|test|docs|build|ci|chore)(\([a-z0-9._/-]+\))?!?: .+'
+          if ! printf '%s' "$PR_TITLE" | grep -Eq "$pattern"; then
+            echo "::error::PR title does not follow Conventional Commits (ADR-0008)."
+            echo "Expected: <type>(<scope>): <subject>"
+            echo "Example:  feat(ttl): add hierarchical time wheel"
+            echo "Got:      $PR_TITLE"
+            exit 1
+          fi

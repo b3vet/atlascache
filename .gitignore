@@ -49,6 +49,10 @@ config.yaml
 tmp/
 temp/
 
-SOW*.md
-prompt.md
-PHASE-*.md
+# Internal planning workspace (SOW, phase plans, features, issues, ADRs, worklogs).
+# Everything under dev/ is private. Public docs live in docs/.
+/dev/
+# Stray tool binaries built into the repo root
+/phasecheck
+/devindex
+/atlas-e2e

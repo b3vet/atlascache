@@ -1,0 +1,8 @@
+version: 1
+name: two-assertions
+tier: smoke
+feature: FEAT-0010
+steps:
+  - cmd: TTL k1
+    expect: NIL
+    expect_error: "ERR no such key"

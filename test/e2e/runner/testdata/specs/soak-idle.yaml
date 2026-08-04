@@ -1,0 +1,8 @@
+name: soak-idle
+tier: soak
+feature: FEAT-0012
+description: >
+  A spec with no version, which is read as version 1.
+steps:
+  - cmd: PING
+    expect: PONG

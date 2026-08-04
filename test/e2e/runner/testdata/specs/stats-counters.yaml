@@ -1,0 +1,17 @@
+version: 1
+name: stats-counters
+tier: full
+feature: FEAT-0011
+issue: ISSUE-0007
+description: >
+  Counter assertions use comparators so unrelated behaviour does not break them.
+config:
+  auth:
+    enabled: false
+steps:
+  - cmd: STATS
+    expect_field:
+      expirations: ">= 1"
+      keys: "== 2"
+      hits: "<= 10"
+      misses: "!= 9"
