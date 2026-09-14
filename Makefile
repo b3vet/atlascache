@@ -1,9 +1,13 @@
-.PHONY: build build-e2e test tidy-check fuzz lint bench bench-network clean fmt vet cover check deps tools e2e e2e-smoke e2e-full e2e-soak phase-check dev-index dev-certs help
+.PHONY: build build-e2e test tidy-check fuzz lint bench bench-network clean fmt vet cover cover-sdk check deps tools e2e e2e-smoke e2e-full e2e-soak phase-check dev-index dev-certs help
 
 BINARY_NAME := atlascache
 BUILD_DIR   := bin
 GO          := go
 E2E_DIR     := test/e2e
+# The Go SDK is its own module (ADR-0015). Three modules now: every target that
+# walks them has to walk all three, because a check that silently covers a
+# subset is worse than no check -- and there is one more subset to miss.
+SDK_DIR     := pkg/client
 # Where `make dev-certs` writes. Gitignored: a committed test certificate gets
 # copied into production with depressing regularity, and it expires.
 CERT_DIR    := certs
@@ -31,24 +35,28 @@ build-e2e:
 	@mkdir -p $(BUILD_DIR)
 	cd $(E2E_DIR) && $(GO) build -o ../../$(BUILD_DIR)/atlas-e2e ./cmd/atlas-e2e
 
-## test: run unit tests with race detection in both modules
+## test: run unit tests with race detection in all three modules
 test:
 	$(GO) test -race -cover ./...
+	cd $(SDK_DIR) && $(GO) test -race -cover ./...
 	cd $(E2E_DIR) && $(GO) test -race -cover ./...
 
-## lint: run golangci-lint in both modules
+## lint: run golangci-lint in all three modules
 lint:
 	golangci-lint run ./...
+	cd $(SDK_DIR) && golangci-lint run ./...
 	cd $(E2E_DIR) && golangci-lint run ./...
 
-## fmt: format both modules
+## fmt: format all three modules
 fmt:
 	$(GO) fmt ./...
+	cd $(SDK_DIR) && $(GO) fmt ./...
 	cd $(E2E_DIR) && $(GO) fmt ./...
 
-## vet: vet both modules
+## vet: vet all three modules
 vet:
 	$(GO) vet ./...
+	cd $(SDK_DIR) && $(GO) vet ./...
 	cd $(E2E_DIR) && $(GO) vet ./...
 
 ## fuzz: fuzz the protocol decoder (FUZZTIME=30s by default)
@@ -72,11 +80,20 @@ bench-network: build
 		-netbench.binary $(CURDIR)/$(BUILD_DIR)/$(BINARY_NAME) \
 		$(if $(NETBENCH_OUT),-netbench.out $(NETBENCH_OUT),) $(NETBENCH_ARGS)
 
-## cover: generate an HTML coverage report
+## cover: generate an HTML coverage report for the root module
 cover:
 	$(GO) test -coverprofile=coverage.out ./...
 	$(GO) tool cover -html=coverage.out -o coverage.html
 	@echo "Coverage report: coverage.html"
+
+## cover-sdk: generate an HTML coverage report for the SDK module
+# Separate from `cover` because coverage profiles are per module: one `go tool
+# cover` run cannot merge two, and a single report that quietly covered only the
+# root module would read as if it covered everything.
+cover-sdk:
+	cd $(SDK_DIR) && $(GO) test -coverprofile=../../coverage-sdk.out ./...
+	$(GO) tool cover -html=coverage-sdk.out -o coverage-sdk.html
+	@echo "Coverage report: coverage-sdk.html"
 
 ## e2e: run the full tier (the regression gate)
 e2e: e2e-full
@@ -124,15 +141,30 @@ dev-certs:
 ## check: fmt, vet, lint, test
 check: fmt vet lint test
 
-## tidy-check: fail if go.mod/go.sum in either module are not tidy
+## tidy-check: fail if go.mod/go.sum in any module are not tidy
+# The SDK is also checked for having no dependencies at all. That is the whole
+# point of its being a separate module (ADR-0015): a consumer importing it must
+# not inherit the server's graph, and the guarantee is worth exactly as much as
+# the check that enforces it.
 tidy-check:
 	@$(GO) mod tidy -diff || { echo "root module is not tidy; run 'make deps'"; exit 1; }
+	@cd $(SDK_DIR) && $(GO) mod tidy -diff || { echo "pkg/client module is not tidy; run 'make deps'"; exit 1; }
 	@cd $(E2E_DIR) && $(GO) mod tidy -diff || { echo "test/e2e module is not tidy; run 'make deps'"; exit 1; }
-	@echo "both modules are tidy"
+# GOWORK=off is required: inside a workspace `go list -m all` reports the
+# workspace's build list, which includes the server's dependencies and would
+# make this check either always fail or -- worse -- accidentally pass for the
+# wrong reason. Off the workspace it reports what a consumer would actually get.
+	@cd $(SDK_DIR) && test "$$(GOWORK=off $(GO) list -m all | wc -l | tr -d ' ')" = "1" || { \
+		echo "pkg/client has grown a dependency:"; \
+		cd $(SDK_DIR) && GOWORK=off $(GO) list -m all; \
+		echo "the SDK is stdlib-only by decision (ADR-0015); adding a dependency needs an ADR"; \
+		exit 1; }
+	@echo "all three modules are tidy, and the SDK still depends on nothing"
 
-## deps: download and tidy dependencies in both modules
+## deps: download and tidy dependencies in all three modules
 deps:
 	$(GO) mod download && $(GO) mod tidy
+	cd $(SDK_DIR) && $(GO) mod download && $(GO) mod tidy
 	cd $(E2E_DIR) && $(GO) mod download && $(GO) mod tidy
 
 ## tools: install dev tooling and git hooks
@@ -146,4 +178,4 @@ tools:
 ## clean: remove build artifacts
 clean:
 	rm -rf $(BUILD_DIR)
-	rm -f coverage.out coverage.html cpu.out mem.out
+	rm -f coverage.out coverage.html coverage-sdk.out coverage-sdk.html cpu.out mem.out

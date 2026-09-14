@@ -30,7 +30,10 @@ type security struct {
 // encrypted when it was not, and they would have no way to find out short of a
 // packet capture. The error names the file at fault.
 func newSecurity(cfg *config.Config, log zerolog.Logger) (*security, error) {
-	sec := &security{auth: server.NewAuthenticator(cfg.Auth.Enabled, cfg.Auth.Token)}
+	// The conversion is deliberate and is the only way to read a
+	// config.Secret: every use of a real secret value is visible at the call
+	// site, and nothing can reach one by printing a struct.
+	sec := &security{auth: server.NewAuthenticator(cfg.Auth.Enabled, string(cfg.Auth.Token))}
 
 	if cfg.TLS.Enabled {
 		keeper, err := server.NewCertificateKeeper(cfg.TLS.CertFile, cfg.TLS.KeyFile, log)
@@ -63,7 +66,7 @@ func (s *security) options() []server.Option {
 // every connection already open — so those are reported and ignored rather than
 // half-applied.
 func (s *security) applyConfig(cfg *config.Config, log zerolog.Logger) {
-	s.auth.Set(cfg.Auth.Enabled, cfg.Auth.Token)
+	s.auth.Set(cfg.Auth.Enabled, string(cfg.Auth.Token))
 	// Deliberately no token, no length, no prefix: the point of logging a
 	// rotation is to record that one happened.
 	log.Info().Bool("auth_enabled", cfg.Auth.Enabled).Msg("auth configuration applied")

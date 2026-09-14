@@ -110,9 +110,12 @@ func (l *Loader) setDefaults() {
 	l.v.SetDefault("server.max_pipeline_commands", defaults.Server.MaxPipelineCommands)
 	l.v.SetDefault("server.max_output_buffer", defaults.Server.MaxOutputBuffer)
 
-	// Admin defaults
+	// Admin defaults. The token is its own secret, distinct from auth.token
+	// (ADR-0023), and empty by default — which the ADR-0023 exposure guard
+	// makes safe by refusing a non-loopback bind_addr without one.
 	l.v.SetDefault("admin.bind_addr", defaults.Admin.BindAddr)
 	l.v.SetDefault("admin.port", defaults.Admin.Port)
+	l.v.SetDefault("admin.token", string(defaults.Admin.Token))
 
 	// Storage defaults
 	l.v.SetDefault("storage.shard_count", defaults.Storage.ShardCount)
@@ -140,7 +143,7 @@ func (l *Loader) setDefaults() {
 
 	// Auth defaults (ADR-0009: shipped, and off)
 	l.v.SetDefault("auth.enabled", defaults.Auth.Enabled)
-	l.v.SetDefault("auth.token", defaults.Auth.Token)
+	l.v.SetDefault("auth.token", string(defaults.Auth.Token))
 }
 
 // buildConfig creates a Config from viper values

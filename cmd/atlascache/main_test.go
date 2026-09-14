@@ -204,11 +204,11 @@ func TestNewCoreRejectsBadConfiguration(t *testing.T) {
 
 func TestWatchConfig(t *testing.T) {
 	t.Run("no config file, no watcher", func(t *testing.T) {
-		assert.Nil(t, watchConfig("", nil, nil, zerolog.Nop()))
+		assert.Nil(t, watchConfig("", nil, nil, nil, zerolog.Nop()))
 	})
 
 	t.Run("an unreadable path is not fatal", func(t *testing.T) {
-		assert.Nil(t, watchConfig(filepath.Join(t.TempDir(), "absent.yaml"), nil, nil, zerolog.Nop()))
+		assert.Nil(t, watchConfig(filepath.Join(t.TempDir(), "absent.yaml"), nil, nil, nil, zerolog.Nop()))
 	})
 
 	t.Run("a real file is watched and applied", func(t *testing.T) {
@@ -216,7 +216,8 @@ func TestWatchConfig(t *testing.T) {
 		require.NoError(t, os.WriteFile(path, []byte("eviction:\n  policy: \"lru\"\n"), 0o600))
 
 		c := startedCore(t, testConfig())
-		watcher := watchConfig(path, c, nil, zerolog.Nop())
+		reported := newEffectiveConfig(testConfig())
+		watcher := watchConfig(path, c, nil, reported, zerolog.Nop())
 		require.NotNil(t, watcher)
 		defer func() { assert.NoError(t, watcher.Stop()) }()
 
@@ -225,6 +226,13 @@ func TestWatchConfig(t *testing.T) {
 		assert.True(t, eventually(t, 5*time.Second, func() bool {
 			return c.eviction.Policy() == eviction.PolicyFIFO
 		}), "the policy follows the file")
+
+		// The admin API reports what the reload applied, not what the process
+		// started with: /config would otherwise answer with a policy the node
+		// stopped running minutes ago.
+		eviction, ok := reported.EffectiveConfig()["eviction"].(map[string]any)
+		require.True(t, ok, "the reported configuration has an eviction section")
+		assert.Equal(t, "fifo", eviction["policy"])
 	})
 }
 

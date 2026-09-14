@@ -148,6 +148,46 @@ func (s *Server) Addr() string {
 // Limits reports the per-connection bounds this server enforces.
 func (s *Server) Limits() ConnLimits { return s.limits }
 
+// ConnStats is the connection accounting INFO reports, exported so the admin
+// API can serve the same numbers from the same place.
+//
+// It exists because /stats and STATS otherwise diverge: ten of these figures
+// live only in this package, and the alternative — a second set of counters on
+// the admin side — is exactly the drift that having one source is meant to
+// prevent. Two endpoints disagreeing about how many clients are connected is
+// the kind of thing that costs an hour during an incident.
+type ConnStats struct {
+	ConnectionsReceived uint64
+	CommandsProcessed   uint64
+	Connected           int64
+	Rejected            uint64
+	IdleClosed          uint64
+	OutputClosed        uint64
+	StalledClosed       uint64
+	RequestClosed       uint64
+	HandlerPanics       uint64
+	UptimeSeconds       uint64
+}
+
+// ConnStats returns a snapshot of the connection counters. The fields are read
+// independently, so a snapshot may straddle a concurrent update — reporting
+// them consistently would mean a lock on the accept path to serve a statistic,
+// which is the wrong trade.
+func (s *Server) ConnStats() ConnStats {
+	return ConnStats{
+		ConnectionsReceived: s.conns.connectionsReceived.Load(),
+		CommandsProcessed:   s.conns.commandsProcessed.Load(),
+		Connected:           s.conns.connected.Load(),
+		Rejected:            s.conns.rejected.Load(),
+		IdleClosed:          s.conns.idleClosed.Load(),
+		OutputClosed:        s.conns.outputClosed.Load(),
+		StalledClosed:       s.conns.stalledClosed.Load(),
+		RequestClosed:       s.conns.requestClosed.Load(),
+		HandlerPanics:       s.conns.panics.Load(),
+		UptimeSeconds:       uint64(uptime().Seconds()),
+	}
+}
+
 // Serve blocks until the server is shut down
 func (s *Server) Serve() error {
 	return s.transport.Serve(s)

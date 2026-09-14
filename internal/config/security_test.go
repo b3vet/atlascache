@@ -172,7 +172,10 @@ func TestLoadSecuritySections(t *testing.T) {
 	assert.Equal(t, "/etc/atlascache/server.crt", cfg.TLS.CertFile)
 	assert.Equal(t, "/etc/atlascache/server.key", cfg.TLS.KeyFile)
 	assert.True(t, cfg.Auth.Enabled)
-	assert.Equal(t, "from-the-file", cfg.Auth.Token)
+	assert.Equal(t, Secret("from-the-file"), cfg.Auth.Token)
+	// Reading the real value took a conversion. Every other way of getting at
+	// it — printing it, encoding it, logging it — yields the redaction.
+	assert.Equal(t, RedactedValue, cfg.Auth.Token.String())
 }
 
 func TestLoadRefusesTTLBothDisabled(t *testing.T) {

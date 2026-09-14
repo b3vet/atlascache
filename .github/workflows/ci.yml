@@ -36,6 +36,13 @@ jobs:
       - name: Build e2e runner
         run: make build-e2e
 
+      # The SDK is its own module and nothing in the root module imports it, so
+      # `make build` never compiles it. Without this, a broken SDK reaches the
+      # test job rather than the build one -- and on a day the tests are skipped
+      # it would reach main.
+      - name: Build the Go SDK
+        run: cd pkg/client && go build ./...
+
       - name: Verify the binary runs
         run: ./bin/atlascache --version
 
@@ -54,12 +61,15 @@ jobs:
           go-version: ${{ matrix.go }}
           cache: true
 
-      - name: Unit tests with race detection (both modules)
+      - name: Unit tests with race detection (all three modules)
         run: make test
 
       # `go mod tidy -diff` answers "is it tidy?" directly, without depending on
-      # git state the way a `make deps` + `git diff` pair would.
-      - name: Verify go.mod and go.sum are tidy
+      # git state the way a `make deps` + `git diff` pair would. The same target
+      # asserts that pkg/client still has no dependencies at all, which is the
+      # only thing standing between a consumer and the server's graph
+      # (ADR-0015).
+      - name: Verify every go.mod is tidy and the SDK has no dependencies
         run: make tidy-check
 
   lint:
@@ -78,7 +88,7 @@ jobs:
       - name: Install golangci-lint
         run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
 
-      - name: Lint both modules
+      - name: Lint all three modules
         run: make lint
 
   e2e:

@@ -1,0 +1,33 @@
+version: 1
+name: admin-config-redact
+tier: full
+feature: FEAT-0030
+description: >
+  GET /config never returns a token value anywhere in its body.
+
+  The tokens below are distinctive so the assertion can scan the whole response
+  rather than read two named fields: a field-by-field check passes against a
+  body that leaked the same secret through a nested or newly added path, which
+  is the failure this spec exists to catch.
+
+  The client token is the one with the most to lose. Whoever reached this
+  endpoint already holds the admin token; a reply carrying auth.token would hand
+  them a credential for the data port as well.
+
+config:
+  admin:
+    token: "ADMIN-TOKEN-e2e-must-never-appear-4c19d7a3"
+  auth:
+    enabled: true
+    token: "CLIENT-TOKEN-e2e-must-never-appear-8e52f0b6"
+
+steps:
+  # PING is on the pre-auth allowlist, so this works on an authenticated port
+  # and proves the server is up before anything is asserted about it.
+  - cmd: PING
+    expect: PONG
+
+  - scenario: admin_config_redacts_every_token
+
+  - cmd: PING
+    expect: PONG

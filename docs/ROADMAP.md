@@ -27,10 +27,14 @@ A single node you can actually run.
 - Admin HTTP API: health and stats
 - Docker image and configuration reference
 
-## v0.2.0 — Trustworthy · *planned*
+## v0.2.0 — Fast to reach, then trustworthy · *planned*
 
-Durable and observable.
-
+- **Faster node-to-node communication.** Benchmarking found that on an
+  unpipelined request, 99% of the time is spent in the network path rather than
+  in the cache itself — AtlasCache is within 1.7% of a server that stores
+  nothing at all. A distributed cache pays that cost on every hop, so the link
+  between instances gets measured and made cheap before clustering is built on
+  top of it.
 - Snapshot persistence with checksums
 - Write-ahead log with configurable fsync
 - Crash recovery from snapshot plus WAL replay
@@ -47,13 +51,16 @@ Distributed.
 - `MOVED` redirects for cluster-aware clients
 - Background anti-entropy repair
 
-## v0.4.0 — Fast · *planned*
+## v0.4.0 — *under review*
 
-The performance release.
+Originally the performance release: a purpose-built binary protocol alongside
+RESP, and an event-loop networking transport.
 
-- ATCP, a purpose-built binary protocol, alongside RESP
-- Event-loop networking transport
-- Zero-allocation hot paths
+Benchmarking in v0.1.0 put both in doubt, and they are being re-examined rather
+than assumed. Protocol decoding turned out to be roughly 0.7% of a request's
+cost, and an event-loop transport measured faster only for unpipelined traffic
+— it was slower than the current design under the batching a cache actually
+does. What replaces this is decided on measurements, not on the original plan.
 
 ## Beyond
 

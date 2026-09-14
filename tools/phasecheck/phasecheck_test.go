@@ -347,9 +347,14 @@ func TestCoverageThresholdIsPerPhase(t *testing.T) {
 func TestCoverageFailureNamesTheModuleAndTheNumbers(t *testing.T) {
 	run := func(dir, name string, args ...string) commandResult {
 		if name == "go" && len(args) > 1 && args[0] == "tool" && args[1] == "cover" {
-			total := "91.0"
-			if !strings.HasSuffix(filepath.Clean(dir), filepath.Join("test", "e2e")) {
-				total = "74.1"
+			// A distinct figure per module, so a row that transposed two of them
+			// would be visible rather than coincidentally right.
+			total := "74.1"
+			switch {
+			case strings.HasSuffix(filepath.Clean(dir), filepath.Join("test", "e2e")):
+				total = "91.0"
+			case strings.HasSuffix(filepath.Clean(dir), filepath.Join("pkg", "client")):
+				total = "85.0"
 			}
 			return commandResult{Output: "total:\t(statements)\t" + total + "%\n"}
 		}
@@ -362,7 +367,7 @@ func TestCoverageFailureNamesTheModuleAndTheNumbers(t *testing.T) {
 		out, detail := g.checkCoverage()
 
 		assert.Equal(t, fail, out)
-		assert.Equal(t, "root 74.1% < 80% (measured: root 74.1%, test/e2e 91.0%)", detail,
+		assert.Equal(t, "root 74.1% < 80% (measured: root 74.1%, pkg/client 85.0%, test/e2e 91.0%)", detail,
 			"the row must state the shortfall and keep the passing module's figure visible")
 	})
 
@@ -378,7 +383,7 @@ func TestCoverageFailureNamesTheModuleAndTheNumbers(t *testing.T) {
 		out, detail := g.checkCoverage()
 
 		assert.Equal(t, fail, out)
-		assert.Equal(t, "root 12.5% < 80%, test/e2e 12.5% < 80%", detail)
+		assert.Equal(t, "root 12.5% < 80%, pkg/client 12.5% < 80%, test/e2e 12.5% < 80%", detail)
 	})
 
 	t.Run("the same numbers clear the P0 threshold", func(t *testing.T) {
@@ -387,11 +392,11 @@ func TestCoverageFailureNamesTheModuleAndTheNumbers(t *testing.T) {
 		out, detail := g.checkCoverage()
 
 		assert.Equal(t, pass, out)
-		assert.Equal(t, "root 74.1%, test/e2e 91.0%", detail)
+		assert.Equal(t, "root 74.1%, pkg/client 85.0%, test/e2e 91.0%", detail)
 	})
 }
 
-func TestBothModulesAreTested(t *testing.T) {
+func TestEveryModuleIsTested(t *testing.T) {
 	var dirs []string
 	run := func(dir, name string, args ...string) commandResult {
 		if name == "go" && args[0] == "test" {
@@ -406,9 +411,9 @@ func TestBothModulesAreTested(t *testing.T) {
 	out, detail := g.checkRace()
 
 	assert.Equal(t, pass, out)
-	assert.Equal(t, "root and test/e2e pass", detail)
-	assert.Equal(t, []string{"/repo", "/repo/test/e2e"}, dirs,
-		"`go test ./...` in the root module does not reach the e2e module")
+	assert.Equal(t, "root, pkg/client and test/e2e pass", detail)
+	assert.Equal(t, []string{"/repo", "/repo/pkg/client", "/repo/test/e2e"}, dirs,
+		"`go test ./...` in the root module reaches neither the SDK nor the e2e module")
 }
 
 func TestFailingTestsFailTheRaceCheckAndVoidCoverage(t *testing.T) {

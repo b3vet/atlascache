@@ -40,9 +40,12 @@ func (e *MultiValidationError) Error() string {
 // Field names used in more than one message. A combination check has to name
 // every field involved, since naming one of them does not say what to change.
 const (
-	fieldAdminPort = "admin.port"
-	fieldTTLActive = "ttl.active_expiration"
-	fieldTTLLazy   = "ttl.lazy_expiration"
+	fieldAdminPort     = "admin.port"
+	fieldAdminBindAddr = "admin.bind_addr"
+	fieldAdminToken    = "admin.token"
+	fieldAuthToken     = "auth.token"
+	fieldTTLActive     = "ttl.active_expiration"
+	fieldTTLLazy       = "ttl.lazy_expiration"
 )
 
 // Validate checks whether the configuration is one the server can honor.
@@ -61,7 +64,7 @@ func Validate(cfg *Config) error {
 	}
 
 	// Validate admin config
-	if err := validateAdmin(&cfg.Admin, &cfg.Server); err != nil {
+	if err := validateAdmin(&cfg.Admin, &cfg.Server, &cfg.Auth); err != nil {
 		errs = append(errs, err...)
 	}
 
@@ -246,13 +249,14 @@ func validateRequestSize(cfg *ServerConfig, storage *StorageConfig) []*Validatio
 // besides the value: the command name, the key, and the length headers.
 const protocolFraming = 64 * 1024
 
-func validateAdmin(cfg *AdminConfig, server *ServerConfig) []*ValidationError {
+func validateAdmin(cfg *AdminConfig, server *ServerConfig, auth *AuthConfig) []*ValidationError {
 	var errs []*ValidationError
 
-	if err := validateBindAddr("admin.bind_addr", cfg.BindAddr); err != nil {
-		errs = append(errs, err)
+	bindErr := validateBindAddr(fieldAdminBindAddr, cfg.BindAddr)
+	if bindErr != nil {
+		errs = append(errs, bindErr)
 	}
-	if err := validatePort("admin.port", cfg.Port); err != nil {
+	if err := validatePort(fieldAdminPort, cfg.Port); err != nil {
 		errs = append(errs, err)
 	}
 
@@ -264,7 +268,69 @@ func validateAdmin(cfg *AdminConfig, server *ServerConfig) []*ValidationError {
 		})
 	}
 
+	// Only when the address parses: "is it loopback" has no answer for an
+	// address that is not an address, and reporting the exposure guard on top
+	// of the malformed-address error would send the operator after the wrong
+	// field.
+	if bindErr == nil {
+		if err := validateAdminExposure(cfg); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := validateAdminTokenSeparation(cfg, auth); err != nil {
+		errs = append(errs, err)
+	}
+
 	return errs
+}
+
+// validateAdminExposure is the guard ADR-0023 requires: binding the admin API
+// to a non-loopback address without an admin token is refused at startup.
+//
+// P0 could not enforce it. FEAT-0010 excluded auth and there was no
+// admin.token to require, so the skeleton logged a WARN naming the exposure and
+// carried on — which is how a warning that was always meant to be an error
+// stays a warning. FEAT-0030 adds the token, so the guard becomes real.
+//
+// The message spends its length on the two ways out rather than on the refusal.
+// A bare "invalid config: admin.bind_addr" against a value the operator typed
+// on purpose reads as a bug in the server, and the operator's next move is to
+// look for a way around it rather than to pick one of the two fixes.
+func validateAdminExposure(cfg *AdminConfig) *ValidationError {
+	if cfg.IsLoopback() || cfg.Token.IsSet() {
+		return nil
+	}
+
+	return &ValidationError{
+		Field: fieldAdminBindAddr,
+		Message: "is " + cfg.BindAddr + ", which is reachable from other hosts, while " + fieldAdminToken +
+			" is not set: the admin API would serve statistics and the effective configuration " +
+			"to anyone who can reach that address, with no credential (ADR-0023). " +
+			"Set " + fieldAdminToken + " to require one, or set " + fieldAdminBindAddr +
+			" to 127.0.0.1 so the API is reachable only from this host.",
+	}
+}
+
+// validateAdminTokenSeparation keeps the two credentials apart.
+//
+// ADR-0023 asks for a separate admin.token so that a client holding a data
+// token does not thereby gain administrative access. Setting both to the same
+// string satisfies the schema and defeats the decision: every data client would
+// hold a working admin credential, and rotating one would silently rotate the
+// other. It is refused rather than warned about, because the configuration has
+// no use that setting them to different values does not serve better.
+func validateAdminTokenSeparation(cfg *AdminConfig, auth *AuthConfig) *ValidationError {
+	if !cfg.Token.IsSet() || cfg.Token != auth.Token {
+		return nil
+	}
+
+	return &ValidationError{
+		Field: fieldAdminToken,
+		Message: "must not be the same value as " + fieldAuthToken + ": the admin API is more powerful " +
+			"than the data port, and sharing the secret gives every data client administrative access " +
+			"and makes either token impossible to rotate on its own (ADR-0023). " +
+			"Give " + fieldAdminToken + " a value of its own.",
+	}
 }
 
 func validateBindAddr(field, addr string) *ValidationError {
@@ -422,7 +488,7 @@ func validateTLS(cfg *TLSConfig) []*ValidationError {
 func validateAuth(cfg *AuthConfig) []*ValidationError {
 	if cfg.Enabled && cfg.Token == "" {
 		return []*ValidationError{{
-			Field:   "auth.token",
+			Field:   fieldAuthToken,
 			Message: "must be set when auth.enabled is true",
 		}}
 	}

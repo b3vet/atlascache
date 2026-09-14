@@ -341,7 +341,13 @@ func TestServerAdminValidationAccepts(t *testing.T) {
 		mutate func(*Config)
 	}{
 		{name: "hostname bind addr", mutate: func(c *Config) { c.Server.BindAddr = "localhost" }},
-		{name: "dotted hostname", mutate: func(c *Config) { c.Admin.BindAddr = "cache.internal" }},
+		{
+			// A non-loopback admin bind is accepted, but only with a token:
+			// exposure plus no credential is refused at startup (ADR-0023), and
+			// TestAdminExposureGuard covers the refusal.
+			name:   "dotted hostname with an admin token",
+			mutate: func(c *Config) { c.Admin.BindAddr = "cache.internal"; c.Admin.Token = "an-admin-token" },
+		},
 		{name: "ipv6 bind addr", mutate: func(c *Config) { c.Server.BindAddr = "::" }},
 		{name: "boundary ports", mutate: func(c *Config) { c.Server.ClientPort = 1; c.Admin.Port = 65535 }},
 	}

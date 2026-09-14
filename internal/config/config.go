@@ -72,10 +72,34 @@ type ServerConfig struct {
 	MaxOutputBuffer string `mapstructure:"max_output_buffer"`
 }
 
-// AdminConfig contains admin HTTP API settings
+// AdminConfig contains admin HTTP API settings.
+//
+// The admin API is strictly more powerful than the data port: it reads
+// statistics and configuration, and later phases add backup and rebalancing
+// triggers. ADR-0023 therefore gives it its own credential rather than reusing
+// auth.token — a client holding a data token must not thereby gain
+// administrative access — and refuses the one combination that is almost
+// always a mistake: a non-loopback bind_addr with no token. See
+// validateAdminExposure.
 type AdminConfig struct {
 	BindAddr string `mapstructure:"bind_addr"` // Loopback by default (ADR-0023)
 	Port     int    `mapstructure:"port"`      // Admin HTTP port
+
+	// Token is the credential /stats, /stats/memory and /config require. The
+	// health endpoints never require it: a Kubernetes probe cannot present
+	// one, and blanket authentication would break the deployment model.
+	//
+	// Empty means the protected endpoints are open, which is only reachable
+	// while bind_addr is loopback. It is Secret-typed so that nothing can
+	// print it by reflection, by %v, or by encoding/json.
+	Token Secret `mapstructure:"token"`
+}
+
+// Redacted renders the admin configuration without its secret, so a config dump
+// or a debug log cannot leak the token by accident.
+func (c AdminConfig) Redacted() AdminConfig {
+	c.Token = Secret(c.Token.String())
+	return c
 }
 
 // TLSConfig contains client-facing TLS settings.
@@ -97,15 +121,13 @@ type TLSConfig struct {
 // see Redacted.
 type AuthConfig struct {
 	Enabled bool   `mapstructure:"enabled"` // false = open port, with a startup warning
-	Token   string `mapstructure:"token"`   // the shared secret AUTH compares against
+	Token   Secret `mapstructure:"token"`   // the shared secret AUTH compares against
 }
 
 // Redacted renders the auth configuration without its secret, so a config dump
 // or a debug log cannot leak the token by accident.
 func (c AuthConfig) Redacted() AuthConfig {
-	if c.Token != "" {
-		c.Token = "<redacted>"
-	}
+	c.Token = Secret(c.Token.String())
 	return c
 }
 
@@ -160,6 +182,7 @@ func Defaults() *Config {
 		Admin: AdminConfig{
 			BindAddr: "127.0.0.1",
 			Port:     8080,
+			Token:    "",
 		},
 		Storage: StorageConfig{
 			ShardCount:   0,   // Auto-detect
@@ -270,9 +293,19 @@ func (c *Config) AdminAddr() string {
 }
 
 // AdminIsLoopback reports whether the admin API is bound to a loopback address
-func (c *Config) AdminIsLoopback() bool {
-	if ip := net.ParseIP(c.Admin.BindAddr); ip != nil {
+func (c *Config) AdminIsLoopback() bool { return c.Admin.IsLoopback() }
+
+// IsLoopback reports whether the admin API is bound to an address reachable
+// only from this host.
+//
+// It is the question the ADR-0023 exposure guard turns on, so it is answered in
+// one place. "localhost" is treated as loopback by name: it resolves to a
+// loopback address on every system the server supports, and an operator who
+// wrote it meant loopback. Anything else — including 0.0.0.0, which binds every
+// interface — is exposure.
+func (c AdminConfig) IsLoopback() bool {
+	if ip := net.ParseIP(c.BindAddr); ip != nil {
 		return ip.IsLoopback()
 	}
-	return strings.EqualFold(c.Admin.BindAddr, "localhost")
+	return strings.EqualFold(c.BindAddr, "localhost")
 }

@@ -1,0 +1,24 @@
+version: 1
+name: admin-bind-guard
+tier: full
+feature: FEAT-0030
+description: >
+  Binding the admin API where other hosts can reach it, with no admin token, is
+  refused at startup with a message naming the cause and both ways out.
+
+  This is the P0 debt. FEAT-0010 could only log a warning, because there was no
+  admin.token to require; ADR-0023 always meant the combination to be a startup
+  failure. A warning that was always meant to become an error is exactly the
+  kind of thing that quietly stays a warning.
+
+steps:
+  # The running server is the loopback control: bound to 127.0.0.1 with no
+  # admin.token, which is the shipped default and must keep working.
+  - cmd: PING
+    expect: PONG
+
+  - scenario: admin_bind_guard_refuses_exposure
+
+  # Refusing those configurations out of band left this server untouched.
+  - cmd: PING
+    expect: PONG

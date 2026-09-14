@@ -12,6 +12,7 @@ bin/
 # Output of the go coverage tool
 *.out
 coverage.html
+coverage-sdk.html
 
 # Profiling
 *.prof

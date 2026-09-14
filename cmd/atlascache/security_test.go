@@ -138,7 +138,7 @@ func TestCertificateHotReloadThroughTheWatcher(t *testing.T) {
 	require.NoError(t, err)
 
 	core := startedCore(t, testConfig())
-	watcher := watchConfig(configPath, core, sec, zerolog.Nop())
+	watcher := watchConfig(configPath, core, sec, nil, zerolog.Nop())
 	require.NotNil(t, watcher)
 	defer func() { assert.NoError(t, watcher.Stop()) }()
 
@@ -171,27 +171,47 @@ func TestCertificateHotReloadThroughTheWatcher(t *testing.T) {
 }
 
 func TestLogExposureNamesWhatIsExposed(t *testing.T) {
-	t.Run("both disabled, both warned about", func(t *testing.T) {
+	t.Run("all three disabled, all three warned about", func(t *testing.T) {
 		var out bytes.Buffer
-		logExposure(zerolog.New(&out), config.Defaults())
+		logExposure(zerolog.New(&out), config.Defaults(), "127.0.0.1:8080")
 
 		written := out.String()
 		// The wording has to name the consequence, not the setting: an operator
 		// who reads "tls.enabled is false" learns only what they typed.
 		assert.Contains(t, written, "traffic is unencrypted")
 		assert.Contains(t, written, "full access")
+		assert.Contains(t, written, "admin.token is not set")
 		assert.Contains(t, written, "warn")
 	})
 
-	t.Run("both enabled, nothing warned about", func(t *testing.T) {
+	t.Run("all three set, nothing warned about", func(t *testing.T) {
 		var out bytes.Buffer
 		cfg := config.Defaults()
 		cfg.TLS.Enabled = true
 		cfg.Auth.Enabled = true
+		cfg.Admin.Token = "an-admin-token"
 
-		logExposure(zerolog.New(&out), cfg)
+		logExposure(zerolog.New(&out), cfg, "127.0.0.1:8080")
 
 		assert.Empty(t, out.String())
+	})
+
+	// What is left of P0's admin warning. The combination it named — exposed
+	// and unauthenticated — is now refused by validation, so the warning that
+	// remains covers the case that is merely worth saying out loud.
+	t.Run("a non-loopback bind with a token is exposure worth naming", func(t *testing.T) {
+		var out bytes.Buffer
+		cfg := config.Defaults()
+		cfg.TLS.Enabled = true
+		cfg.Auth.Enabled = true
+		cfg.Admin.BindAddr = "0.0.0.0"
+		cfg.Admin.Token = "an-admin-token"
+
+		logExposure(zerolog.New(&out), cfg, "0.0.0.0:8080")
+
+		written := out.String()
+		assert.Contains(t, written, "reachable from other hosts")
+		assert.NotContains(t, written, "an-admin-token", "a warning about a token must not carry it")
 	})
 }
 

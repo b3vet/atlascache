@@ -1,0 +1,45 @@
+version: 1
+name: admin-auth
+tier: full
+feature: FEAT-0030
+description: >
+  Everything but the health endpoints requires the admin token, and the client
+  token is not it.
+
+  ADR-0023 asks for a second credential precisely so that a client holding a
+  data token does not thereby gain administrative access, and the case worth
+  asserting is the one where the wrong token is a real, configured, working
+  token rather than a random string.
+
+config:
+  admin:
+    token: "e2e-admin-token-2f7b81ce"
+  auth:
+    # Configured and deliberately not enabled: the harness client drives this
+    # spec through the data port, and the point here is that the value of
+    # auth.token opens nothing on the admin port. Whether the data port is
+    # gating on it is auth-required's business.
+    enabled: false
+    token: "e2e-client-token-a03d95f6"
+
+steps:
+  - cmd: PING
+    expect: PONG
+
+  - scenario: admin_protected_endpoints_need_the_token
+
+  # A little traffic, so the figures the next scenario compares are not all
+  # zero: two counters that are both zero agree without proving anything.
+  - cmd: SET admin:auth:key value
+    expect: OK
+
+  - cmd: GET admin:auth:key
+    expect: value
+
+  - cmd: GET admin:auth:missing
+    expect: NIL
+
+  - scenario: admin_stats_matches_the_stats_command
+
+  - cmd: DEL admin:auth:key
+    expect: 1

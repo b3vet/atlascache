@@ -76,9 +76,39 @@ func run() int {
 		return 1
 	}
 
+	// The admin listener binds and starts serving before the engine exists, and
+	// the node reports itself not-ready until everything below is up.
+	//
+	// The ordering is the whole point of splitting liveness from readiness. An
+	// orchestrator probing a process that is still building its engine — or,
+	// from P5, still replaying a snapshot — must get an answer. A connection
+	// refused is a failed liveness probe, and a failed liveness probe restarts
+	// a process that was starting normally, which puts it straight back where
+	// it was. So /health/live answers from here on, while /health/ready keeps
+	// saying no until the listeners are actually serving.
+	serveErr := make(chan error, 2)
+	adminConfig := newEffectiveConfig(cfg)
+	adm, err := admin.New(ctx, cfg.AdminAddr(), logging.WithComponent("admin"),
+		admin.WithToken(string(cfg.Admin.Token)),
+		admin.WithConfig(adminConfig))
+	if err != nil {
+		log.Error().Err(err).Msg("failed to bind admin port")
+		return 1
+	}
+	go func() { serveErr <- adm.Serve() }()
+
+	// Every failure below this line has to take the admin listener down with
+	// it, or the process exits while a goroutine is still serving probes.
+	stopAdmin := func() {
+		if shutdownErr := adm.Shutdown(context.Background()); shutdownErr != nil {
+			log.Debug().Err(shutdownErr).Msg("admin listener shutdown failed")
+		}
+	}
+
 	cache, err := newCore(cfg)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to build the storage engine")
+		stopAdmin()
 		return 1
 	}
 	defer cache.close()
@@ -93,6 +123,7 @@ func run() int {
 	limits, err := connLimits(cfg)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to read the connection limits")
+		stopAdmin()
 		return 1
 	}
 
@@ -103,17 +134,13 @@ func run() int {
 		append(sec.options(), server.WithConnLimits(limits))...)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to bind client port")
+		stopAdmin()
 		return 1
 	}
 
-	adm, err := admin.New(ctx, cfg.AdminAddr(), logging.WithComponent("admin"))
-	if err != nil {
-		log.Error().Err(err).Msg("failed to bind admin port")
-		if shutdownErr := srv.Shutdown(context.Background()); shutdownErr != nil {
-			log.Debug().Err(shutdownErr).Msg("client listener shutdown failed")
-		}
-		return 1
-	}
+	// One source for the figures, so /stats and the STATS command cannot
+	// disagree: both read this keyspace and these limits (FEAT-0030).
+	adm.SetStats(adminStats{store: store, srv: srv})
 
 	logBanner(log, cfg, configFile, srv.Addr(), adm.Addr())
 
@@ -121,7 +148,7 @@ func run() int {
 
 	// Hot-reload is best-effort: a node that cannot watch its config file still
 	// serves, it just needs a restart to pick up a policy change.
-	watcher := watchConfig(configFile, cache, sec, log)
+	watcher := watchConfig(configFile, cache, sec, adminConfig, log)
 	if watcher != nil {
 		defer func() {
 			if err := watcher.Stop(); err != nil {
@@ -130,10 +157,11 @@ func run() int {
 		}()
 	}
 
-	serveErr := make(chan error, 2)
 	go func() { serveErr <- srv.Serve() }()
-	go func() { serveErr <- adm.Serve() }()
 
+	// Readiness flips only here, once the client listener is serving: it is the
+	// answer to "should traffic be sent to this node", and everything above was
+	// the node not yet being able to take any.
 	adm.SetReady(true)
 	log.Info().Msg("atlascache ready")
 
@@ -324,7 +352,7 @@ func (c *core) applyConfig(cfg *config.Config, log zerolog.Logger) {
 // watchConfig starts the config watcher, returning nil when there is nothing to
 // watch or the watch could not be established. Neither is fatal: hot-reload is
 // a convenience, and the node runs the configuration it started with.
-func watchConfig(path string, c *core, sec *security, log zerolog.Logger) *config.Watcher {
+func watchConfig(path string, c *core, sec *security, reported *effectiveConfig, log zerolog.Logger) *config.Watcher {
 	if path == "" {
 		return nil
 	}
@@ -339,6 +367,11 @@ func watchConfig(path string, c *core, sec *security, log zerolog.Logger) *confi
 		c.applyConfig(cfg, log)
 		if sec != nil {
 			sec.applyConfig(cfg, log)
+		}
+		// Last, so /config never reports a configuration that has not been
+		// applied yet. It is still ahead of the fields a reload cannot change.
+		if reported != nil {
+			reported.set(cfg)
 		}
 	})
 
@@ -389,12 +422,21 @@ func shutdown(srv *server.Server, adm *admin.Server, c *core) error {
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
-	admErr := adm.Shutdown(ctx)
+	// The client listener drains first and the admin listener closes last.
+	//
+	// The order matters to an orchestrator. Readiness has already gone false,
+	// so the probe's job for the rest of the drain is to keep saying so — and
+	// it cannot say anything once its port is closed. Closing the admin
+	// listener first turns the drain into connection-refused on both probes,
+	// which a liveness check reads as a dead process and answers by killing a
+	// pod that was shutting down in an orderly way.
 	srvErr := srv.Shutdown(ctx)
 
-	// Expiry stops after the listeners drain, so an in-flight command never
-	// finds the keyspace half-managed.
+	// Expiry stops after the client listener drains, so an in-flight command
+	// never finds the keyspace half-managed.
 	ttlErr := c.stop(ctx)
+
+	admErr := adm.Shutdown(ctx)
 
 	return errors.Join(admErr, srvErr, ttlErr)
 }
@@ -431,13 +473,7 @@ func logBanner(log zerolog.Logger, cfg *config.Config, configFile, clientAddr, a
 		Str("log_level", cfg.Logging.Level).
 		Msg("atlascache starting")
 
-	logExposure(log, cfg)
-
-	if !cfg.AdminIsLoopback() {
-		log.Warn().
-			Str("admin_addr", adminAddr).
-			Msg("admin API is not bound to loopback — it is unauthenticated and reachable from other hosts")
-	}
+	logExposure(log, cfg, adminAddr)
 }
 
 // logExposure names what is exposed by the defaults, which ADR-0009 requires
@@ -447,11 +483,31 @@ func logBanner(log zerolog.Logger, cfg *config.Config, configFile, clientAddr, a
 // false" tells an operator what they already typed; "traffic is unencrypted"
 // tells them what it costs, and that is the difference between a warning that
 // is acted on and one that is scrolled past.
-func logExposure(log zerolog.Logger, cfg *config.Config) {
+func logExposure(log zerolog.Logger, cfg *config.Config, adminAddr string) {
 	if !cfg.TLS.Enabled {
 		log.Warn().Msg("TLS disabled — traffic is unencrypted. Do not use in production.")
 	}
 	if !cfg.Auth.Enabled {
 		log.Warn().Msg("auth disabled — any client that can reach this port has full access.")
+	}
+
+	// What is left of P0's admin warning.
+	//
+	// The dangerous case it named — exposed and unauthenticated — is no longer
+	// reachable: config validation refuses a non-loopback admin.bind_addr with
+	// no admin.token, so the process does not start (ADR-0023, FEAT-0030). Two
+	// safe-but-worth-saying cases remain, and each names what is exposed rather
+	// than which setting produced it.
+	if !cfg.AdminIsLoopback() {
+		log.Warn().
+			Str("admin_addr", adminAddr).
+			Msg("admin API is reachable from other hosts — it serves statistics and the effective " +
+				"configuration to anyone holding admin.token.")
+	}
+	if !cfg.Admin.Token.IsSet() {
+		log.Warn().
+			Str("admin_addr", adminAddr).
+			Msg("admin.token is not set — anything that can reach the admin address on this host " +
+				"can read statistics and the effective configuration. Set admin.token to require one.")
 	}
 }

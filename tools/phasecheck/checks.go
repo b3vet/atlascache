@@ -10,14 +10,20 @@ import (
 )
 
 // goModules are every module in the repository. `go test ./...` in the root
-// module does not reach test/e2e — it is a separate module — so each is run in
-// its own directory. A check that silently covered one of them would be worse
-// than no check at all.
+// module reaches neither pkg/client nor test/e2e — both are separate modules —
+// so each is run in its own directory. A check that silently covered one of
+// them would be worse than no check at all.
+//
+// Adding a module to the workspace means adding it here. Nothing enforces that,
+// which is the weakness of this list: the gate would keep reporting green while
+// covering less. `make tidy-check` is the closest thing to a tripwire, since it
+// fails when a module's go.mod drifts.
 var goModules = []struct {
 	Label string
 	Dir   string
 }{
 	{"root", "."},
+	{"pkg/client", "pkg/client"},
 	{"test/e2e", "test/e2e"},
 }
 
@@ -62,7 +68,7 @@ func (g *gate) checkRace() (outcome, string) {
 	if len(failures) > 0 {
 		return fail, strings.Join(failures, "; ")
 	}
-	return pass, strings.Join(labels, " and ") + " pass"
+	return pass, joinLabels(labels) + " pass"
 }
 
 func (g *gate) checkCoverage() (outcome, string) {
@@ -208,4 +214,17 @@ func summarizeDevindex(res commandResult) string {
 // record keeps a failed command's output for the tail printed under the table.
 func (g *gate) record(name string, res commandResult) {
 	g.transcripts = append(g.transcripts, transcript{Name: name, Output: res.Output})
+}
+
+// joinLabels renders a list of module names for a status row: "root and
+// test/e2e", "root, pkg/client and test/e2e". Reading a gate row is the whole
+// point of the row, and "a and b and c" reads like a bug.
+func joinLabels(labels []string) string {
+	switch len(labels) {
+	case 0:
+		return ""
+	case 1:
+		return labels[0]
+	}
+	return strings.Join(labels[:len(labels)-1], ", ") + " and " + labels[len(labels)-1]
 }

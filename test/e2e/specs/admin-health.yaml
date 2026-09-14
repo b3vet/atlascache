@@ -1,0 +1,34 @@
+version: 1
+name: admin-health
+tier: smoke
+feature: FEAT-0030
+description: >
+  The three health endpoints answer without credentials, and answer with
+  nothing but a status.
+
+  They are unauthenticated by design (ADR-0023), because a Kubernetes probe
+  cannot present one — so everything in a response is public, and the leak
+  check is a check on the field set rather than on any particular string.
+
+config:
+  # A configured admin token must make no difference here. The health
+  # endpoints are the one part of the API that never asks for one.
+  admin:
+    token: "e2e-admin-health-6c1b94fa"
+
+steps:
+  # The server is serving, which is the positive control for everything below:
+  # a node answering /health/ready with 200 has to be a node that answers PING.
+  - cmd: PING
+    expect: PONG
+
+  - scenario: admin_health_needs_no_credential
+
+  - scenario: admin_health_reveals_nothing
+
+  # The protected half is still protected on the same node, so the spec is not
+  # passing because authentication was simply off.
+  - scenario: admin_protected_endpoints_are_still_closed
+
+  - cmd: PING
+    expect: PONG

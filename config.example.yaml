@@ -52,12 +52,27 @@ server:
   max_output_buffer: "64MB"
 
 # Admin HTTP API configuration
+#
+# GET /health, /health/live and /health/ready need no credential, because a
+# Kubernetes probe cannot present one; they report liveness and readiness and
+# nothing else. GET /stats, /stats/memory and /config require admin.token.
 admin:
   # Bound to loopback by default; the admin API is more powerful than the
   # data port, so it is not remotely reachable unless changed deliberately
   bind_addr: "127.0.0.1"
   # Admin HTTP port (must differ from server.client_port)
   port: 8080
+  # The admin credential, and deliberately not auth.token: a client holding a
+  # data token must not thereby gain administrative access, and the two must be
+  # rotatable separately. Setting both to the same value is refused.
+  #
+  # Empty is allowed only while bind_addr is loopback. Binding a non-loopback
+  # address without a token is refused at startup, since that combination
+  # serves statistics and the effective configuration to anyone who can reach
+  # the port. In Docker and Kubernetes, where loopback inside a container is
+  # not reachable from a probe on another interface, set both: a bind_addr the
+  # probe can reach, and a token.
+  token: ""
 
 # Storage engine configuration
 storage:
