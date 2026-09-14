@@ -1,0 +1,56 @@
+#!/bin/sh
+#
+# Runs the smoke tier of the E2E suite against a real atlascache process before
+# every commit. ADR-0003 budgets smoke at under 30 seconds precisely so it can
+# sit here: the point of the gate is to catch a regression while it is still
+# attributable to one change.
+#
+# Skipped automatically during merges, rebases and cherry-picks, where the tree
+# is mid-operation and a failure says nothing useful.
+#
+# To bypass deliberately:  git commit --no-verify
+# To disable entirely:     git config atlascache.pregate false
+
+set -e
+
+if [ "$(git config --get atlascache.pregate)" = "false" ]; then
+    exit 0
+fi
+
+git_dir=$(git rev-parse --git-dir)
+for state in MERGE_HEAD REBASE_HEAD CHERRY_PICK_HEAD REVERT_HEAD; do
+    if [ -e "$git_dir/$state" ]; then
+        echo "pre-commit: $state present, skipping the smoke gate"
+        exit 0
+    fi
+done
+
+# An empty commit or a docs-only change still gets the gate: specs are data, and
+# a broken spec is exactly the kind of thing that should not reach a commit.
+
+printf 'pre-commit: building and running the smoke tier...\n'
+
+start=$(date +%s)
+if ! output=$(make e2e-smoke 2>&1); then
+    elapsed=$(( $(date +%s) - start ))
+    printf '\n%s\n' "$output" | tail -30
+    cat <<'MSG'
+
+pre-commit: the smoke tier failed, so this commit was not created.
+
+A previously-green run that fails means a regression was just introduced.
+That is a stop-work signal, not a flake to retry -- see ADR-0003.
+
+  make e2e-smoke                 reproduce
+  ./bin/atlas-e2e --spec NAME \
+      --binary ./bin/atlascache \
+      --specs test/e2e/specs     run one spec while fixing
+
+  git commit --no-verify         commit anyway, deliberately
+MSG
+    printf '\n(took %ss)\n' "$elapsed"
+    exit 1
+fi
+
+elapsed=$(( $(date +%s) - start ))
+printf 'pre-commit: %s (%ss)\n' "$(printf '%s' "$output" | tail -1 | sed 's/^ *//')" "$elapsed"
