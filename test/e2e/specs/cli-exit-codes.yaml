@@ -1,0 +1,28 @@
+version: 1
+name: cli-exit-codes
+tier: full
+feature: FEAT-0029
+description: >
+  The four outcomes and their four codes: success, a key that is not there, a
+  flag that does not exist, and a server that is not listening.
+
+  Distinguishing the second from the fourth is the point of the table. "The key
+  is missing" and "the server is down" call for different things from a script,
+  and a client that answers both with 1 forces it to parse English to tell them
+  apart — so the codes are asserted to be four distinct numbers as well as the
+  right ones.
+
+  The usage family gets its own pass, because it is the code a script author is
+  least likely to have thought about and the one they hit the moment they edit
+  the command line wrong. Every case there must also be silent on stdout: a
+  usage error is a diagnostic, and a script parsing output should get nothing
+  to parse.
+
+steps:
+  - cmd: PING
+    expect: PONG
+
+  - scenario: cli_exit_codes_distinguish_outcomes
+
+  - cmd: GET exit:key
+    expect: v

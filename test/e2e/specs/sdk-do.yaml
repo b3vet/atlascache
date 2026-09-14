@@ -1,0 +1,24 @@
+version: 1
+name: sdk-do
+tier: full
+feature: FEAT-0027
+description: >
+  Do, the escape hatch that keeps SDK releases decoupled from server releases
+  (ADR-0022): every command the server grows is reachable without waiting for
+  an SDK that wraps it.
+
+  What is asserted is the shape of what comes back — status, bulk, nil,
+  integer, array, map — and the two refusals that matter. A command the server
+  rejects is an error with a category and a connection that still works, so a
+  typo is survivable; and an argument the SDK cannot render is refused rather
+  than formatted with %v, because a struct that reached the wire as its Go
+  formatting would be stored, retrieved, and noticed much later.
+
+steps:
+  - cmd: PING
+    expect: PONG
+
+  - scenario: sdk_do_sends_arbitrary_commands
+
+  - cmd: EXISTS do:key do:ttl
+    expect: 2

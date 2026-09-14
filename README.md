@@ -61,15 +61,23 @@ another host unless you change `admin.bind_addr`.
 
 ```bash
 make help      # list all targets
-make test      # unit tests with race detection, both modules
-make lint      # golangci-lint, both modules
+make test      # unit tests with race detection, all three modules
+make lint      # golangci-lint, all three modules
 make check     # fmt, vet, lint, test
 make tools     # install golangci-lint and the git hooks
 ```
 
-This repository contains two Go modules — the root module and the end-to-end
-test suite under `test/e2e/` — tied together by `go.work`. Makefile targets
-cover both; a bare `go test ./...` at the root does not reach the E2E module.
+This repository contains three Go modules, tied together by `go.work`:
+
+| Module | Purpose |
+|--------|---------|
+| `github.com/b3vet/atlascache` | server, engine, tooling |
+| `github.com/b3vet/atlascache/pkg/client` | the Go SDK — **zero dependencies** |
+| `github.com/b3vet/atlascache/test/e2e` | the end-to-end suite |
+
+The SDK is its own module so that importing it does not pull in the server's
+dependencies. Makefile targets cover all three; a bare `go test ./...` at the
+root reaches none of the others.
 
 Commits follow [Conventional Commits](https://www.conventionalcommits.org/).
 `make tools` installs a hook that enforces the format.
@@ -86,10 +94,25 @@ atlascache/
 │   ├── protocol/         RESP codec
 │   ├── server/           transport and command dispatch
 │   └── storage/          sharded storage engine
+├── pkg/client/           Go SDK (separate module, no dependencies)
+├── cmd/atlasctl/         command-line client
 ├── tools/                repository tooling
 ├── test/e2e/             end-to-end suite (separate module)
+├── examples/             runnable programs, executed in CI
 └── docs/                 public documentation
 ```
+
+## Documentation
+
+| Guide | Covers |
+|-------|--------|
+| [docs/sdk-go.md](docs/sdk-go.md) | Using the Go SDK |
+| [docs/atlasctl.md](docs/atlasctl.md) | The CLI: commands, flags, exit codes, JSON output |
+| [docs/protocol.md](docs/protocol.md) | Supported commands and the guarantees they carry |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | What is coming, and in what order |
+
+Runnable programs live in [`examples/`](examples/) and are executed against a
+real server in CI, so they cannot drift from the code.
 
 ## Contributing
 

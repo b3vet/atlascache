@@ -2,6 +2,15 @@ module github.com/b3vet/atlascache
 
 go 1.24
 
+// The Go SDK is its own module (ADR-0015). atlasctl lives here and imports it,
+// so the dependency has to be declared even though go.work resolves it locally:
+// without the require and the replace below, a build outside the workspace --
+// CI, or anyone who fetches this module -- compiles atlasctl against whatever
+// version of the SDK is published rather than the one in this tree.
+require github.com/b3vet/atlascache/pkg/client v0.0.0
+
+replace github.com/b3vet/atlascache/pkg/client => ./pkg/client
+
 require (
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/fsnotify/fsnotify v1.9.0

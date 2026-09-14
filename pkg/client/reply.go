@@ -18,19 +18,50 @@ const opReply = "reply"
 // server it talks to starts answering HELLO 3.
 type ReplyType uint8
 
-// The reply shapes a caller may see.
+// The reply shapes a caller may see. Which one a command answers with is the
+// server's choice, so a caller reading a [Reply] from [Client.Do] uses the
+// conversion helpers rather than switching on this — they accept every shape
+// that can sensibly carry the value asked for.
 const (
 	// TypeNil is the null bulk string or null array. It is not an error: a
 	// cache miss is the most ordinary outcome there is.
 	TypeNil ReplyType = iota
+
+	// TypeStatus is a simple status line, "+OK" being the one every write
+	// answers with. Str holds the text without the leading plus.
 	TypeStatus
+
+	// TypeError is an error reply. Kind holds its first word and Str the whole
+	// line. A command sent through the SDK never returns one of these as a
+	// Reply — it is converted into an [*Error] first — so seeing one means it
+	// arrived nested inside an array.
 	TypeError
+
+	// TypeInteger is a ":" reply, carried in Int.
 	TypeInteger
+
+	// TypeBulk is a length-prefixed string of arbitrary bytes, carried in Str.
+	// It is what a value comes back as.
 	TypeBulk
+
+	// TypeArray is a multi-element reply, carried in Arr. A RESP3 set is
+	// normalized onto it, because a caller iterating one does not care.
 	TypeArray
+
+	// TypeMap is a RESP3 map, carried in Arr as alternating keys and values —
+	// the same layout a RESP2 server sends for the same reply, so
+	// [Reply.Map] reads either without knowing which arrived.
 	TypeMap
+
+	// TypeBool is a RESP3 boolean, carried in Int as 1 or 0.
 	TypeBool
+
+	// TypeDouble is a RESP3 double, carried in Float, with Str holding the
+	// text exactly as the server wrote it.
 	TypeDouble
+
+	// TypeBigNumber is a RESP3 big number, carried in Str as its digits
+	// because it may not fit in an int64.
 	TypeBigNumber
 
 	// TypePush is a RESP3 out-of-band message. Nothing in v0.1.0 produces one,
@@ -56,6 +87,9 @@ var replyTypeNames = map[ReplyType]string{
 	TypePush:      "push",
 }
 
+// String names the type for a human: "bulk string", "integer", "nil". It is
+// what a conversion error mentions when a reply turned out to be a perfectly
+// good one of some other shape.
 func (t ReplyType) String() string {
 	if name, ok := replyTypeNames[t]; ok {
 		return name
@@ -69,6 +103,8 @@ func (t ReplyType) String() string {
 // safe and a value containing a null byte or invalid UTF-8 is a value like any
 // other. The conversion helpers below are where a caller opts into a string.
 type Reply struct {
+	// Type is the shape this reply arrived in, and it decides which of the
+	// fields below carry anything.
 	Type ReplyType
 
 	// Str carries the bytes of a bulk string, the text of a status or error
@@ -102,6 +138,14 @@ func (r Reply) IsNil() bool { return r.Type == TypeNil }
 // A nil reply returns (nil, nil), because "no value" is not an error. A caller
 // that must tell a missing key from an empty one — both are legal, and the
 // server distinguishes them — checks IsNil rather than the length.
+//
+// The returned slice is read-only, under the same contract [Client.Get]
+// states: do not modify it, and copy it before keeping it past the call that
+// produced it. [Reply.Text] is the copying version.
+//
+// An integer, boolean or double reply is rendered as the digits the server
+// would have sent for it; an error reply is returned as an [*Error] rather
+// than as its text; any other shape is a mismatch and an ErrProtocol.
 func (r Reply) Bytes() ([]byte, error) {
 	switch r.Type {
 	case TypeNil:

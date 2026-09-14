@@ -1,0 +1,36 @@
+version: 1
+name: sdk-basic
+tier: smoke
+feature: FEAT-0027
+description: >
+  The SDK's typed methods against a live server, through the SDK rather than
+  around it.
+
+  Every other spec in this suite dials with the runner's own client, so that a
+  bug in pkg/client cannot cancel out a bug in the server (ADR-0003). This one
+  inverts that on purpose: it drives the SDK, so an SDK regression shows up
+  here while the protocol specs stay green — and that pattern of failure is
+  what says which of the two broke.
+
+  The assertions chosen are the ones where a plausible implementation gives a
+  different answer. A miss is not an error. An empty value is not a miss. A
+  value is bytes, not text. A scan is over when its cursor says so and not when
+  a page comes back short. Each of those is a decision the SDK makes, and each
+  is one another language binding will mirror in P10.
+
+steps:
+  # The suite's own client first, so that a failure below is the SDK's rather
+  # than a server that never came up.
+  - cmd: PING
+    expect: PONG
+
+  - scenario: sdk_typed_methods_round_trip
+
+  # Written by the SDK, read back by the independent client: the round trip
+  # above proved the SDK agrees with itself, and this proves it agreed with the
+  # server.
+  - cmd: GET sdk:text
+    expect: hello
+
+  - cmd: EXISTS sdk:empty
+    expect: 1

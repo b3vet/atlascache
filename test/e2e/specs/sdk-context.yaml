@@ -1,0 +1,27 @@
+version: 1
+name: sdk-context
+tier: full
+feature: FEAT-0028
+description: >
+  Cancellation and deadlines, honoured at the blocking point that matters: the
+  read.
+
+  "Returns promptly" is the requirement. A call that ignores its context until
+  the reply arrives makes every timeout in the calling service a lie, and it
+  will be the one that hangs in production. So the relay holds replies for
+  longer than the cancellation, and the call is timed.
+
+  The client has a pool of one, which makes the second half of the assertion
+  possible: a canceled call that leaked its connection would leave this client
+  with none, and a canceled call that returned its connection half-read would
+  hand the next caller the reply it abandoned. Both show up as the GET at the
+  end failing, and nothing else in the suite would notice either.
+
+steps:
+  - cmd: PING
+    expect: PONG
+
+  - scenario: sdk_honors_cancellation
+
+  - cmd: GET sdk:ctx
+    expect: v

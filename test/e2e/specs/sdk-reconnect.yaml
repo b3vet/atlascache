@@ -1,0 +1,29 @@
+version: 1
+name: sdk-reconnect
+tier: full
+feature: FEAT-0028
+description: >
+  A server restart is a pause inside one call rather than a run of failures
+  across many.
+
+  The client is built once and never rebuilt, which is the whole point: a test
+  that constructed a new client after the restart would assert nothing. The
+  harness gives a restarted server fresh ports, so a relay with a stable
+  address stands in for the load balancer or DNS name a deployment would have,
+  and the client keeps the address it was given.
+
+  At most one error may surface. A call that arrives while the server is coming
+  back waits, with jittered backoff, for as long as the reconnect window and
+  its own context allow — which is what makes "backoff with jitter" and "a
+  restart surfaces at most one error" reconcilable at all (FEAT-0028).
+
+steps:
+  - cmd: PING
+    expect: PONG
+
+  - scenario: sdk_survives_a_server_restart
+
+  # The runner's own client reconnects too, and the value the SDK wrote after
+  # the restart is there.
+  - cmd: GET sdk:restart
+    expect: after

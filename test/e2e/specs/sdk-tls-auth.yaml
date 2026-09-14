@@ -1,0 +1,36 @@
+version: 1
+name: sdk-tls-auth
+tier: full
+feature: FEAT-0027
+description: >
+  The SDK's connection setup: TLS, both AUTH forms, and the failures of each.
+
+  The negative cases are the reason this spec is worth running. A client that
+  "supports TLS" by trusting any certificate passes every positive test and
+  protects nobody, so one client here is given an empty trust store and must
+  fail. A client that reported a refused token as a network failure would have
+  its caller retry a credential that will never work, so the category is
+  asserted as well as the failure. And a plaintext client against a TLS port
+  must be refused rather than left hanging: a hang looks like a wedged server,
+  and that is the diagnosis its operator will pursue.
+
+config:
+  tls:
+    # cert_file and key_file are the harness's, like the ports.
+    enabled: true
+  auth:
+    enabled: true
+    token: "e2e-sdk-tls-auth-7c2e5a19"
+
+steps:
+  - cmd: PING
+    expect: PONG
+
+  - scenario: sdk_tls_and_auth
+
+  - cmd: AUTH e2e-sdk-tls-auth-7c2e5a19
+    expect: OK
+
+  # Written by the SDK over TLS, read back by the suite's own TLS client.
+  - cmd: EXISTS sdk:tls
+    expect: 1

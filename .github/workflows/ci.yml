@@ -107,6 +107,26 @@ jobs:
       - name: Run the full E2E tier
         run: make e2e-full
 
+  examples:
+    name: Examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_FLOOR }}
+          cache: true
+
+      # The examples are documentation, and documentation nothing has executed
+      # is a guess (FEAT-0031). This builds every program under examples/,
+      # starts real servers -- plaintext, with auth, and TLS -- and runs each
+      # one against them; every program fails if the SDK did something other
+      # than what it documents. The atlasctl tour at the end asserts every exit
+      # code and --json field docs/atlasctl.md publishes.
+      - name: Run every example against a live server
+        run: make examples
+
   commit-lint:
     name: Commit convention
     runs-on: ubuntu-latest

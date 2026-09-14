@@ -1,4 +1,4 @@
-.PHONY: build build-e2e test tidy-check fuzz lint bench bench-network clean fmt vet cover cover-sdk check deps tools e2e e2e-smoke e2e-full e2e-soak phase-check dev-index dev-certs help
+.PHONY: build build-ctl build-e2e cross-check test tidy-check fuzz lint bench bench-network clean fmt vet cover cover-sdk check deps tools e2e e2e-smoke e2e-full e2e-soak examples phase-check dev-index dev-certs help
 
 BINARY_NAME := atlascache
 BUILD_DIR   := bin
@@ -29,6 +29,25 @@ help:
 build:
 	@mkdir -p $(BUILD_DIR)
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY_NAME) ./cmd/atlascache
+
+## build-ctl: build the atlasctl CLI binary
+# The E2E suite finds it beside the server binary, which is why it lands in the
+# same directory rather than somewhere of its own.
+build-ctl:
+	@mkdir -p $(BUILD_DIR)
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/atlasctl ./cmd/atlasctl
+
+## cross-check: verify both binaries build for every released platform
+# FEAT-0029 requires the CLI to cross-compile; a release that discovers
+# otherwise discovers it at tag time, which is the worst moment for it.
+cross-check:
+	@for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do \
+		for pkg in ./cmd/atlascache ./cmd/atlasctl; do \
+			GOOS=$${target%/*} GOARCH=$${target#*/} CGO_ENABLED=0 $(GO) build -trimpath -o /dev/null $$pkg \
+				|| { echo "$$pkg does not build for $$target"; exit 1; }; \
+		done; \
+		echo "  $$target ok"; \
+	done
 
 ## build-e2e: build the e2e runner binary
 build-e2e:
@@ -99,16 +118,24 @@ cover-sdk:
 e2e: e2e-full
 
 ## e2e-smoke: run the smoke tier (fast, every commit)
-e2e-smoke: build build-e2e
+e2e-smoke: build build-ctl build-e2e
 	./$(BUILD_DIR)/atlas-e2e --tier smoke --binary ./$(BUILD_DIR)/$(BINARY_NAME) --specs $(E2E_DIR)/specs
 
 ## e2e-full: run the full tier (every PR, phase close)
-e2e-full: build build-e2e
+e2e-full: build build-ctl build-e2e
 	./$(BUILD_DIR)/atlas-e2e --tier full --binary ./$(BUILD_DIR)/$(BINARY_NAME) --specs $(E2E_DIR)/specs
 
 ## e2e-soak: run the soak tier (nightly, milestone close)
-e2e-soak: build build-e2e
+e2e-soak: build build-ctl build-e2e
 	./$(BUILD_DIR)/atlas-e2e --tier soak --binary ./$(BUILD_DIR)/$(BINARY_NAME) --specs $(E2E_DIR)/specs
+
+## examples: run every examples/ program against a live server
+# The examples are documentation, and documentation nothing has executed is a
+# guess (FEAT-0031). run.sh starts the servers it needs -- plaintext, with auth,
+# and TLS -- on ports it picks at run time, runs every program and the atlasctl
+# tour, and fails if any of them reports something other than what it documents.
+examples: build
+	./examples/run.sh --binary $(BUILD_DIR)/$(BINARY_NAME)
 
 ## phase-check: verify a phase is ready to close (PHASE=P0)
 phase-check:

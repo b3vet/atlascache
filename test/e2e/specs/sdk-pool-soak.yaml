@@ -1,0 +1,26 @@
+version: 1
+name: sdk-pool-soak
+tier: soak
+feature: FEAT-0028
+description: >
+  Sustained churn through the SDK: clients built and closed, callers coming and
+  going, for long enough that a connection leaked once per round would be
+  unmistakable.
+
+  The count is taken at the relay, which sees every connection the SDK opens
+  and every one it closes. That makes the assertion immune to whatever else is
+  running in parallel, and it makes "Close returns every connection" checkable
+  directly rather than by watching a number that ought to stop growing.
+
+  A client that leaked one connection per round would hold the server's
+  connection limit long before anything else noticed, which is exactly the kind
+  of failure that only a soak finds.
+
+steps:
+  - cmd: PING
+    expect: PONG
+
+  - scenario: sdk_pool_churn_leaks_nothing
+
+  - cmd: PING
+    expect: PONG

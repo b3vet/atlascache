@@ -1,0 +1,32 @@
+version: 1
+name: sdk-errors
+tier: full
+feature: FEAT-0028
+description: >
+  All six error categories, produced against a real server and checked to be
+  distinguishable with errors.Is.
+
+  The categories exist so that a caller decides what to do without matching on
+  strings (P3 §4.2). That promise is only worth something if every failure path
+  carries exactly one of them, so each error here is checked against the five
+  it must *not* be as well as the one it must: a client whose errors wrapped
+  every sentinel would pass a check that only looked for the right one, and
+  would make errors.Is useless to the caller it was built for.
+
+  Two of the six need help to happen. ErrTimeout comes from a listener that
+  accepts and never answers, and ErrProtocol from a relay that corrupts one
+  reply — a correct server produces neither, and the SDK's behaviour on both is
+  precisely what the pool's correctness rests on.
+
+config:
+  auth:
+    enabled: true
+    token: "e2e-sdk-errors-4f1c9b73"
+
+steps:
+  # PING is on the pre-auth allowlist, so this says the server is up without
+  # authenticating first.
+  - cmd: PING
+    expect: PONG
+
+  - scenario: sdk_error_categories

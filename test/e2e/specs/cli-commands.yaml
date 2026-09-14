@@ -1,0 +1,50 @@
+version: 1
+name: cli-commands
+tier: full
+feature: FEAT-0029
+description: >
+  Every atlasctl command against a live server, over TLS, with a token — so the
+  global flags are exercised by the commands rather than by a test of their own.
+
+  Three properties here are the ones a CLI usually gets wrong. A value reaches
+  stdout as the bytes the server holds, with no trailing newline and no
+  escaping, because stdout is a pipe: escaping is correct on a terminal and
+  corruption anywhere else, which is why the decision is made from what stdout
+  *is* rather than from a flag. --json is valid JSON on failure as well as on
+  success, because a client that prints a bare error string when things go
+  wrong breaks every script precisely in the case it was written for. And a
+  token passed in the environment stays out of `ps`, where the flag that does
+  the same job is visible to every user on the host.
+
+  The CLI is built on the SDK and holds no second protocol implementation, so
+  this spec is also the SDK's most demanding consumer.
+
+config:
+  tls:
+    enabled: true
+  auth:
+    enabled: true
+    token: "e2e-cli-commands-3b8d6f41"
+
+steps:
+  - cmd: PING
+    expect: PONG
+
+  - scenario: cli_commands_work_against_a_live_server
+
+  - scenario: cli_values_round_trip_through_stdout
+
+  - scenario: cli_json_is_stable_and_parsable
+
+  - scenario: cli_auth_prefers_the_environment
+
+  - cmd: AUTH e2e-cli-commands-3b8d6f41
+    expect: OK
+
+  # The suite's own client, confirming that the CLI's writes reached the server
+  # rather than only agreeing with themselves.
+  - cmd: GET cli:auth
+    expect: v
+
+  - cmd: EXISTS cli:empty cli:binary
+    expect: 2

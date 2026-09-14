@@ -51,6 +51,14 @@ var (
 // operation, the address, the server's error kind — while `errors.Is` against
 // the sentinel above answers the category question. Six types would have made
 // the category check a type switch, which is exactly the API ADR-0022 rejected.
+//
+// Reach for it when the category is not enough — to log which server failed, or
+// to read the kind the server put on a rejection:
+//
+//	var atlasErr *client.Error
+//	if errors.As(err, &atlasErr) && atlasErr.Kind == "OOM" {
+//		// the server is out of memory, not merely unhappy with the command
+//	}
 type Error struct {
 	// Category is one of the six sentinels above, or nil for a canceled call.
 	Category error
@@ -75,6 +83,15 @@ type Error struct {
 	Err error
 }
 
+// Error renders the failure as "atlascache: <op> <addr>: <detail>", for
+// example:
+//
+//	atlascache: GET cache.internal:6379: ERR value is not an integer
+//	atlascache: dial 127.0.0.1:6379: connect: connection refused
+//
+// The text is for a human and for a log line. It is not an interface: classify
+// with errors.Is against a category sentinel, or read the fields with
+// errors.As, and never by matching on this string.
 func (e *Error) Error() string {
 	var b strings.Builder
 	b.WriteString("atlascache")
@@ -118,10 +135,23 @@ func (e *Error) Unwrap() []error {
 
 // Retryable reports whether an error is one a retry could plausibly fix.
 //
-// It is the table in P3 §4.2 in one function: network and timeout failures may
-// be retried, and nothing else may. It says nothing about whether the *command*
-// is safe to retry — that is the caller's judgement, and the reason retries are
-// opt-in per call rather than automatic (FEAT-0028).
+// It is the table in P3 §4.2 in one function:
+//
+//	[ErrNetwork]   retryable    the dial, the write or the read failed
+//	[ErrTimeout]   retryable    a deadline expired, the caller's or a configured one
+//	[ErrProtocol]  no           the reply could not be decoded; the connection is discarded
+//	[ErrServer]    no           the command reached the server and was refused
+//	[ErrAuth]      no           the token is wrong, or the server wants one
+//	[ErrClosed]    no           Close has already run; a caller lifecycle bug
+//	cancellation   no           the caller canceled it, so the caller decides
+//
+// It exists so that a caller never has to rebuild that table by matching on
+// error strings, which is the failure mode a single opaque error type produces.
+//
+// It says nothing about whether the *command* is safe to retry — that is the
+// caller's judgment, and the reason retries are opt-in per call rather than
+// automatic (FEAT-0028). [Client.WithRetries] applies both tests: this one, and
+// whether the command's reply survives being asked for twice.
 func Retryable(err error) bool {
 	return errors.Is(err, ErrNetwork) || errors.Is(err, ErrTimeout)
 }

@@ -1,0 +1,32 @@
+version: 1
+name: sdk-pool
+tier: full
+feature: FEAT-0027
+description: >
+  The connection pool: that it reuses what it has, that it never opens more
+  than it was given, that a caller arriving at an exhausted pool waits on its
+  own context rather than causing another connection, and that a connection
+  which has seen a protocol error is discarded rather than reused.
+
+  The last one is the case with real consequences. A connection that failed to
+  decode a reply is at an unknown stream position, so returning it to the pool
+  hands the next caller what was left behind — one caller receiving another
+  caller's data, which is a disclosure bug and not a performance one. The relay
+  in front of the server leaves the real reply in the stream behind the
+  corruption, so a client that reused the connection answers the second GET
+  with the first GET's value and says nothing about it.
+
+  Connections are counted at the relay rather than inferred from the server's
+  counters: the runner holds a connection of its own and other specs run in
+  parallel, so a count taken from the server would be measuring them too.
+
+steps:
+  - cmd: PING
+    expect: PONG
+
+  - scenario: sdk_pool_reuses_and_bounds_connections
+
+  - scenario: sdk_pool_discards_after_a_protocol_error
+
+  - cmd: GET sdk:discard:second
+    expect: "the second caller's value"
