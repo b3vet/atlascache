@@ -3,9 +3,10 @@
 AtlasCache is a high-performance, distributed in-memory key-value store written
 in Go.
 
-It is **pre-alpha**: not yet released, not yet usable, and not ready for
-production or evaluation. This page describes where it is going and what has
-landed so far.
+It is **pre-alpha**: nothing has been released, packaged, or tagged, and none
+of it is ready for production. The v0.1.0 feature set is built and tested; what
+is missing is the release itself. This page describes where it is going and
+what has landed so far.
 
 Each release is independently useful. No dates — items move only when they are
 done.

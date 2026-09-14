@@ -2,8 +2,9 @@
 
 A high-performance, distributed in-memory key-value store written in Go.
 
-> **Pre-alpha — not usable yet.** There is no release, and the server currently
-> answers only `PING`. This repository is being built toward a v0.1.0 alpha.
+> **Pre-alpha — no release yet.** The server runs and is feature-complete for
+> v0.1.0, but nothing has been tagged, packaged, or published. Treat it as
+> something to read and build, not something to depend on.
 > See [docs/ROADMAP.md](docs/ROADMAP.md) for what is coming and in what order.
 
 AtlasCache speaks the Redis wire protocol, so `redis-cli` and existing Redis
@@ -13,20 +14,26 @@ client libraries work against it without modification.
 
 What works today:
 
-- Sharded in-memory storage engine (`GET`/`SET`/`SETNX`/`DEL`/`EXISTS`/`KEYS`/`SCAN`)
-  — as a Go package; not yet reachable over the network
-- Configuration loading, validation, environment overrides, and hot reload
-- A server binary that starts, speaks RESP well enough to answer `PING`,
-  serves a health endpoint, and shuts down gracefully
+- **18 commands over RESP2**: `GET` `SET` `SETNX` `DEL` `EXISTS` `KEYS` `SCAN`
+  `TTL` `EXPIRE` `DBSIZE` `PING` `ECHO` `INFO` `STATS` `AUTH` `HELLO` `QUIT`
+  `COMMAND` — see [docs/protocol.md](docs/protocol.md) for exact reply shapes
+- Sharded in-memory storage engine with per-shard locking
+- Per-key TTL, expired lazily on access and actively by a time wheel
+- Eviction under a memory limit: `lru`, `lfu`, `fifo`, or `none`
+- TLS and token auth, both supported and both off by default
+- Go SDK (`pkg/client`) with pooling, reconnection, and typed errors
+- `atlasctl` command-line client
+- Admin HTTP API: health, stats, and config
+- 51 end-to-end specs run against a real server on every commit
 
-Not yet implemented — all planned, see the roadmap:
+Not yet done — see the roadmap:
 
-- Data commands over the network (v0.1.0)
-- TTL expiration and eviction policies (v0.1.0)
-- TLS and authentication (v0.1.0)
-- Go SDK and `atlasctl` CLI (v0.1.0)
+- Docker image, configuration reference, and a signed v0.1.0 release
 - Persistence and crash recovery (v0.2.0)
 - Clustering and replication (v0.3.0)
+
+RESP3 is not supported: `HELLO 3` is answered with `-NOPROTO`, which every
+mainstream client handles by staying on RESP2.
 
 ## Requirements
 
@@ -50,8 +57,9 @@ cp config.example.yaml config.yaml
 In another shell:
 
 ```bash
-redis-cli -p 6379 PING          # -> PONG
-curl localhost:8080/health      # -> {"status":"ok"}
+redis-cli -p 6379 SET hello world   # -> OK
+redis-cli -p 6379 GET hello         # -> "world"
+curl localhost:8080/health          # -> {"status":"ok"}
 ```
 
 The admin port binds to `127.0.0.1` by default and is not reachable from
