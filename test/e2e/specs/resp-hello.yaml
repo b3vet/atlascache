@@ -1,0 +1,59 @@
+version: 1
+name: resp-hello
+tier: smoke
+feature: FEAT-0019
+description: >
+  HELLO reports RESP2 and refuses every other version with -NOPROTO, which is
+  what a client probing for RESP3 falls back on. The connection stays usable
+  after the refusal, because a negotiation that cost the client its connection
+  would not be a negotiation.
+
+steps:
+  # HELLO with no version reports what this server speaks. The handler returns a
+  # logical map; RESP2 has no map frame, so it arrives as a flat array of pairs
+  # and expect_field reads it as one. FEAT-0048 renders the same handler's reply
+  # as a RESP3 map without the handler changing.
+  - cmd: HELLO
+    expect_field:
+      server: atlascache
+      proto: 2
+      mode: standalone
+      role: master
+
+  # Redis answers HELLO 2 with the properties map too, not a status reply.
+  - cmd: HELLO 2
+    expect_field:
+      proto: "== 2"
+      server: "== atlascache"
+
+  # The case the whole command exists for. redis-cli reads -NOPROTO as "speak
+  # RESP2", notes it on stderr and carries on. Omitting HELLO would answer
+  # -ERR unknown command, which some clients treat as a hard failure instead.
+  #
+  # Note redis-py does NOT fall back: asked for protocol=3 explicitly it raises
+  # on -NOPROTO. Its default is RESP2 and sends no HELLO at all, so nothing
+  # real breaks -- but the earlier claim that every client falls back silently
+  # was wrong, and was corrected once measured.
+  - cmd: HELLO 3
+    expect_error: NOPROTO unsupported protocol version
+
+  - cmd: HELLO 4
+    expect_error: NOPROTO unsupported protocol version
+
+  - cmd: HELLO three
+    expect_error: NOPROTO unsupported protocol version
+
+  # What a client probing for RESP3 with credentials sends. It must be the same
+  # refusal and not an arity error, which no client knows how to fall back from.
+  - cmd: HELLO 3 AUTH default secret
+    expect_error: NOPROTO unsupported protocol version
+
+  # The connection survived every refusal above, and still serves RESP2.
+  - cmd: PING
+    expect: PONG
+
+  - cmd: SET hello:k v1
+    expect: OK
+
+  - cmd: GET hello:k
+    expect: v1

@@ -1,8 +1,12 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"net"
 	"strconv"
 	"strings"
 	"sync"
@@ -423,4 +427,95 @@ func TestCommandSpecArity(t *testing.T) {
 	assert.False(t, open.accepts(0))
 	assert.True(t, open.accepts(1))
 	assert.True(t, open.accepts(1000))
+}
+
+// TestHello covers the negotiation ADR-0028 settles on: this server speaks
+// RESP2, says so, and refuses every other version with -NOPROTO — the reply
+// redis-cli, go-redis and redis-py all fall back to RESP2 on. Returning "-ERR
+// unknown command" instead, which omitting HELLO would do, is a hard failure to
+// some of them.
+func TestHello(t *testing.T) {
+	srv, serveErr := newTestServer(t)
+	defer shutdownServer(t, srv, serveErr)
+
+	t.Run("with no argument it reports the protocol and the server", func(t *testing.T) {
+		conn, r := dial(t, srv)
+		send(t, conn, "*1\r\n$5\r\nHELLO\r\n")
+
+		// The handler returns a protocol.Map. RESP2 has no map frame, so it
+		// arrives flattened into an array of 2n — which is what this asserts,
+		// and what FEAT-0048's RESP3 encoder will render as %6 instead without
+		// the handler changing.
+		want := "*12\r\n" +
+			"$6\r\nserver\r\n$10\r\natlascache\r\n" +
+			fmt.Sprintf("$7\r\nversion\r\n$%d\r\n%s\r\n", len(Version), Version) +
+			"$5\r\nproto\r\n:2\r\n" +
+			"$4\r\nmode\r\n$10\r\nstandalone\r\n" +
+			"$4\r\nrole\r\n$6\r\nmaster\r\n" +
+			"$7\r\nmodules\r\n*0\r\n"
+		assert.Equal(t, want, readExactly(t, conn, r, len(want)))
+
+		// Nothing was left on the wire: the array header counted its elements
+		// correctly, so the next reply starts where the client expects.
+		send(t, conn, "*1\r\n$4\r\nPING\r\n")
+		assert.Equal(t, "+PONG\r\n", readReply(t, conn, r))
+	})
+
+	t.Run("HELLO 2 answers with the properties map, as Redis does", func(t *testing.T) {
+		// Not +OK: Redis returns the same map for HELLO 2 as for a bare HELLO,
+		// and a client asking for 2 may well be parsing a map.
+		// exchange returns the first line only, so assert on the frame header
+		// and on it being identical to what a bare HELLO answers.
+		reply := exchange(t, srv, "HELLO", "2")
+		assert.Equal(t, exchange(t, srv, "HELLO"), reply)
+		assert.Equal(t, "*12\r\n", reply, "six key/value pairs flattened into RESP2")
+	})
+
+	noProto := "-NOPROTO unsupported protocol version\r\n"
+	for _, version := range []string{"3", "4", "0", "-1", "2.0", "three", ""} {
+		t.Run("HELLO "+version+" is refused with NOPROTO", func(t *testing.T) {
+			assert.Equal(t, noProto, exchange(t, srv, "HELLO", version))
+		})
+	}
+
+	t.Run("HELLO 3 AUTH is refused with NOPROTO, not an arity error", func(t *testing.T) {
+		// What a client probing for RESP3 with credentials sends. An arity
+		// error is not something it knows how to fall back from.
+		assert.Equal(t, noProto, exchange(t, srv, "HELLO", "3", "AUTH", "default", "secret"))
+	})
+
+	t.Run("an option on HELLO 2 names what was refused", func(t *testing.T) {
+		assert.Equal(t, "-ERR syntax error in HELLO option 'AUTH'\r\n",
+			exchange(t, srv, "HELLO", "2", "AUTH", "default", "secret"))
+		assert.Equal(t, "-ERR syntax error in HELLO option 'SETNAME'\r\n",
+			exchange(t, srv, "HELLO", "2", "SETNAME", "client"))
+	})
+
+	t.Run("the connection survives the refusal, which is the whole point", func(t *testing.T) {
+		conn, r := dial(t, srv)
+
+		send(t, conn, "*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n")
+		assert.Equal(t, noProto, readReply(t, conn, r))
+
+		// The client now carries on in RESP2, exactly as it would against a
+		// Redis old enough not to know RESP3.
+		send(t, conn, "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n")
+		assert.Equal(t, "+OK\r\n", readReply(t, conn, r))
+		send(t, conn, "*2\r\n$3\r\nGET\r\n$1\r\nk\r\n")
+		assert.Equal(t, "$1\r\n", readReply(t, conn, r))
+		assert.Equal(t, "v\r\n", readReply(t, conn, r))
+	})
+}
+
+// readExactly reads n bytes of a reply, for the replies that span more frames
+// than readReply's single line.
+func readExactly(t *testing.T, conn net.Conn, r *bufio.Reader, n int) string {
+	t.Helper()
+
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(2*time.Second)))
+	buf := make([]byte, n)
+	_, err := io.ReadFull(r, buf)
+	require.NoError(t, err)
+
+	return string(buf)
 }

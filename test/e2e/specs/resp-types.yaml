@@ -1,0 +1,77 @@
+version: 1
+name: resp-types
+tier: full
+feature: FEAT-0019
+description: >
+  Every RESP2 reply type the v0.1.0 command surface can produce, read back by a
+  client that decodes the wire format itself. The types RESP3 renders
+  differently are covered by the codec's unit tests, since no command in this
+  milestone returns a double or a boolean yet.
+
+steps:
+  # Simple string.
+  - cmd: PING
+    expect: PONG
+
+  # Bulk string, in both directions.
+  - cmd: PING hello
+    expect: hello
+
+  - cmd: SET types:k hello
+    expect: OK
+
+  - cmd: GET types:k
+    expect: hello
+
+  # An empty bulk string is a value, and is distinct from a missing key below.
+  - cmd: SET types:empty ""
+    expect: OK
+
+  - cmd: GET types:empty
+    expect: ""
+
+  # A bulk string is length-prefixed, so a value containing CRLF is carried
+  # intact rather than framing a second reply.
+  - cmd: 'SET types:bin "a\r\nb"'
+    expect: OK
+
+  - cmd: GET types:bin
+    expect: "a\r\nb"
+
+  # Null. A miss is the null bulk string, never an error.
+  - cmd: GET types:missing
+    expect: NIL
+
+  # Integers, including the two negative ones TTL uses to tell "lives forever"
+  # from "no such key".
+  - cmd: DEL types:k
+    expect: 1
+
+  - cmd: DEL types:k
+    expect: 0
+
+  - cmd: TTL types:empty
+    expect: -1
+
+  - cmd: TTL types:missing
+    expect: -2
+
+  - cmd: SET types:ttl v EX 100
+    expect: OK
+
+  - cmd: TTL types:ttl
+    expect_value: "> 90"
+
+  # Error.
+  - cmd: FROB
+    expect_error: "ERR unknown command 'FROB'"
+
+  # Array. HELLO's map flattens into one, key then value.
+  - cmd: HELLO
+    expect_field:
+      server: atlascache
+      proto: 2
+
+  # The connection is still framed correctly after all of that.
+  - cmd: PING
+    expect: PONG

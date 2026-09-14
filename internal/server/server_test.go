@@ -2,9 +2,11 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"io"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 
@@ -208,4 +210,74 @@ func dialContext(t *testing.T, addr string) (net.Conn, error) {
 	defer cancel()
 	var d net.Dialer
 	return d.DialContext(ctx, "tcp", addr)
+}
+
+// TestUnterminatedLineIsRefusedAtTheLimit is ISSUE-0016 at the level a client
+// meets it. A connection that streams bytes and never sends a newline used to
+// grow the server's buffer until the process died; auth is off by default, so
+// anyone who can open a socket could do it.
+//
+// The assertion is on what the server spent, not only on the error it sent: an
+// error returned after reading 64MB is still 64MB read.
+func TestUnterminatedLineIsRefusedAtTheLimit(t *testing.T) {
+	const (
+		flood = 32 << 20
+		chunk = 64 << 10
+	)
+
+	srv, serveErr := newTestServer(t)
+	defer shutdownServer(t, srv, serveErr)
+
+	conn, r := dial(t, srv)
+
+	// The reply arrives while the flood is still being written, so it is read
+	// here rather than after: the server closes the connection behind the
+	// error, and a client still writing into a closed socket may never get to
+	// read what was already sent to it.
+	replies := make(chan string, 1)
+	go func() {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			line = "read failed: " + err.Error()
+		}
+		replies <- line
+	}()
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+
+	payload := bytes.Repeat([]byte("x"), chunk)
+	require.NoError(t, conn.SetWriteDeadline(time.Now().Add(10*time.Second)))
+	sent := 0
+	for sent < flood {
+		n, err := conn.Write(payload)
+		sent += n
+		if err != nil {
+			// The server closed on us, which is the expected end of this loop.
+			break
+		}
+	}
+
+	select {
+	case reply := <-replies:
+		assert.Equal(t, "-ERR Protocol error: too big inline request\r\n", reply)
+	case <-time.After(5 * time.Second):
+		t.Fatalf("no reply after writing %d bytes with no newline in them", sent)
+	}
+
+	runtime.ReadMemStats(&after)
+	allocated := after.TotalAlloc - before.TotalAlloc
+	t.Logf("wrote %d bytes; the process allocated %d serving them", sent, allocated)
+
+	// The server reads at most the inline limit plus its connection buffer, so
+	// what it allocates is bounded by those and not by what the client sends.
+	// Before the fix this grew with the flood.
+	assert.Lessf(t, allocated, uint64(4<<20),
+		"serving a %d byte unterminated line allocated %d bytes", sent, allocated)
+
+	// The connection is gone: a protocol error is not resynchronizable.
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(2*time.Second)))
+	_, err := r.ReadByte()
+	assert.Error(t, err, "the connection must be closed behind the protocol error")
 }

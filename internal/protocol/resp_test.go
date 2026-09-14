@@ -7,6 +7,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"testing/iotest"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -170,11 +171,37 @@ func TestDecodeMalformed(t *testing.T) {
 	}
 }
 
-func TestDecodeTruncatedInputReturnsEOF(t *testing.T) {
+// TestDecodeDistinguishesACleanCloseFromATruncatedFrame. A connection that ends
+// between commands is a client that went away; one that ends part-way through a
+// frame is a request that was cut in half. Reporting both as io.EOF would let a
+// truncated frame read as a clean close, which is the "valid short frame" the
+// feature forbids — and the server logs the two differently because only one of
+// them is a problem.
+func TestDecodeDistinguishesACleanCloseFromATruncatedFrame(t *testing.T) {
 	codec := NewRESP()
 
-	_, err := codec.Decode(decoderFor("*2\r\n$4\r\nPING\r\n"))
-	assert.ErrorIs(t, err, io.EOF)
+	t.Run("a connection that ends between commands is EOF", func(t *testing.T) {
+		r := decoderFor("*1\r\n$4\r\nPING\r\n")
+		_, err := codec.Decode(r)
+		require.NoError(t, err)
+
+		_, err = codec.Decode(r)
+		assert.ErrorIs(t, err, io.EOF)
+	})
+
+	truncated := map[string]string{
+		"multibulk header promises elements that never arrive": "*2\r\n$4\r\nPING\r\n",
+		"bulk header with no payload":                          "*1\r\n$4\r\n",
+		"bulk payload cut short":                               "*1\r\n$4\r\nPI",
+		"line with no terminator":                              "PING",
+	}
+	for name, input := range truncated {
+		t.Run(name, func(t *testing.T) {
+			_, err := codec.Decode(decoderFor(input))
+			assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
+			assert.NotErrorIs(t, err, io.EOF, "a half-sent frame must not read as a clean close")
+		})
+	}
 }
 
 func TestEncode(t *testing.T) {
@@ -238,4 +265,39 @@ func TestRoundTrip(t *testing.T) {
 func TestCodecInterfaceSatisfied(t *testing.T) {
 	var codec Codec = NewRESP()
 	assert.NotNil(t, codec)
+}
+
+// TestDecodeReassemblesASplitFrame. A command does not arrive in one piece: TCP
+// segments it wherever it likes, and a parser that read what was available and
+// decided would mangle or drop the half it had. The reader below is the worst
+// case — one byte per read — and the decode must be identical to the same bytes
+// arriving at once.
+func TestDecodeReassemblesASplitFrame(t *testing.T) {
+	const request = "*3\r\n$3\r\nSET\r\n$2\r\nk1\r\n$11\r\nhello world\r\n"
+
+	// A buffer smaller than the request, so the line accumulator has to span
+	// refills as well as reads.
+	r := bufio.NewReaderSize(iotest.OneByteReader(strings.NewReader(request)), 16)
+
+	cmd, err := NewRESP().Decode(r)
+	require.NoError(t, err)
+	assert.Equal(t, "SET", cmd.Name)
+	require.Len(t, cmd.Args, 2)
+	assert.Equal(t, "k1", string(cmd.Args[0]))
+	assert.Equal(t, "hello world", string(cmd.Args[1]))
+}
+
+// TestDecodeReassemblesASplitInlineLine. The same for an inline request longer
+// than the read buffer, which is the path where the line spans several
+// ReadSlice calls and the size check runs between them.
+func TestDecodeReassemblesASplitInlineLine(t *testing.T) {
+	value := strings.Repeat("a", 200)
+
+	r := bufio.NewReaderSize(iotest.OneByteReader(strings.NewReader("ECHO "+value+"\r\n")), 16)
+
+	cmd, err := NewRESP().Decode(r)
+	require.NoError(t, err)
+	assert.Equal(t, "ECHO", cmd.Name)
+	require.Len(t, cmd.Args, 1)
+	assert.Equal(t, value, string(cmd.Args[0]))
 }

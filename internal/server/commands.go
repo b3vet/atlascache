@@ -70,7 +70,23 @@ const (
 	cmdDel    = "DEL"
 	cmdTTL    = "TTL"
 	cmdExpire = "EXPIRE"
+	cmdHello  = "HELLO"
 )
+
+// What HELLO reports about this server. The protocol version is a constant
+// because v0.1.0 speaks RESP2 only (ADR-0028): there is no negotiated state,
+// per connection or otherwise, for a handler to read.
+const (
+	serverName  = "atlascache"
+	serverMode  = "standalone"
+	serverRole  = "master"
+	respVersion = 2
+)
+
+// Version is the server version HELLO reports. The build stamp lives in
+// cmd/atlascache, which sets this once FEAT-0021 wires INFO to the same
+// properties; until then it is the version in the VERSION file.
+var Version = "0.1.0-dev"
 
 // commandSpec is one row of the dispatch table: how many arguments the command
 // takes, what serves it, and whether the connection ends afterwards.
@@ -98,6 +114,11 @@ var commands = map[string]commandSpec{
 	cmdDel:    {minArgs: 1, maxArgs: unbounded, handler: (*Server).del},
 	cmdTTL:    {minArgs: 1, maxArgs: 1, handler: (*Server).ttl},
 	cmdExpire: {minArgs: 2, maxArgs: 2, handler: (*Server).expire},
+
+	// HELLO takes any tail so that `HELLO 3 AUTH user pass` — what a client
+	// probing for RESP3 sends — is answered with -NOPROTO, the reply it knows
+	// how to fall back from, rather than an arity error it does not.
+	cmdHello: {minArgs: 0, maxArgs: unbounded, handler: (*Server).hello},
 }
 
 // accepts reports whether the command was given a workable number of arguments.
@@ -119,6 +140,48 @@ func (s *Server) ping(cmd protocol.Command) protocol.Reply {
 // quit acknowledges; the dispatcher closes the connection after the reply.
 func (s *Server) quit(protocol.Command) protocol.Reply {
 	return protocol.SimpleString("OK")
+}
+
+// hello reports the protocol in use, and refuses to speak any other.
+//
+// A client that asks for RESP3 gets -NOPROTO, which redis-cli, go-redis and
+// redis-py all read as "this server speaks RESP2" and fall back on silently.
+// Omitting HELLO entirely would answer -ERR unknown command instead, which some
+// clients treat as a hard failure (ADR-0028). RESP3 itself is FEAT-0048, in P6.
+func (s *Server) hello(cmd protocol.Command) protocol.Reply {
+	if len(cmd.Args) == 0 {
+		return helloProperties()
+	}
+
+	version, err := strconv.Atoi(string(cmd.Args[0]))
+	if err != nil || version != respVersion {
+		return errNoProto()
+	}
+
+	// AUTH and SETNAME arrive with FEAT-0022 and FEAT-0024. Naming the option
+	// that was refused is what tells a client which of the two it was.
+	if len(cmd.Args) > 1 {
+		return protocol.Errorf("syntax error in HELLO option '%s'", cmd.Args[1])
+	}
+
+	// Redis answers HELLO 2 with the same properties map as a bare HELLO, not a
+	// status reply. A client that asks for 2 and parses a map would otherwise
+	// break on a +OK it did not expect.
+	return helloProperties()
+}
+
+// helloProperties is the map HELLO answers with when it is asked for no
+// particular version. It is a protocol.Map, which the RESP2 codec flattens into
+// an array — the handler neither knows nor cares that it did.
+func helloProperties() protocol.Reply {
+	return protocol.Map{
+		{Key: protocol.BulkString("server"), Value: protocol.BulkString(serverName)},
+		{Key: protocol.BulkString("version"), Value: protocol.BulkString(Version)},
+		{Key: protocol.BulkString("proto"), Value: protocol.Integer(respVersion)},
+		{Key: protocol.BulkString("mode"), Value: protocol.BulkString(serverMode)},
+		{Key: protocol.BulkString("role"), Value: protocol.BulkString(serverRole)},
+		{Key: protocol.BulkString("modules"), Value: protocol.Array{}},
+	}
 }
 
 // set stores a value, with an optional expiry given as EX seconds or PX
@@ -284,6 +347,12 @@ func storeFailure(err error) protocol.Reply {
 	default:
 		return protocol.Errorf("%v", err)
 	}
+}
+
+// errNoProto is the documented fallback signal for a protocol version this
+// server does not speak. Clients negotiate down on it rather than failing.
+func errNoProto() protocol.Reply {
+	return protocol.Error{Kind: "NOPROTO", Message: "unsupported protocol version"}
 }
 
 func errSyntax() protocol.Reply {
