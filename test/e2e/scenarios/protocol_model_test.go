@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -116,6 +117,11 @@ const reservationCeiling = 192 << 20
 type protoServer struct {
 	defects protoDefects
 
+	// maxMultiBulk is the element cap this model enforces. It is a field
+	// rather than the constant so that a model with a request budget can
+	// derive a tighter one from it, the way the server does (ISSUE-0018).
+	maxMultiBulk int
+
 	mu       sync.Mutex
 	values   map[string]string
 	reserved [][]byte
@@ -124,7 +130,7 @@ type protoServer struct {
 }
 
 func newProtoServer(defects protoDefects) *protoServer {
-	return &protoServer{defects: defects, values: map[string]string{}}
+	return &protoServer{defects: defects, values: map[string]string{}, maxMultiBulk: modelMaxMultiBulk}
 }
 
 func (s *protoServer) serve(ln net.Listener) {
@@ -242,7 +248,7 @@ func (s *protoServer) protocolErrorReply(protoErr string) (reply string, keepOpe
 // decode reads one request. It returns the arguments, or a protocol error
 // message, or a transport error meaning the connection ended.
 func (s *protoServer) decode(r *bufio.Reader) ([]string, string, error) {
-	line, protoErr, err := s.readLine(r)
+	line, crlf, protoErr, err := s.readLine(r)
 	if protoErr != "" || err != nil {
 		return nil, protoErr, err
 	}
@@ -250,11 +256,17 @@ func (s *protoServer) decode(r *bufio.Reader) ([]string, string, error) {
 		return nil, "", nil
 	}
 	if line[0] != '*' {
+		// Inline requests take a bare LF, which is what Redis does and what
+		// `redis-cli --pipe` with a text file sends (ISSUE-0019).
 		return strings.Fields(line), "", nil
+	}
+	if !crlf {
+		// Framing headers do not.
+		return nil, "expected CRLF line terminator", nil
 	}
 
 	count, convErr := strconv.Atoi(line[1:])
-	if convErr != nil || count < 0 || count > modelMaxMultiBulk {
+	if convErr != nil || count < 0 || count > s.maxMultiBulk {
 		return nil, "invalid multibulk length", nil
 	}
 	if s.defects.reservesFromDeclaredSizes {
@@ -278,9 +290,12 @@ func (s *protoServer) decode(r *bufio.Reader) ([]string, string, error) {
 }
 
 func (s *protoServer) decodeBulk(r *bufio.Reader) (string, string, error) {
-	line, protoErr, err := s.readLine(r)
+	line, crlf, protoErr, err := s.readLine(r)
 	if protoErr != "" || err != nil {
 		return "", protoErr, err
+	}
+	if !crlf {
+		return "", "expected CRLF line terminator", nil
 	}
 	if line == "" || line[0] != '$' {
 		return "", fmt.Sprintf("expected '$', got '%s'", s.renderByte(line)), nil
@@ -318,43 +333,52 @@ func (s *protoServer) renderByte(line string) string {
 	return quoted[1 : len(quoted)-1]
 }
 
-// readLine accumulates one CRLF-terminated line under the inline limit, or —
+// readLine accumulates one newline-terminated line under the inline limit, or —
 // with the defect — reads to the newline first and checks the limit afterwards.
-func (s *protoServer) readLine(r *bufio.Reader) (string, string, error) {
+//
+// It reports whether the terminator was a full CRLF rather than insisting on
+// one, because the two kinds of line want different answers: an inline request
+// takes a bare LF and a framing header does not (ISSUE-0019).
+func (s *protoServer) readLine(r *bufio.Reader) (string, bool, string, error) {
 	if s.defects.readsInlineWithoutBound {
 		line, err := r.ReadBytes('\n')
 		if err != nil {
-			return "", "", err
+			return "", false, "", err
 		}
 		if len(line) > modelMaxInline {
-			return "", "too big inline request", nil
+			return "", false, "too big inline request", nil
 		}
-		return trimTerminator(string(line))
+		text, crlf := trimTerminator(string(line))
+		return text, crlf, "", nil
 	}
 
 	var line []byte
 	for {
 		chunk, err := r.ReadSlice('\n')
 		if len(line)+len(chunk) > modelMaxInline {
-			return "", "too big inline request", nil
+			return "", false, "too big inline request", nil
 		}
 		line = append(line, chunk...)
 		switch {
 		case err == nil:
-			return trimTerminator(string(line))
+			text, crlf := trimTerminator(string(line))
+			return text, crlf, "", nil
 		case errors.Is(err, bufio.ErrBufferFull):
 			continue
 		default:
-			return "", "", err
+			return "", false, "", err
 		}
 	}
 }
 
-func trimTerminator(line string) (string, string, error) {
-	if len(line) < 2 || line[len(line)-2] != '\r' {
-		return "", "expected CRLF line terminator", nil
+// trimTerminator drops the newline, and the carriage return in front of it when
+// there is one.
+func trimTerminator(line string) (string, bool) {
+	line = line[:len(line)-1]
+	if line != "" && line[len(line)-1] == '\r' {
+		return line[:len(line)-1], true
 	}
-	return line[:len(line)-2], "", nil
+	return line, false
 }
 
 // reserve makes the allocation the declared size asked for, scaled down, and
@@ -413,14 +437,63 @@ func (s *protoServer) exec(args []string) string {
 		}
 		return bulkReply(value)
 	case "DEL":
+		if len(args) < 2 {
+			return "-ERR wrong number of arguments for 'del' command\r\n"
+		}
 		if _, ok := s.values[args[1]]; ok {
 			delete(s.values, args[1])
 			return ":1\r\n"
 		}
 		return ":0\r\n"
 	default:
+		return s.execIntrospection(args)
+	}
+}
+
+// execIntrospection is the half of the command table that reads the server
+// rather than the keyspace, split out so neither half is long enough to hide a
+// case in.
+func (s *protoServer) execIntrospection(args []string) string {
+	switch strings.ToUpper(args[0]) {
+	case "ECHO":
+		if len(args) < 2 {
+			return "-ERR wrong number of arguments for 'echo' command\r\n"
+		}
+		return bulkReply(args[1])
+	case "INFO":
+		return bulkReply(s.infoText())
+	case "KEYS":
+		return s.keysReply()
+	default:
 		return "-ERR unknown command '" + args[0] + "'\r\n"
 	}
+}
+
+// infoText is the INFO payload the model serves.
+//
+// Only the fields a scenario reads back from the server it is driving, so that
+// a scenario which derives a probe from the server's own limits — rather than
+// from a number written down beside it — works against the model too.
+func (s *protoServer) infoText() string {
+	return fmt.Sprintf("# Clients\r\natlascache_max_request_elements:%d\r\n", s.maxMultiBulk)
+}
+
+// keysReply answers KEYS with every key the model holds. The pattern is
+// ignored: the scenarios that use it ask for all of them, and matching is the
+// engine's business rather than the wire format's.
+func (s *protoServer) keysReply() string {
+	names := make([]string, 0, len(s.values))
+	for name := range s.values {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var reply strings.Builder
+	fmt.Fprintf(&reply, "*%d\r\n", len(names))
+	for _, name := range names {
+		reply.WriteString(bulkReply(name))
+	}
+	return reply.String()
 }
 
 func bulkReply(s string) string {

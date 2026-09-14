@@ -104,6 +104,11 @@ func (l *Loader) setDefaults() {
 	// Server defaults
 	l.v.SetDefault("server.bind_addr", defaults.Server.BindAddr)
 	l.v.SetDefault("server.client_port", defaults.Server.ClientPort)
+	l.v.SetDefault("server.max_connections", defaults.Server.MaxConnections)
+	l.v.SetDefault("server.client_idle_timeout", defaults.Server.ClientIdleTimeout)
+	l.v.SetDefault("server.max_request_size", defaults.Server.MaxRequestSize)
+	l.v.SetDefault("server.max_pipeline_commands", defaults.Server.MaxPipelineCommands)
+	l.v.SetDefault("server.max_output_buffer", defaults.Server.MaxOutputBuffer)
 
 	// Admin defaults
 	l.v.SetDefault("admin.bind_addr", defaults.Admin.BindAddr)

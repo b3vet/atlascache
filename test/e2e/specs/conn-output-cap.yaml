@@ -1,0 +1,36 @@
+version: 1
+name: conn-output-cap
+tier: full
+feature: FEAT-0024
+description: >
+  The per-connection output cap, moved into P2 from FEAT-0046 because the
+  exposure starts when v0.1.0 ships: KEYS on a large keyspace builds a reply
+  whose size the client chose and the server pays for, on a port whose default
+  configuration has authentication off, and a client is under no obligation to
+  read what it asked for.
+
+  A client asks for the whole keyspace sixty-four times over and reads none of
+  it. The connection must be closed with the reason recorded, and the server's
+  resident set -- sampled from outside the process -- must not follow what was
+  asked for.
+
+  This is the crude version: bytes buffered, disconnect on breach. FEAT-0046
+  refines it into something that streams instead.
+
+config:
+  server:
+    max_output_buffer: "128KB"
+    client_idle_timeout: "0"
+
+steps:
+  - cmd: PING
+    expect: PONG
+
+  - cmd: INFO clients
+    expect_field:
+      atlascache_max_output_buffer: "131072"
+
+  - scenario: conn_output_cap_disconnects_a_silent_reader
+
+  - cmd: PING
+    expect: PONG

@@ -8,11 +8,17 @@ description: >
   replied. ISSUE-0016 is the reason: all three of its bugs returned the correct
   error, after allocating from a size an unauthenticated client had declared.
 
-  A bulk header declaring 512MB and a multibulk header declaring a million
-  elements are each sent two hundred times, and the server's resident set is
-  sampled from outside the process between them. Before the fixes that is a
-  hundred gigabytes of allocation churn; it must now move the resident set by
-  nothing.
+  A bulk header declaring 512MB, a multibulk header declaring a million
+  elements, and a multibulk header at the element cap that does apply are each
+  sent two hundred times, and the server's resident set is sampled from outside
+  the process between them. Before the fixes that is a hundred gigabytes of
+  allocation churn; it must now move the resident set by nothing.
+
+  The million-element header is the one ISSUE-0018 added to this list. It used
+  to be legal -- it is inside the protocol's own ceiling -- which is exactly
+  what made it an issue: twelve bytes on the wire entitling a client to a 154MB
+  decode. FEAT-0024 caps the elements below that ceiling, so the reservation
+  property this spec was written for is now probed at the cap that does apply.
 
   The third limit is measured differently because it has a better instrument: a
   client streaming a line with no newline in it can count how many bytes the

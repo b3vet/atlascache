@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // ValidationError represents a configuration validation error
@@ -55,7 +56,7 @@ func Validate(cfg *Config) error {
 	var errs []*ValidationError
 
 	// Validate server config
-	if err := validateServer(&cfg.Server); err != nil {
+	if err := validateServer(&cfg.Server, &cfg.Storage); err != nil {
 		errs = append(errs, err...)
 	}
 
@@ -101,7 +102,7 @@ func Validate(cfg *Config) error {
 	return nil
 }
 
-func validateServer(cfg *ServerConfig) []*ValidationError {
+func validateServer(cfg *ServerConfig, storage *StorageConfig) []*ValidationError {
 	var errs []*ValidationError
 
 	if err := validateBindAddr("server.bind_addr", cfg.BindAddr); err != nil {
@@ -110,9 +111,140 @@ func validateServer(cfg *ServerConfig) []*ValidationError {
 	if err := validatePort("server.client_port", cfg.ClientPort); err != nil {
 		errs = append(errs, err)
 	}
+	errs = append(errs, validateConnLimits(cfg, storage)...)
 
 	return errs
 }
+
+// Field names used in more than one connection-limit message.
+const (
+	fieldMaxConnections      = "server.max_connections"
+	fieldClientIdleTimeout   = "server.client_idle_timeout"
+	fieldMaxPipelineCommands = "server.max_pipeline_commands"
+	fieldMaxOutputBuffer     = "server.max_output_buffer"
+	fieldMaxRequestSize      = "server.max_request_size"
+	fieldMaxValueSize        = "storage.max_value_size"
+)
+
+// tooLarge is the ceiling message shared by the counted limits. Each has a
+// different floor and a different reason for it; the ceiling is the same
+// sanity bound in every case.
+const tooLarge = "must be <= 1000000"
+
+// validateConnLimits checks the bounds one client is held to (FEAT-0024).
+//
+// Every one of these has a floor rather than merely a type, because the
+// dangerous value is not a malformed one — it is a small one that looks
+// deliberate. A max_connections of 0 is a server nobody can reach; a
+// client_idle_timeout of 10ms disconnects clients mid-round-trip and reads as a
+// network fault; a max_request_size below max_value_size makes the largest
+// value the engine accepts unwritable, which surfaces as a protocol error and
+// sends an operator looking at the wrong layer.
+func validateConnLimits(cfg *ServerConfig, storage *StorageConfig) []*ValidationError {
+	var errs []*ValidationError
+
+	if cfg.MaxConnections < 1 {
+		errs = append(errs, &ValidationError{
+			Field:   fieldMaxConnections,
+			Message: "must be >= 1; a server that accepts no connections serves nobody",
+		})
+	}
+	if cfg.MaxConnections > 1_000_000 {
+		errs = append(errs, &ValidationError{
+			Field:   fieldMaxConnections,
+			Message: tooLarge,
+		})
+	}
+
+	if cfg.ClientIdleTimeout < 0 {
+		errs = append(errs, &ValidationError{
+			Field:   fieldClientIdleTimeout,
+			Message: "must be >= 0 (0 disables the timeout)",
+		})
+	}
+	if cfg.ClientIdleTimeout > 0 && cfg.ClientIdleTimeout < time.Second {
+		errs = append(errs, &ValidationError{
+			Field:   fieldClientIdleTimeout,
+			Message: "must be >= 1s when set; anything shorter disconnects clients between commands",
+		})
+	}
+
+	if cfg.MaxPipelineCommands < 1 {
+		errs = append(errs, &ValidationError{
+			Field:   fieldMaxPipelineCommands,
+			Message: "must be >= 1; a batch of zero commands never flushes a reply",
+		})
+	}
+	if cfg.MaxPipelineCommands > 1_000_000 {
+		errs = append(errs, &ValidationError{
+			Field:   fieldMaxPipelineCommands,
+			Message: tooLarge,
+		})
+	}
+
+	if outputBuffer, err := ParseSize(cfg.MaxOutputBuffer); err != nil {
+		errs = append(errs, &ValidationError{
+			Field:   fieldMaxOutputBuffer,
+			Message: fmt.Sprintf("invalid size format: %v", err),
+		})
+	} else if outputBuffer > 0 && outputBuffer < minOutputBuffer {
+		errs = append(errs, &ValidationError{
+			Field:   fieldMaxOutputBuffer,
+			Message: "must be >= 64KB when set, or 0 to leave output uncapped",
+		})
+	}
+
+	return append(errs, validateRequestSize(cfg, storage)...)
+}
+
+// minOutputBuffer is the floor on a set server.max_output_buffer. One INFO
+// reply is a few kilobytes and one bulk reply may be a whole value, so a cap
+// below this disconnects clients running ordinary commands.
+const minOutputBuffer = 64 * 1024
+
+// validateRequestSize is the combination check: the request budget is only
+// meaningful against the value size it has to carry.
+//
+// It is the kind of defect a per-field pass cannot see — each field is
+// individually legal and the pair is not — which is the class ISSUE-0017 was.
+func validateRequestSize(cfg *ServerConfig, storage *StorageConfig) []*ValidationError {
+	requestSize, err := ParseSize(cfg.MaxRequestSize)
+	if err != nil {
+		return []*ValidationError{{
+			Field:   fieldMaxRequestSize,
+			Message: fmt.Sprintf("invalid size format: %v", err),
+		}}
+	}
+	if requestSize == 0 {
+		// Derived from storage.max_value_size at startup, so there is no pair
+		// to disagree.
+		return nil
+	}
+
+	maxValueSize, valueErr := ParseSize(storage.MaxValueSize)
+	if valueErr != nil {
+		// storage.max_value_size is reported by its own check; nothing here can
+		// add to it.
+		return nil
+	}
+
+	if requestSize < maxValueSize+protocolFraming {
+		return []*ValidationError{{
+			Field: fieldMaxRequestSize,
+			Message: fmt.Sprintf(
+				"must be at least %s -- %s plus %s of protocol framing -- or the largest value "+
+					"%s allows can never be written; raise %s or lower %s",
+				FormatSize(maxValueSize+protocolFraming), fieldMaxValueSize,
+				FormatSize(protocolFraming), fieldMaxValueSize,
+				fieldMaxRequestSize, fieldMaxValueSize),
+		}}
+	}
+	return nil
+}
+
+// protocolFraming is the wire overhead a SET of a maximum-sized value carries
+// besides the value: the command name, the key, and the length headers.
+const protocolFraming = 64 * 1024
 
 func validateAdmin(cfg *AdminConfig, server *ServerConfig) []*ValidationError {
 	var errs []*ValidationError

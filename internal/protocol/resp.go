@@ -154,7 +154,7 @@ func (c *RESP) Limits() Limits {
 // Empty requests are skipped, matching Redis.
 func (c *RESP) Decode(r *bufio.Reader) (Command, error) {
 	for {
-		line, err := c.readLine(r, false)
+		line, hadCRLF, err := c.readLine(r, false)
 		if err != nil {
 			return Command{}, err
 		}
@@ -165,6 +165,13 @@ func (c *RESP) Decode(r *bufio.Reader) (Command, error) {
 
 		var cmd Command
 		if line[0] == '*' {
+			// A framing header must end in CRLF even though an inline command
+			// need not: a bulk length is followed by exactly CRLF, and relaxing
+			// that lets a truncated frame read as a complete one. Redis draws
+			// the line in the same place (ISSUE-0019).
+			if !hadCRLF {
+				return Command{}, protocolErrorf("expected CRLF line terminator")
+			}
 			cmd, err = c.decodeMultiBulk(r, line)
 			if err != nil {
 				return Command{}, err
@@ -234,9 +241,14 @@ func (c *RESP) decodeMultiBulk(r *bufio.Reader, header []byte) (Command, error) 
 // decodeBulk reads one "$<length>\r\n<payload>\r\n" element. The length is
 // checked against the limit before it sizes anything.
 func (c *RESP) decodeBulk(r *bufio.Reader) ([]byte, error) {
-	line, err := c.readLine(r, true)
+	line, hadCRLF, err := c.readLine(r, true)
 	if err != nil {
 		return nil, err
+	}
+	// Inside a frame every line is a framing line, so CRLF is required here
+	// unconditionally — the bare-LF relaxation is for inline commands only.
+	if !hadCRLF {
+		return nil, protocolErrorf("expected CRLF line terminator")
 	}
 	if len(line) == 0 || line[0] != '$' {
 		return nil, protocolErrorf("expected '$', got '%s'", printableByte(line))
@@ -292,33 +304,50 @@ func commandFromParts(parts [][]byte) Command {
 // EOF is a client that went away and is reported as io.EOF; part-way through a
 // frame it is a truncated request, reported as io.ErrUnexpectedEOF so that a
 // short frame is never mistaken for a complete one.
-func (c *RESP) readLine(r *bufio.Reader, midFrame bool) ([]byte, error) {
-	var line []byte
+func (c *RESP) readLine(r *bufio.Reader, midFrame bool) (line []byte, hadCRLF bool, err error) {
 	for {
-		chunk, err := r.ReadSlice('\n')
+		chunk, readErr := r.ReadSlice('\n')
 		if len(line)+len(chunk) > c.limits.MaxInlineLength {
-			return nil, protocolErrorf("too big inline request")
+			return nil, false, protocolErrorf("too big inline request")
 		}
 		line = append(line, chunk...)
 
 		switch {
-		case err == nil:
-			return trimCRLF(line)
-		case errors.Is(err, bufio.ErrBufferFull):
+		case readErr == nil:
+			return trimTerminator(line)
+		case errors.Is(readErr, bufio.ErrBufferFull):
 			continue
-		case errors.Is(err, io.EOF) && (midFrame || len(line) > 0):
-			return nil, io.ErrUnexpectedEOF
+		case errors.Is(readErr, io.EOF) && (midFrame || len(line) > 0):
+			return nil, false, io.ErrUnexpectedEOF
 		default:
-			return nil, err
+			return nil, false, readErr
 		}
 	}
 }
 
-func trimCRLF(line []byte) ([]byte, error) {
-	if len(line) < 2 || line[len(line)-2] != '\r' {
-		return nil, protocolErrorf("expected CRLF line terminator")
+// trimTerminator strips the line ending, and is strict only where Redis is.
+//
+// Inline commands accept a bare LF: that is what redis-cli --pipe emits for a
+// plain-text file, and what anything piped through echo, a heredoc or a
+// Unix-authored file produces. Requiring CRLF there broke the exact path people
+// use when first trying a server (ISSUE-0019).
+//
+// Framing headers stay strict, which is also Redis's split — a bulk length is
+// followed by exactly CRLF, and relaxing that would let a truncated frame read
+// as a complete one.
+//
+// The line arrives already bounded: readLine applies MaxInlineLength as it
+// accumulates, not here, so changing the terminator cannot reopen ISSUE-0016.
+func trimTerminator(line []byte) ([]byte, bool, error) {
+	if len(line) == 0 || line[len(line)-1] != '\n' {
+		return nil, false, protocolErrorf("expected CRLF line terminator")
 	}
-	return line[:len(line)-2], nil
+	body := line[:len(line)-1]
+
+	if len(body) > 0 && body[len(body)-1] == '\r' {
+		return body[:len(body)-1], true, nil
+	}
+	return body, false, nil
 }
 
 // unexpectedEOF reports a connection that ended part-way through a frame as a

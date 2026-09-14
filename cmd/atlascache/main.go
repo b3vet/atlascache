@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"os/signal"
 	"syscall"
@@ -89,10 +90,17 @@ func run() int {
 	procmem.Start()
 	defer procmem.Stop()
 
+	limits, err := connLimits(cfg)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to read the connection limits")
+		return 1
+	}
+
 	// The engine reaches the server through the keyspace seam, so the transport
 	// layer holds no storage types (FEAT-0017).
 	store := keyspace{engine: cache.engine, procmem: procmem}
-	srv, err := server.New(ctx, cfg.ClientAddr(), logging.WithComponent("server"), store, sec.options()...)
+	srv, err := server.New(ctx, cfg.ClientAddr(), logging.WithComponent("server"), store,
+		append(sec.options(), server.WithConnLimits(limits))...)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to bind client port")
 		return 1
@@ -150,6 +158,44 @@ func run() int {
 
 	log.Info().Msg("atlascache stopped")
 	return exitCode
+}
+
+// connLimits turns the server section of the configuration into the bounds the
+// connection layer enforces (FEAT-0024).
+//
+// It lives here rather than in internal/server for the same reason the keyspace
+// seam does: the server package names what it needs and the composition root
+// fills it in, so nothing under internal/server imports the configuration
+// package and nothing in the configuration package knows how a connection is
+// served.
+func connLimits(cfg *config.Config) (server.ConnLimits, error) {
+	requestBudget, err := cfg.RequestBudget()
+	if err != nil {
+		return server.ConnLimits{}, fmt.Errorf("server.max_request_size: %w", err)
+	}
+	outputBuffer, err := config.ParseSize(cfg.Server.MaxOutputBuffer)
+	if err != nil {
+		return server.ConnLimits{}, fmt.Errorf("server.max_output_buffer: %w", err)
+	}
+
+	return server.ConnLimits{
+		MaxConnections:      cfg.Server.MaxConnections,
+		IdleTimeout:         cfg.Server.ClientIdleTimeout,
+		MaxRequestBytes:     clampToInt(requestBudget),
+		MaxPipelineCommands: cfg.Server.MaxPipelineCommands,
+		MaxOutputBytes:      clampToInt(outputBuffer),
+	}, nil
+}
+
+// clampToInt narrows a configured size to the int the limits are expressed in.
+// A size past the int range is not a limit anybody meant; it becomes the
+// largest one that can be enforced rather than wrapping into a small one, which
+// is the failure mode that turns a generous setting into a strict one.
+func clampToInt(size uint64) int {
+	if size > math.MaxInt {
+		return math.MaxInt
+	}
+	return int(size)
 }
 
 // core is the cache itself: the storage engine, the eviction policy it makes
@@ -375,6 +421,11 @@ func logBanner(log zerolog.Logger, cfg *config.Config, configFile, clientAddr, a
 		Int("ttl_batch_size", cfg.TTL.BatchSize).
 		Bool("ttl_active_expiration", cfg.TTL.ActiveExpiration).
 		Bool("ttl_lazy_expiration", cfg.TTL.LazyExpiration).
+		Int("max_connections", cfg.Server.MaxConnections).
+		Dur("client_idle_timeout", cfg.Server.ClientIdleTimeout).
+		Str("max_request_size", cfg.Server.MaxRequestSize).
+		Int("max_pipeline_commands", cfg.Server.MaxPipelineCommands).
+		Str("max_output_buffer", cfg.Server.MaxOutputBuffer).
 		Bool("tls_enabled", cfg.TLS.Enabled).
 		Bool("auth_enabled", cfg.Auth.Enabled).
 		Str("log_level", cfg.Logging.Level).

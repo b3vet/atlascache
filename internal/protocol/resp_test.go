@@ -98,6 +98,49 @@ func TestDecodeInline(t *testing.T) {
 	assert.Equal(t, "world", string(cmd.Args[1]))
 }
 
+// TestInlineRequestsTakeABareLF is ISSUE-0019. Redis's inline parser splits on
+// LF and strips an optional CR in front of it, which is what `redis-cli --pipe`
+// with a plain-text file, a shell heredoc and `printf 'PING\n' | nc` all send.
+// Requiring CRLF broke every one of them.
+func TestInlineRequestsTakeABareLF(t *testing.T) {
+	codec := NewRESP()
+
+	accepted := map[string]string{
+		"bare LF":                      "PING\n",
+		"CRLF still works":             "PING\r\n",
+		"arguments after a bare LF":    "echo hello\n",
+		"a blank LF line is skipped":   "\n\nPING\n",
+		"a blank CRLF line is skipped": "\r\n\r\nPING\r\n",
+	}
+	for name, input := range accepted {
+		t.Run(name, func(t *testing.T) {
+			cmd, err := codec.Decode(decoderFor(input))
+			require.NoError(t, err)
+			assert.Contains(t, []string{"PING", "ECHO"}, cmd.Name)
+		})
+	}
+
+	t.Run("a whole pipeline of LF-terminated lines", func(t *testing.T) {
+		r := decoderFor("SET k v\nGET k\nPING\n")
+		for _, want := range []string{"SET", "GET", "PING"} {
+			cmd, err := codec.Decode(r)
+			require.NoError(t, err)
+			assert.Equal(t, want, cmd.Name)
+		}
+	})
+
+	// The bound ISSUE-0016 set has to survive the terminator change: a client
+	// streaming bytes with neither CR nor LF in them is still cut off at the
+	// limit, not after it.
+	t.Run("the inline limit still applies while the line accumulates", func(t *testing.T) {
+		source := &floodReader{fill: 'x', cap: 8 << 20}
+		_, err := codec.Decode(bufio.NewReaderSize(source, connBufferSize))
+		require.ErrorContains(t, err, "too big inline request")
+		assert.LessOrEqual(t, source.read, codec.Limits().MaxInlineLength+2*connBufferSize,
+			"the parser read %d bytes of a line it may not accept", source.read)
+	})
+}
+
 func TestDecodeSequentialCommands(t *testing.T) {
 	codec := NewRESP()
 	r := decoderFor("*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nQUIT\r\n")
@@ -151,8 +194,15 @@ func TestDecodeMalformed(t *testing.T) {
 			wantMsg: "expected CRLF after bulk string",
 		},
 		{
-			name:    "line without carriage return",
-			input:   "PING\n",
+			// Inline requests take a bare LF (ISSUE-0019); framing headers do
+			// not, and Redis is strict about them in the same way.
+			name:    "multibulk header without a carriage return",
+			input:   "*1\n$4\r\nPING\r\n",
+			wantMsg: "expected CRLF line terminator",
+		},
+		{
+			name:    "bulk header without a carriage return",
+			input:   "*1\r\n$4\nPING\r\n",
 			wantMsg: "expected CRLF line terminator",
 		},
 	}

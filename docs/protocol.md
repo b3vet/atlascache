@@ -218,7 +218,10 @@ the server would make them reject commands the server accepts.
 | `SCAN` guarantee | Tolerates concurrent resizing | Snapshot-based; keys created mid-scan may be missed |
 | `COMMAND` | Full command table | Empty array |
 | `INFO` `redis_version` | Present | Absent; `atlascache_version` instead |
-| Inline commands ending `\n` | Accepted | Rejected with `ERR Protocol error: expected CRLF line terminator` |
+| Arguments in one request | 1,048,576 | 131,072, and lower when `server.max_request_size` is (ISSUE-0018) |
+| Total size of one request | Unbounded beyond the per-field limits | `server.max_request_size`, charged while the request arrives |
+| Idle connections | Kept, unless `timeout` is set | Closed after `server.client_idle_timeout`, 30s by default |
+| Output buffering | `client-output-buffer-limit`, unlimited for normal clients | `server.max_output_buffer`, 64MB, disconnect on breach |
 | Command set | Several hundred | The table above |
 | `PING` before `AUTH` | `-NOAUTH` | Served, so health checks and pools work |
 | `AUTH` error text | Ends "or user is disabled." / "Did you mean...?" | The shorter forms in the table above |
@@ -226,3 +229,8 @@ the server would make them reject commands the server accepts.
 
 Empty keys are **not** a divergence. `SET "" v` works, and the empty key behaves
 like any other (ISSUE-0013).
+
+Nor are inline terminators. An inline command ending `\n` is accepted, with an
+optional `\r` in front of it stripped, exactly as Redis does — which is what
+`redis-cli --pipe` with a plain-text file sends (ISSUE-0019). RESP framing
+headers still require CRLF, as they do in Redis.

@@ -45,6 +45,11 @@ const (
 	errBulkLength      = "invalid bulk length"
 	errMultiBulkLength = "invalid multibulk length"
 
+	// errUnknownCommand is what an input that is a bad command rather than a
+	// bad frame gets. The connection survives it, which is the difference the
+	// cases below turn on.
+	errUnknownCommand = "unknown command"
+
 	// rawTimeout bounds every read and write on a raw connection. A server bug
 	// that hangs must fail the spec, not the run.
 	rawTimeout = 10 * time.Second
@@ -126,8 +131,25 @@ var malformedCases = []malformedCase{
 		halfClose: true,
 	},
 	{
-		class:   "line terminated with a bare LF",
-		input:   "+OK\n",
+		// ISSUE-0019: a bare LF terminates an inline request, as it does in
+		// Redis. "+OK" is then a command nobody implements, which is answered
+		// and survived rather than being a framing error.
+		class:    "inline request terminated with a bare LF",
+		input:    "+OK\n",
+		wantErr:  errUnknownCommand,
+		survives: true,
+	},
+	{
+		// The leniency stops at the frame boundary. A multibulk header with a
+		// bare LF is a client library that has lost track of what it wrote, and
+		// Redis refuses it too.
+		class:   "multibulk header terminated with a bare LF",
+		input:   "*1\n$4\r\nPING\r\n",
+		wantErr: "expected CRLF line terminator",
+	},
+	{
+		class:   "bulk header terminated with a bare LF",
+		input:   "*1\r\n$4\nPING\r\n",
 		wantErr: "expected CRLF line terminator",
 	},
 	{
@@ -153,13 +175,13 @@ var malformedCases = []malformedCase{
 	{
 		class:    "RESP3 type byte at the top of a request",
 		input:    "%2\r\n",
-		wantErr:  "unknown command",
+		wantErr:  errUnknownCommand,
 		survives: true,
 	},
 	{
 		class:    "integer overflow in an inline request",
 		input:    ":99999999999999999999\r\n",
-		wantErr:  "unknown command",
+		wantErr:  errUnknownCommand,
 		survives: true,
 	},
 }
@@ -353,25 +375,49 @@ func protoBinaryValuesRoundTrip(c *runner.Ctx) error {
 	return nil
 }
 
-// declaredSizeProbes are the two headers ISSUE-0016 turned into allocations. In
-// each case the request is a few bytes, the declared size is enormous, and the
-// server is always going to refuse it — the only question is what refusing cost.
-var declaredSizeProbes = []struct {
+// declaredSizeProbe is one header whose declared size is enormous and whose
+// wire form is a few bytes.
+type declaredSizeProbe struct {
 	class string
 	input string
 	// wantErr is empty where the header itself is legal and the elements behind
 	// it never arrive, which is the cheapest way to ask for the reservation.
 	wantErr string
-}{
-	{
-		class:   "a bulk header declaring 512MB",
-		input:   "*1\r\n$536870912\r\n",
-		wantErr: errBulkLength,
-	},
-	{
-		class: "a multibulk header declaring a million elements",
-		input: "*1048576\r\n",
-	},
+}
+
+// declaredSizeProbes are the headers ISSUE-0016 turned into allocations, probed
+// against the element cap the server actually runs with.
+//
+// The cap is read from the server rather than written down here, for the reason
+// ISSUE-0018 exists: the million-element header this used to send was legal,
+// because it is inside the protocol's own ceiling, and that is precisely what
+// made twelve bytes on the wire worth a 154MB decode. FEAT-0024 puts a cap
+// below that ceiling, so what matters is that the cap — wherever it is — is
+// refused one element over and reserves nothing at it. The conn-request-budget
+// spec sends the literal million-element header and measures what refusing it
+// costs.
+func declaredSizeProbes(c *runner.Ctx) ([]declaredSizeProbe, error) {
+	elements, err := infoInt(c, "atlascache_max_request_elements")
+	if err != nil {
+		return nil, err
+	}
+
+	return []declaredSizeProbe{
+		{
+			class:   "a bulk header declaring 512MB",
+			input:   "*1\r\n$536870912\r\n",
+			wantErr: errBulkLength,
+		},
+		{
+			class:   fmt.Sprintf("a multibulk header one element over the %d cap", elements),
+			input:   fmt.Sprintf("*%d\r\n", elements+1),
+			wantErr: errMultiBulkLength,
+		},
+		{
+			class: fmt.Sprintf("a multibulk header at the %d element cap", elements),
+			input: fmt.Sprintf("*%d\r\n", elements),
+		},
+	}, nil
 }
 
 // allocationProbeRounds is how many times each probe is sent. Before
@@ -403,7 +449,12 @@ func protoDeclaredSizesCostNothing(c *runner.Ctx) error {
 	}
 	c.Logf("the server holds %d bytes resident before the probes", baseline)
 
-	for _, probe := range declaredSizeProbes {
+	probes, err := declaredSizeProbes(c)
+	if err != nil {
+		return err
+	}
+
+	for _, probe := range probes {
 		peak := baseline
 		for range allocationProbeRounds {
 			if err := sendProbe(c, probe.input, probe.wantErr); err != nil {

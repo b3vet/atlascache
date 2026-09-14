@@ -23,6 +23,15 @@ type Conn interface {
 	// RemoteAddr returns the peer address for logging
 	RemoteAddr() string
 
+	// Touch records that a complete command was served, which restarts the
+	// connection's idle clock and returns its per-request byte budget.
+	//
+	// It is called once per command and never per byte, so that a client
+	// dribbling bytes without ever completing a request is still idle. The
+	// handler has to say when that happened because it is the only layer that
+	// knows where one request ends and the next begins.
+	Touch()
+
 	// Close releases the connection
 	Close() error
 }

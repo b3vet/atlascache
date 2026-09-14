@@ -156,10 +156,24 @@ func (s *session) infoServer() []string {
 	}
 }
 
+// infoClients reports the connection accounting and the bounds it is measured
+// against.
+//
+// The limits are here rather than only in the log banner because a limit an
+// operator cannot read back is one they have to guess at: "connected_clients is
+// 9998" means nothing without maxclients beside it, and a client disconnected by
+// the idle timeout is only diagnosable if the timeout is visible. Redis does the
+// same with maxclients, which is why that one field carries Redis's spelling.
 func (s *session) infoClients() []string {
 	return []string{
 		field("connected_clients", s.srv.conns.connected.Load()),
 		field("blocked_clients", 0),
+		field("maxclients", s.srv.limits.MaxConnections),
+		field("atlascache_client_idle_timeout_ms", s.srv.limits.IdleTimeout.Milliseconds()),
+		field("atlascache_max_request_size", s.srv.limits.MaxRequestBytes),
+		field("atlascache_max_request_elements", s.srv.codecLimits.MaxMultiBulkLength),
+		field("atlascache_max_pipeline_commands", s.srv.limits.MaxPipelineCommands),
+		field("atlascache_max_output_buffer", s.srv.limits.MaxOutputBytes),
 	}
 }
 
@@ -207,6 +221,17 @@ func (s *session) infoStats(stats Stats) []string {
 	return []string{
 		field("total_connections_received", s.srv.conns.connectionsReceived.Load()),
 		field("total_commands_processed", s.srv.conns.commandsProcessed.Load()),
+		// Redis's spelling again: connections turned away at max_connections.
+		field("rejected_connections", s.srv.conns.rejected.Load()),
+		// The rest have no Redis equivalent, so they carry the prefix. Each
+		// names one reason a connection ended that is not the client hanging
+		// up, because the four are four different things to go and fix
+		// (FEAT-0024).
+		field("atlascache_idle_closed", s.srv.conns.idleClosed.Load()),
+		field("atlascache_output_limit_closed", s.srv.conns.outputClosed.Load()),
+		field("atlascache_stalled_closed", s.srv.conns.stalledClosed.Load()),
+		field("atlascache_request_limit_closed", s.srv.conns.requestClosed.Load()),
+		field("atlascache_handler_panics", s.srv.conns.panics.Load()),
 		field("keyspace_hits", stats.Hits),
 		field("keyspace_misses", stats.Misses),
 		field("expired_keys", stats.Expirations),

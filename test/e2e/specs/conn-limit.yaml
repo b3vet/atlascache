@@ -1,0 +1,34 @@
+version: 1
+name: conn-limit
+tier: full
+feature: FEAT-0024
+description: >
+  max_connections is mandatory rather than optional (ADR-0021): a connection
+  costs a goroutine and two buffers, so an unbounded count is a memory
+  exhaustion vector on a port that is unauthenticated by default.
+
+  What is checked here is how the limit is enforced. A connection past it is
+  accepted, told "-ERR max number of clients reached", and closed -- not refused
+  at accept, which would reach the client as ECONNREFUSED and is exactly what a
+  server that is down looks like.
+
+  The idle timeout is off for this spec so that nothing but the limit decides
+  when a connection ends.
+
+config:
+  server:
+    max_connections: 12
+    client_idle_timeout: "0"
+
+steps:
+  - cmd: PING
+    expect: PONG
+
+  - cmd: INFO clients
+    expect_field:
+      maxclients: "12"
+
+  - scenario: conn_limit_reports_then_closes
+
+  - cmd: PING
+    expect: PONG

@@ -1,0 +1,24 @@
+version: 1
+name: conn-drain
+tier: full
+feature: FEAT-0024
+description: >
+  A graceful shutdown with nothing happening is the easy case, and
+  shutdown-graceful already covers it. This one arrives while twenty connections
+  are mid-pipeline, which is when a drain that waits for the wrong thing hangs:
+  the listener has to stop accepting, the connections in a read have to be
+  unblocked, the ones executing a command have to be allowed to finish it, and
+  the whole thing has to be over inside the window.
+
+  The signal is deliberately sent without warning the clients, because that is
+  how a deploy does it.
+
+steps:
+  - cmd: PING
+    expect: PONG
+
+  - cmd: SET drain:k written-before-the-signal
+    expect: OK
+
+  # Last step: the server is gone afterwards.
+  - scenario: conn_drain_under_load_exits_in_time

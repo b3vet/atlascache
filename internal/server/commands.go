@@ -310,6 +310,23 @@ type connCounters struct {
 	connectionsReceived atomic.Uint64
 	commandsProcessed   atomic.Uint64
 	connected           atomic.Int64
+
+	// Why connections ended other than by the client hanging up (FEAT-0024).
+	// They are counted separately rather than as one "disconnects" figure
+	// because they read as four different operational problems: a pool that
+	// has outgrown max_connections, clients that go quiet, clients that stop
+	// reading, and clients sending requests too large to accept. A single
+	// number would leave an operator guessing which.
+	rejected      atomic.Uint64
+	idleClosed    atomic.Uint64
+	outputClosed  atomic.Uint64
+	stalledClosed atomic.Uint64
+	requestClosed atomic.Uint64
+
+	// panics is handler panics survived, one connection each. It should be
+	// zero; anything else is a bug that a fuzzer or a client found, and it is
+	// reported so that the recovery does not hide it (FEAT-0025).
+	panics atomic.Uint64
 }
 
 // session is one connection's view of the server: what it can reach, and the
@@ -730,6 +747,13 @@ func (s *session) stats(protocol.Command) protocol.Reply {
 		counter("connections_received", s.srv.conns.connectionsReceived.Load()),
 		counter("commands_processed", s.srv.conns.commandsProcessed.Load()),
 		{Key: protocol.BulkString("connected_clients"), Value: protocol.Integer(s.srv.conns.connected.Load())},
+		counter("max_connections", uint64(s.srv.limits.MaxConnections)), //nolint:gosec // validated to 1..1e6
+		counter("rejected_connections", s.srv.conns.rejected.Load()),
+		counter("idle_closed", s.srv.conns.idleClosed.Load()),
+		counter("output_limit_closed", s.srv.conns.outputClosed.Load()),
+		counter("stalled_closed", s.srv.conns.stalledClosed.Load()),
+		counter("request_limit_closed", s.srv.conns.requestClosed.Load()),
+		counter("handler_panics", s.srv.conns.panics.Load()),
 		counter("uptime_seconds", uint64(uptime().Seconds())),
 	}
 }

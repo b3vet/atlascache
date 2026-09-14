@@ -1,0 +1,30 @@
+version: 1
+name: compat-inline-lf
+tier: smoke
+feature: FEAT-0024
+issue: ISSUE-0019
+description: >
+  Redis's inline parser splits on LF and strips an optional CR in front of it.
+  This server required CRLF, which refused `printf 'PING\n' | nc`, anything
+  piped through echo or a shell heredoc, and -- the one with the blast radius --
+  `redis-cli --pipe` with a plain-text file, which is the documented way to mass
+  load a Redis and is the first thing somebody reaches for when trying a new
+  server.
+
+  What runs here is the byte stream `redis-cli --pipe` puts on the wire for a
+  text file authored on any Unix: inline commands with no CR anywhere, all in
+  one write, followed by an ECHO of a token to find the end of the replies. The
+  tool itself is checked against a real redis-cli out of band; the suite keeps
+  no dependency on a Redis installation.
+
+  The framing headers stay strict, as they are in Redis, and proto-malformed
+  holds them to it.
+
+steps:
+  - cmd: PING
+    expect: PONG
+
+  - scenario: compat_inline_lf_bulk_load
+
+  - cmd: GET pipe:key:0000
+    expect: value-0000

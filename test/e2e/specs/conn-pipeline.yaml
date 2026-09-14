@@ -1,0 +1,36 @@
+version: 1
+name: conn-pipeline
+tier: full
+feature: FEAT-0024
+description: >
+  Pipelining, which is buffering rather than concurrency (ADR-0021): a client
+  writes many commands without waiting, the server drains the read buffer,
+  executes them in order, and answers with one flush.
+
+  Two properties are asserted, and the second is the one that is easy to get
+  wrong. Ordering, because a client matches replies to requests positionally and
+  a reordered reply is not an error -- it is a confident wrong answer. And that
+  a batch ending in a partial frame is answered anyway: a server that kept
+  decoding while anything was buffered would block inside the incomplete command
+  holding the replies to the complete ones, against a client that is waiting for
+  exactly those before it sends the rest.
+
+  The syscall count is asserted in internal/server, where the connection's
+  net.Conn can be counted. From out here the observable is that a thousand
+  commands come back, in order, promptly, on a connection that carries on
+  working afterwards.
+
+steps:
+  - cmd: PING
+    expect: PONG
+
+  - scenario: conn_pipeline_returns_in_order
+
+  - scenario: conn_pipeline_retains_a_partial_frame
+
+  # Pipelined writes are real writes: what the batch set is readable after it.
+  - cmd: SET pipeline:k after-the-batch
+    expect: OK
+
+  - cmd: GET pipeline:k
+    expect: after-the-batch

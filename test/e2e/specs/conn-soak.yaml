@@ -1,0 +1,25 @@
+version: 1
+name: conn-soak
+tier: soak
+feature: FEAT-0024
+description: >
+  The scenario FEAT-0024 says finds the real bugs: sustained connect, command,
+  disconnect churn while the goroutine count and the resident set are watched.
+
+  A goroutine that outlives its connection by one is invisible in every other
+  spec in the suite and takes the process down after a week. So the count is
+  read from a process sample taken after each pass rather than from a stale one,
+  and the resident set is read with ps from outside -- and neither may follow
+  the number of connections that have been served.
+
+steps:
+  - cmd: PING
+    expect: PONG
+
+  - scenario: conn_churn_leaks_nothing
+
+  - cmd: SET soak:k survived
+    expect: OK
+
+  - cmd: GET soak:k
+    expect: survived

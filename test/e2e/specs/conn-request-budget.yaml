@@ -1,0 +1,47 @@
+version: 1
+name: conn-request-budget
+tier: full
+feature: FEAT-0024
+issue: ISSUE-0018
+description: >
+  Every parser limit bounds one field and nothing bounds their product. The
+  largest request the field limits accept is 1,048,576 single-byte elements:
+  7,340,044 bytes sent for 154,527,640 bytes allocated, 21x, none of it charged
+  against max_memory and all of it reachable by anyone who can open a socket.
+
+  Two bounds close it, and both are derived rather than configured so that
+  neither can drift from what it is derived from. The element cap comes from the
+  request budget, which refuses the million-element header on sight. The byte
+  budget itself is charged while the request is arriving, so a request whose
+  fields are each legal and whose total is not is refused part-way through
+  rather than after it has all been read.
+
+  The measurement is the point. Every one of ISSUE-0016's bugs returned the
+  correct error after allocating, and this issue was found by measuring rather
+  than by reading a reply -- so the server's resident set is sampled with ps,
+  from outside the process, while the flood is in flight.
+
+config:
+  storage:
+    max_value_size: "64KB"
+  server:
+    max_request_size: "256KB"
+    client_idle_timeout: "0"
+
+steps:
+  - cmd: PING
+    expect: PONG
+
+  - cmd: INFO clients
+    expect_field:
+      atlascache_max_request_size: "262144"
+
+  - scenario: conn_request_budget_costs_nothing
+
+  # A request at a size the budget does allow is still served, so the flood
+  # above is about refusing the impossible and not about refusing everything.
+  - cmd: SET budget:k an-ordinary-value
+    expect: OK
+
+  - cmd: GET budget:k
+    expect: an-ordinary-value

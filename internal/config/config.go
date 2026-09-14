@@ -31,10 +31,45 @@ type NodeConfig struct {
 	DataDir string `mapstructure:"data_dir"` // Data directory path
 }
 
-// ServerConfig contains client-facing listener settings
+// ServerConfig contains client-facing listener and connection settings.
+//
+// Everything below BindAddr and ClientPort bounds what one client may cost
+// (FEAT-0024). None of them is optional in practice: a connection costs a
+// goroutine, two buffers and whatever its in-flight request decodes to, and
+// with auth off by default (ADR-0009) every one of those is reachable by
+// anyone who can open a socket.
 type ServerConfig struct {
 	BindAddr   string `mapstructure:"bind_addr"`   // Interface to bind, e.g. "0.0.0.0"
 	ClientPort int    `mapstructure:"client_port"` // RESP client port
+
+	// MaxConnections is the ceiling on concurrently served clients. A
+	// connection past it is accepted, told so, and closed — refusing to accept
+	// would give the client an opaque connection-refused instead (ADR-0021).
+	MaxConnections int `mapstructure:"max_connections"`
+
+	// ClientIdleTimeout closes a connection that has issued no command for this
+	// long. It is refreshed per command, never per byte, so a client dribbling
+	// bytes without completing a request is still reaped. 0 disables it.
+	ClientIdleTimeout time.Duration `mapstructure:"client_idle_timeout"`
+
+	// MaxRequestSize bounds the wire bytes one request may consume, which is
+	// the bound every per-field limit leaves open: the largest request the
+	// field limits accept is a million one-byte elements, 7MB sent for 154MB
+	// decoded (ISSUE-0018). Empty or "0" derives it from
+	// storage.max_value_size, so the largest value the engine accepts always
+	// fits in a request.
+	MaxRequestSize string `mapstructure:"max_request_size"`
+
+	// MaxPipelineCommands is how many pipelined commands are executed before
+	// the accumulated replies are flushed. It bounds the reply buffer one
+	// client can build up by pipelining without reading.
+	MaxPipelineCommands int `mapstructure:"max_pipeline_commands"`
+
+	// MaxOutputBuffer is the ceiling on reply bytes buffered for one
+	// connection. A client that issues `KEYS *` against a large keyspace and
+	// stops reading is the case it exists for; on breach the connection is
+	// closed with the reason logged.
+	MaxOutputBuffer string `mapstructure:"max_output_buffer"`
 }
 
 // AdminConfig contains admin HTTP API settings
@@ -112,6 +147,15 @@ func Defaults() *Config {
 		Server: ServerConfig{
 			BindAddr:   "0.0.0.0",
 			ClientPort: 6379,
+			// Redis's own default, and about 400MB of connection overhead
+			// here: ADR-0021 budgeted 8KB of goroutine stack per connection,
+			// but the read and write buffers take the real cost nearer 40KB.
+			MaxConnections:    10000,
+			ClientIdleTimeout: 30 * time.Second,
+			// Derived from storage.max_value_size; see ServerConfig.
+			MaxRequestSize:      "0",
+			MaxPipelineCommands: 1024,
+			MaxOutputBuffer:     "64MB",
 		},
 		Admin: AdminConfig{
 			BindAddr: "127.0.0.1",
@@ -120,7 +164,7 @@ func Defaults() *Config {
 		Storage: StorageConfig{
 			ShardCount:   0,   // Auto-detect
 			MaxMemory:    "0", // Unlimited
-			MaxValueSize: "1MB",
+			MaxValueSize: defaultMaxValueSize,
 		},
 		TTL: TTLConfig{
 			CheckInterval:    100 * time.Millisecond,
@@ -150,6 +194,40 @@ func Defaults() *Config {
 			Token:   "",
 		},
 	}
+}
+
+// defaultMaxValueSize is the largest value the engine accepts out of the box,
+// and the figure the request budget is derived from.
+const defaultMaxValueSize = "1MB"
+
+// RequestBudgetMargin is what a request carries besides its largest argument:
+// the command name, the key, the options, and the per-element framing. It is
+// the headroom a derived server.max_request_size adds on top of
+// storage.max_value_size, so a SET of the largest value the engine accepts is
+// never refused by the request budget instead.
+const RequestBudgetMargin = 1024 * 1024
+
+// RequestBudget returns the wire bytes one request may consume, resolving the
+// derived form of server.max_request_size.
+//
+// Deriving it rather than defaulting it to a constant is what keeps the two
+// limits from drifting: raising storage.max_value_size to 16MB with a fixed
+// 2MB request budget would make the larger value unwritable, and the failure
+// would look like a protocol bug rather than a configuration one.
+func (c *Config) RequestBudget() (uint64, error) {
+	explicit, err := ParseSize(c.Server.MaxRequestSize)
+	if err != nil {
+		return 0, err
+	}
+	if explicit > 0 {
+		return explicit, nil
+	}
+
+	maxValueSize, err := ParseSize(c.Storage.MaxValueSize)
+	if err != nil {
+		return 0, err
+	}
+	return maxValueSize + RequestBudgetMargin, nil
 }
 
 // GetShardCount returns the effective shard count

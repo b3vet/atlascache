@@ -1,0 +1,41 @@
+version: 1
+name: conn-idle-timeout
+tier: full
+feature: FEAT-0024
+issue: ISSUE-0018
+description: >
+  client_idle_timeout was declared in the plan and never implemented, so a
+  connection that opened and said nothing held its goroutine and its buffers for
+  as long as the process lived -- the second half of what ISSUE-0018 found.
+
+  Three clients are held to it. One that sends nothing is reaped. One that sends
+  a command every third of the timeout is not, because the clock restarts per
+  command and a timeout that did not would be a connection lifetime. And one
+  that dribbles a byte at a time without ever completing a request is reaped
+  anyway, which is what "per command, not per byte" is for: a timeout armed on
+  read activity would be pushed out by every byte and would never fire.
+
+config:
+  server:
+    client_idle_timeout: "2s"
+
+steps:
+  - cmd: PING
+    expect: PONG
+
+  - cmd: INFO clients
+    expect_field:
+      atlascache_client_idle_timeout_ms: "2000"
+
+  - scenario: conn_idle_timeout_reaps_the_silent
+
+  - scenario: conn_idle_timeout_spares_the_busy
+
+  - scenario: conn_dribbling_does_not_defeat_the_timeout
+
+  # The server is unharmed by having reaped several connections.
+  - cmd: SET idle:k still-here
+    expect: OK
+
+  - cmd: GET idle:k
+    expect: still-here

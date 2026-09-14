@@ -17,6 +17,40 @@ server:
   # RESP client port
   client_port: 6379
 
+  # Connection management (FEAT-0024). Each of these bounds what one client can
+  # cost, and with auth off by default every one of them is reachable by anyone
+  # who can open a socket.
+
+  # Maximum clients served at once. One more than this is accepted, told
+  # "-ERR max number of clients reached", and closed -- rather than refused at
+  # accept, which reaches the client as an opaque connection-refused. Each
+  # connection costs a goroutine plus its read and write buffers, roughly 40KB,
+  # so this default is about 400MB of connection overhead at the ceiling.
+  max_connections: 10000
+
+  # Close a connection that has issued no command for this long. Refreshed per
+  # command, not per byte: a client dribbling bytes without ever completing a
+  # request is still reaped. "0" disables it.
+  client_idle_timeout: "30s"
+
+  # Wire bytes one request may consume. Every per-field protocol limit bounds
+  # one field and nothing bounds their product, so the largest request the
+  # field limits accept is a million one-byte elements -- 7MB sent, 154MB
+  # decoded (ISSUE-0018). "0" derives this from storage.max_value_size plus 1MB
+  # of framing, so the largest value the engine accepts always fits.
+  max_request_size: "0"
+
+  # Pipelined commands executed before the accumulated replies are flushed.
+  # Pipelining is buffering, not concurrency: N commands cost one read and one
+  # write syscall instead of N of each, and this bounds how much reply a client
+  # can build up by pipelining without reading.
+  max_pipeline_commands: 1024
+
+  # Reply bytes buffered for one connection before it is closed. `KEYS *` on a
+  # large keyspace from a client that stops reading is the case this exists
+  # for. "0" leaves output uncapped, which is not recommended.
+  max_output_buffer: "64MB"
+
 # Admin HTTP API configuration
 admin:
   # Bound to loopback by default; the admin API is more powerful than the

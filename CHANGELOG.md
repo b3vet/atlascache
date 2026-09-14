@@ -35,6 +35,26 @@ of the command set arrives in the next phase.
 - Commit convention tooling: a `commit-msg` hook enforcing Conventional
   Commits, installed by `make tools`.
 - An MIT `LICENSE`, which the README had claimed without one being present.
+- Pipelining. A client that writes many commands without waiting gets them
+  executed in order and answered in one flush, so a batch costs one read and
+  one write rather than one of each per command. A batch that ends in a partial
+  frame is answered anyway: the partial frame is kept for the next read instead
+  of stalling the replies already earned.
+- Connection limits, under `server:` and all with working defaults.
+  `max_connections` (10000) turns a connection past the ceiling away with
+  `-ERR max number of clients reached` and closes it, rather than refusing to
+  accept and leaving the client with an unexplained `ECONNREFUSED`.
+  `client_idle_timeout` (30s) reaps a connection that has completed no command,
+  refreshed per command rather than per byte so that dribbling bytes does not
+  defeat it. `max_output_buffer` (64MB) disconnects a client that asks for a
+  reply it will not read. `max_pipeline_commands` (1024) bounds a batch.
+- `INFO` reports the connection bounds and why connections ended: `maxclients`
+  and `rejected_connections` in Redis's spelling, plus `atlascache_idle_closed`,
+  `atlascache_output_limit_closed`, `atlascache_stalled_closed`,
+  `atlascache_request_limit_closed` and `atlascache_handler_panics`. `STATS`
+  carries the same figures.
+- Panic isolation per connection. A handler that panics closes that connection,
+  logs the stack, and leaves every other client served.
 
 ### Fixed
 
@@ -46,5 +66,18 @@ of the command set arrives in the next phase.
   wrap was accounted as tiny and would have slipped past the memory limit.
 - `make tools` installs a `golangci-lint` that can read the project's
   configuration; it previously installed a version that could not.
+- An inline command terminated with a bare `\n` is accepted, as it is in Redis.
+  Requiring CRLF broke `redis-cli --pipe` with a plain-text file — the
+  documented way to mass-load a Redis — along with anything piped through
+  `echo`, a heredoc, or a file authored on Unix. RESP framing headers stay
+  strict, which is also what Redis does.
+- One accepted request can no longer cost the server twenty times the bytes it
+  took to send. Every per-field parser limit was correct and nothing bounded
+  their product: a request of a million single-byte elements was inside all of
+  them, 7MB to send and 154MB to decode, against a port that is
+  unauthenticated by default. A per-request byte budget — derived from
+  `storage.max_value_size` unless `server.max_request_size` sets it — is charged
+  while the request is arriving, and the element count is derived from it, so
+  the same flood now moves the resident set by nothing.
 
 [Unreleased]: https://github.com/b3vet/atlascache/commits/main

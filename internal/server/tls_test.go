@@ -449,7 +449,11 @@ func TestConnHidesTLS(t *testing.T) {
 	}
 	sort.Strings(methods)
 
-	assert.Equal(t, []string{"Close", "Flush", "Reader", "RemoteAddr", "Writer"}, methods,
+	// Touch joined the set with FEAT-0024. It says when a command completed,
+	// which the handler is the only layer that knows; it says nothing about
+	// what the connection is made of, so a gnet transport implements it with
+	// its own deadline handling and no handler learns anything either way.
+	assert.Equal(t, []string{"Close", "Flush", "Reader", "RemoteAddr", "Touch", "Writer"}, methods,
 		"the connection a handler sees must expose nothing about its transport")
 }
 
