@@ -3,6 +3,7 @@ package storage
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,7 +30,7 @@ func scanAll(t *testing.T, engine *ShardedEngine, owner ScanOwner, count int) []
 	for pages := 0; ; pages++ {
 		require.Less(t, pages, 10_000_000, "the scan did not terminate")
 
-		keys, next, err := engine.Scan(owner, cursor, count)
+		keys, next, err := engine.Scan(owner, cursor, count, "")
 		require.NoError(t, err)
 		for _, key := range keys {
 			yielded = append(yielded, string(key))
@@ -262,7 +263,7 @@ func TestScanFiltersKeysRemovedAfterTheSnapshot(t *testing.T) {
 	}
 
 	// One page fixes the snapshot; everything else is removed after it is taken.
-	first, cursor, err := engine.Scan(1, ScanCursorStart, 5)
+	first, cursor, err := engine.Scan(1, ScanCursorStart, 5, "")
 	require.NoError(t, err)
 	require.NotEqual(t, ScanCursorStart, cursor)
 
@@ -276,7 +277,7 @@ func TestScanFiltersKeysRemovedAfterTheSnapshot(t *testing.T) {
 	// before anything was removed, so a doomed key in it is correct, not a leak.
 	var laterPages []string
 	for {
-		keys, next, scanErr := engine.Scan(1, cursor, 5)
+		keys, next, scanErr := engine.Scan(1, cursor, 5, "")
 		require.NoError(t, scanErr)
 		for _, key := range keys {
 			laterPages = append(laterPages, string(key))
@@ -324,7 +325,7 @@ func TestScanCursorExpiresWhenIdle(t *testing.T) {
 	now := time.Now()
 	engine.scans.now = func() time.Time { return now }
 
-	_, cursor, err := engine.Scan(1, ScanCursorStart, 5)
+	_, cursor, err := engine.Scan(1, ScanCursorStart, 5, "")
 	require.NoError(t, err)
 	require.NotEqual(t, ScanCursorStart, cursor)
 	require.Equal(t, uint64(1), engine.Stats().ScanCursors)
@@ -332,7 +333,7 @@ func TestScanCursorExpiresWhenIdle(t *testing.T) {
 	t.Run("a cursor still within the window survives", func(t *testing.T) {
 		now = now.Add(59 * time.Second)
 
-		_, next, pageErr := engine.Scan(1, cursor, 5)
+		_, next, pageErr := engine.Scan(1, cursor, 5, "")
 		require.NoError(t, pageErr)
 		cursor = next
 	})
@@ -340,7 +341,7 @@ func TestScanCursorExpiresWhenIdle(t *testing.T) {
 	t.Run("an idle cursor is dropped and then errors clearly", func(t *testing.T) {
 		now = now.Add(2 * time.Minute)
 
-		keys, next, pageErr := engine.Scan(1, cursor, 5)
+		keys, next, pageErr := engine.Scan(1, cursor, 5, "")
 		assert.ErrorIs(t, pageErr, ErrScanCursorUnknown)
 		assert.Nil(t, keys, "an expired cursor must not return partial results")
 		assert.Equal(t, ScanCursorStart, next)
@@ -365,17 +366,17 @@ func TestScanPerConnectionCursorCap(t *testing.T) {
 
 	open := make([]string, 0, cap)
 	for i := 0; i < cap; i++ {
-		_, cursor, err := engine.Scan(1, ScanCursorStart, 1)
+		_, cursor, err := engine.Scan(1, ScanCursorStart, 1, "")
 		require.NoError(t, err)
 		require.NotEqual(t, ScanCursorStart, cursor)
 		open = append(open, cursor)
 	}
 
-	_, _, err := engine.Scan(1, ScanCursorStart, 1)
+	_, _, err := engine.Scan(1, ScanCursorStart, 1, "")
 	assert.ErrorIs(t, err, ErrTooManyScanCursors)
 
 	t.Run("the cap is per connection, not global", func(t *testing.T) {
-		_, cursor, otherErr := engine.Scan(2, ScanCursorStart, 1)
+		_, cursor, otherErr := engine.Scan(2, ScanCursorStart, 1, "")
 		require.NoError(t, otherErr)
 		assert.NotEqual(t, ScanCursorStart, cursor)
 	})
@@ -384,12 +385,12 @@ func TestScanPerConnectionCursorCap(t *testing.T) {
 		// Drain the first cursor to completion, which drops it.
 		cursor := open[0]
 		for cursor != ScanCursorStart {
-			_, next, pageErr := engine.Scan(1, cursor, maxScanCount)
+			_, next, pageErr := engine.Scan(1, cursor, maxScanCount, "")
 			require.NoError(t, pageErr)
 			cursor = next
 		}
 
-		_, fresh, freshErr := engine.Scan(1, ScanCursorStart, 1)
+		_, fresh, freshErr := engine.Scan(1, ScanCursorStart, 1, "")
 		require.NoError(t, freshErr)
 		assert.NotEqual(t, ScanCursorStart, fresh)
 	})
@@ -405,22 +406,22 @@ func TestScanRejectsCursorsItDidNotIssue(t *testing.T) {
 	fillKeys(t, engine, "k:", 100)
 
 	t.Run("an id that was never issued", func(t *testing.T) {
-		keys, next, err := engine.Scan(1, "deadbeefdeadbeefdeadbeefdeadbeef", 10)
+		keys, next, err := engine.Scan(1, "deadbeefdeadbeefdeadbeefdeadbeef", 10, "")
 		assert.ErrorIs(t, err, ErrScanCursorUnknown)
 		assert.Nil(t, keys)
 		assert.Equal(t, ScanCursorStart, next)
 	})
 
 	t.Run("a malformed id", func(t *testing.T) {
-		_, _, err := engine.Scan(1, "not-a-cursor", 10)
+		_, _, err := engine.Scan(1, "not-a-cursor", 10, "")
 		assert.ErrorIs(t, err, ErrScanCursorUnknown)
 	})
 
 	t.Run("another connection's cursor", func(t *testing.T) {
-		_, cursor, err := engine.Scan(1, ScanCursorStart, 5)
+		_, cursor, err := engine.Scan(1, ScanCursorStart, 5, "")
 		require.NoError(t, err)
 
-		keys, next, err := engine.Scan(2, cursor, 5)
+		keys, next, err := engine.Scan(2, cursor, 5, "")
 		assert.ErrorIs(t, err, ErrScanCursorUnknown,
 			"a cursor is scoped to the connection that created it")
 		assert.Nil(t, keys)
@@ -428,7 +429,7 @@ func TestScanRejectsCursorsItDidNotIssue(t *testing.T) {
 
 		// And the owner still holds it: rejecting the impostor must not have
 		// dropped the real scan.
-		_, next, err = engine.Scan(1, cursor, 5)
+		_, next, err = engine.Scan(1, cursor, 5, "")
 		require.NoError(t, err)
 		assert.NotEqual(t, ScanCursorStart, next)
 	})
@@ -437,7 +438,7 @@ func TestScanRejectsCursorsItDidNotIssue(t *testing.T) {
 		cursor := ScanCursorStart
 		var last string
 		for {
-			_, next, err := engine.Scan(3, cursor, 10)
+			_, next, err := engine.Scan(3, cursor, 10, "")
 			require.NoError(t, err)
 			if next == ScanCursorStart {
 				break
@@ -447,7 +448,7 @@ func TestScanRejectsCursorsItDidNotIssue(t *testing.T) {
 		}
 		require.NotEmpty(t, last)
 
-		_, _, err := engine.Scan(3, last, 10)
+		_, _, err := engine.Scan(3, last, 10, "")
 		assert.ErrorIs(t, err, ErrScanCursorUnknown,
 			"an exhausted cursor must error rather than start the scan over")
 	})
@@ -465,10 +466,12 @@ func TestScanCursorIDsAreUnguessable(t *testing.T) {
 
 	seen := make(map[string]struct{}, 64)
 	for i := 0; i < 64; i++ {
-		_, cursor, err := engine.Scan(ScanOwner(i%4), ScanCursorStart, 1)
+		_, cursor, err := engine.Scan(ScanOwner(i%4), ScanCursorStart, 1, "")
 		require.NoError(t, err)
 
-		assert.Len(t, cursor, 2*cursorIDBytes, "an id carries %d bytes of entropy", cursorIDBytes)
+		value, parseErr := strconv.ParseUint(cursor, 10, 64)
+		require.NoError(t, parseErr, "a cursor must parse as a decimal uint64, the way every real client parses it")
+		assert.NotZero(t, value, "zero is the start-and-finished sentinel and must never be issued")
 		assert.NotEqual(t, ScanCursorStart, cursor)
 		assert.NotContains(t, seen, cursor, "cursor ids must not repeat")
 		seen[cursor] = struct{}{}
@@ -494,7 +497,7 @@ func TestScanSnapshotMemoryIsNotChargedToMaxMemory(t *testing.T) {
 	before := engine.Stats()
 	require.Equal(t, uint64(2000), before.Keys)
 
-	_, cursor, err := engine.Scan(1, ScanCursorStart, 1)
+	_, cursor, err := engine.Scan(1, ScanCursorStart, 1, "")
 	require.NoError(t, err)
 	require.NotEqual(t, ScanCursorStart, cursor)
 
@@ -543,12 +546,12 @@ func TestScanGlobalSnapshotMemoryCap(t *testing.T) {
 		require.NoError(t, engine.Set([]byte(fmt.Sprintf("key:%08d", i)), []byte("v"), 0))
 	}
 
-	_, first, err := engine.Scan(1, ScanCursorStart, 1)
+	_, first, err := engine.Scan(1, ScanCursorStart, 1, "")
 	require.NoError(t, err)
 	firstBytes := engine.Stats().ScanSnapshotBytes
 	require.Positive(t, firstBytes)
 
-	_, second, err := engine.Scan(2, ScanCursorStart, 1)
+	_, second, err := engine.Scan(2, ScanCursorStart, 1, "")
 	require.NoError(t, err)
 	require.NotEqual(t, ScanCursorStart, second)
 
@@ -559,14 +562,14 @@ func TestScanGlobalSnapshotMemoryCap(t *testing.T) {
 	})
 
 	t.Run("the evicted cursor errors rather than restarting", func(t *testing.T) {
-		pageKeys, next, pageErr := engine.Scan(1, first, 10)
+		pageKeys, next, pageErr := engine.Scan(1, first, 10, "")
 		assert.ErrorIs(t, pageErr, ErrScanCursorUnknown)
 		assert.Nil(t, pageKeys)
 		assert.Equal(t, ScanCursorStart, next)
 	})
 
 	t.Run("the surviving cursor still works", func(t *testing.T) {
-		_, next, pageErr := engine.Scan(2, second, 10)
+		_, next, pageErr := engine.Scan(2, second, 10, "")
 		require.NoError(t, pageErr)
 		assert.NotEqual(t, ScanCursorStart, next)
 	})
@@ -587,7 +590,7 @@ func TestScanSnapshotLargerThanTheCapIsRejected(t *testing.T) {
 
 	fillKeys(t, engine, "key:", 500)
 
-	keys, next, err := engine.Scan(1, ScanCursorStart, 10)
+	keys, next, err := engine.Scan(1, ScanCursorStart, 10, "")
 	assert.ErrorIs(t, err, ErrScanMemoryExhausted)
 	assert.Nil(t, keys)
 	assert.Equal(t, ScanCursorStart, next)
@@ -609,7 +612,7 @@ func TestScanSnapshotLargerThanTheCapIsRejected(t *testing.T) {
 
 		fillKeys(t, tiny, "k:", 10)
 
-		_, cursor, openErr := tiny.Scan(1, ScanCursorStart, 10)
+		_, cursor, openErr := tiny.Scan(1, ScanCursorStart, 10, "")
 		assert.ErrorIs(t, openErr, ErrScanMemoryExhausted)
 		assert.Equal(t, ScanCursorStart, cursor)
 		assert.Equal(t, uint64(0), tiny.Stats().ScanCursors)
@@ -663,11 +666,11 @@ func TestReleaseScansDropsAConnectionsCursors(t *testing.T) {
 
 	var mine []string
 	for i := 0; i < 3; i++ {
-		_, cursor, err := engine.Scan(1, ScanCursorStart, 1)
+		_, cursor, err := engine.Scan(1, ScanCursorStart, 1, "")
 		require.NoError(t, err)
 		mine = append(mine, cursor)
 	}
-	_, theirs, err := engine.Scan(2, ScanCursorStart, 1)
+	_, theirs, err := engine.Scan(2, ScanCursorStart, 1, "")
 	require.NoError(t, err)
 
 	require.Equal(t, uint64(4), engine.Stats().ScanCursors)
@@ -678,11 +681,11 @@ func TestReleaseScansDropsAConnectionsCursors(t *testing.T) {
 	assert.Equal(t, uint64(1), stats.ScanCursors, "only the released connection's cursors go")
 
 	for _, cursor := range mine {
-		_, _, pageErr := engine.Scan(1, cursor, 10)
+		_, _, pageErr := engine.Scan(1, cursor, 10, "")
 		assert.ErrorIs(t, pageErr, ErrScanCursorUnknown)
 	}
 
-	_, _, err = engine.Scan(2, theirs, 10)
+	_, _, err = engine.Scan(2, theirs, 10, "")
 	assert.NoError(t, err, "another connection's scan is untouched")
 
 	t.Run("releasing an unknown connection is a no-op", func(t *testing.T) {
@@ -697,7 +700,7 @@ func TestCloseDropsEveryCursor(t *testing.T) {
 	engine := NewShardedEngine(EngineConfig{ShardCount: 4, MaxValueSize: 1024})
 
 	fillKeys(t, engine, "k:", 100)
-	_, cursor, err := engine.Scan(1, ScanCursorStart, 1)
+	_, cursor, err := engine.Scan(1, ScanCursorStart, 1, "")
 	require.NoError(t, err)
 	require.Equal(t, uint64(1), engine.Stats().ScanCursors)
 
@@ -707,7 +710,7 @@ func TestCloseDropsEveryCursor(t *testing.T) {
 	assert.Equal(t, uint64(0), stats.ScanCursors)
 	assert.Equal(t, uint64(0), stats.ScanSnapshotBytes)
 
-	_, _, err = engine.Scan(1, cursor, 10)
+	_, _, err = engine.Scan(1, cursor, 10, "")
 	assert.ErrorIs(t, err, ErrEngineClosed)
 }
 
@@ -724,7 +727,7 @@ func TestScanCountBounds(t *testing.T) {
 
 	t.Run("a non-positive count falls back to the default", func(t *testing.T) {
 		for _, count := range []int{0, -1} {
-			keys, cursor, err := engine.Scan(ScanOwner(1), ScanCursorStart, count)
+			keys, cursor, err := engine.Scan(ScanOwner(1), ScanCursorStart, count, "")
 			require.NoError(t, err)
 			assert.Len(t, keys, defaultScanCount)
 			assert.NotEqual(t, ScanCursorStart, cursor)
@@ -733,7 +736,7 @@ func TestScanCountBounds(t *testing.T) {
 	})
 
 	t.Run("an enormous count is clamped rather than honored", func(t *testing.T) {
-		keys, _, err := engine.Scan(2, ScanCursorStart, 1<<30)
+		keys, _, err := engine.Scan(2, ScanCursorStart, 1<<30, "")
 		require.NoError(t, err)
 		assert.Len(t, keys, maxScanCount, "one page may not walk an unbounded number of entries")
 	})
@@ -751,7 +754,7 @@ func TestScanCursorIDGeneratorFailures(t *testing.T) {
 
 		engine.scans.newID = func() (string, error) { return "", boom }
 
-		_, _, err := engine.Scan(1, ScanCursorStart, 10)
+		_, _, err := engine.Scan(1, ScanCursorStart, 10, "")
 		assert.ErrorIs(t, err, boom)
 	})
 
@@ -762,23 +765,35 @@ func TestScanCursorIDGeneratorFailures(t *testing.T) {
 		fillKeys(t, engine, "k:", 20)
 		engine.scans.newID = func() (string, error) { return "always-the-same", nil }
 
-		_, first, err := engine.Scan(1, ScanCursorStart, 1)
+		_, first, err := engine.Scan(1, ScanCursorStart, 1, "")
 		require.NoError(t, err)
 		assert.Equal(t, "always-the-same", first)
 
-		_, _, err = engine.Scan(1, ScanCursorStart, 1)
+		_, _, err = engine.Scan(1, ScanCursorStart, 1, "")
 		assert.Error(t, err, "a colliding id must not overwrite a live cursor")
 		assert.NotErrorIs(t, err, ErrScanCursorUnknown)
 	})
 }
 
-// TestRandomCursorIDShape guards the generator itself: 128 bits, hex, distinct.
+// TestRandomCursorIDShape guards the generator itself, and specifically the
+// property the clients depend on (ADR-0017 as revised): a cursor is the decimal
+// text of a non-zero uint64.
+//
+// This is the assertion that would have caught the hex ids. go-redis parses the
+// cursor with ParseUint, redis-py with int(), `redis-cli --scan` with strtoull;
+// a hex id fails or truncates in all three, and no single-page test sees it
+// because a one-page scan returns "0" either way.
 func TestRandomCursorIDShape(t *testing.T) {
 	seen := make(map[string]struct{}, 128)
 	for i := 0; i < 128; i++ {
 		id, err := randomCursorID()
 		require.NoError(t, err)
-		assert.Len(t, id, 2*cursorIDBytes)
+
+		value, parseErr := strconv.ParseUint(id, 10, 64)
+		require.NoErrorf(t, parseErr, "id %q must parse as a decimal uint64", id)
+		assert.NotZero(t, value, "zero is reserved for start and for done")
+		assert.Equal(t, strconv.FormatUint(value, 10), id, "an id is canonical decimal, with no padding or prefix")
+
 		assert.NotContains(t, seen, id)
 		seen[id] = struct{}{}
 	}
@@ -791,4 +806,97 @@ func TestSnapshotBytesAccounting(t *testing.T) {
 	assert.Equal(t, uint64(0), snapshotBytes(nil))
 	assert.Equal(t, uint64(scanKeyOverhead+3), snapshotBytes([]string{"abc"}))
 	assert.Equal(t, uint64(2*scanKeyOverhead+5), snapshotBytes([]string{"abc", "de"}))
+}
+
+// TestScanMatchFiltersThePage is the MATCH half of the SCAN contract. The
+// filter removes keys from a page; it does not make the page look further for
+// replacements, which is why a non-final page may come back empty. A client
+// that reads an empty page as the end of the scan is wrong, and the reason the
+// cursor — not the page — is the termination signal.
+func TestScanMatchFiltersThePage(t *testing.T) {
+	engine := NewShardedEngine(EngineConfig{ShardCount: 1, MaxValueSize: 1024})
+	defer engine.Close()
+
+	for i := 0; i < 40; i++ {
+		require.NoError(t, engine.Set([]byte(fmt.Sprintf("user:%d", i)), []byte("v"), 0))
+	}
+	require.NoError(t, engine.Set([]byte("session:1"), []byte("v"), 0))
+
+	t.Run("a filtered scan returns only matching keys, and all of them", func(t *testing.T) {
+		var got []string
+		cursor := ScanCursorStart
+		pages := 0
+		for {
+			keys, next, err := engine.Scan(1, cursor, 3, "session:*")
+			require.NoError(t, err)
+			for _, key := range keys {
+				got = append(got, string(key))
+			}
+			pages++
+			require.Less(t, pages, 1000, "the scan never finished")
+			if next == ScanCursorStart {
+				break
+			}
+			cursor = next
+		}
+
+		assert.Equal(t, []string{"session:1"}, got)
+		assert.Greater(t, pages, 1, "40 keys at COUNT 3 cannot finish in one page")
+	})
+
+	t.Run("a pattern matching nothing still walks the keyspace", func(t *testing.T) {
+		keys, next, err := engine.Scan(2, ScanCursorStart, 3, "nothing:*")
+		require.NoError(t, err)
+
+		assert.Empty(t, keys, "an empty page is not the end of the scan")
+		assert.NotEqual(t, ScanCursorStart, next, "the cursor is what says the scan is over")
+	})
+
+	t.Run("a bare star filters nothing", func(t *testing.T) {
+		all := len(scanAllMatching(t, engine, 3, 1000, MatchAllPattern))
+		assert.Equal(t, 41, all)
+	})
+}
+
+// TestScanMatchAcceptsRedisGlobs checks that SCAN MATCH and KEYS answer the
+// same question. Two matchers would be two compatibility surfaces.
+func TestScanMatchAcceptsRedisGlobs(t *testing.T) {
+	engine := NewShardedEngine(EngineConfig{ShardCount: 2, MaxValueSize: 1024})
+	defer engine.Close()
+
+	for _, key := range []string{"a/b/c", "a/b/d", "x", "user:1", "user:22"} {
+		require.NoError(t, engine.Set([]byte(key), []byte("v"), 0))
+	}
+
+	for _, pattern := range []string{"a/*", "*/c", "user:?", "[ax]*", "[^u]*"} {
+		scanned := scanAllMatching(t, engine, 2, 1000, pattern)
+		sort.Strings(scanned)
+
+		fromKeys := stringKeys(engine.Keys(pattern))
+		sort.Strings(fromKeys)
+
+		assert.Equalf(t, fromKeys, scanned, "SCAN MATCH %q and KEYS %q must agree", pattern, pattern)
+	}
+}
+
+// scanAllMatching drives a filtered scan to completion and returns every key it
+// yielded.
+func scanAllMatching(t *testing.T, engine *ShardedEngine, count int, owner ScanOwner, match string) []string {
+	t.Helper()
+
+	var got []string
+	cursor := ScanCursorStart
+	for i := 0; ; i++ {
+		require.Less(t, i, 10_000, "the scan never finished")
+
+		keys, next, err := engine.Scan(owner, cursor, count, match)
+		require.NoError(t, err)
+		for _, key := range keys {
+			got = append(got, string(key))
+		}
+		if next == ScanCursorStart {
+			return got
+		}
+		cursor = next
+	}
 }

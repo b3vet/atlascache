@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,15 +29,37 @@ var errUnexpected = errors.New("the engine fell over")
 // The real engine is exercised end to end by the E2E suite and by
 // cmd/atlascache; what these tests need is a store that can be made to fail on
 // demand, which a real one cannot without contorting its configuration.
+// MaxValueSize mirrors the engine default; the protocol limits derive from it.
+func (f *fakeStore) MaxValueSize() int { return 1 << 20 }
+
 type fakeStore struct {
 	mu     sync.Mutex
 	values map[string][]byte
 	expiry map[string]time.Time
 
-	setErr error
+	setErr  error
+	scanErr error
 	// gone reports a key as absent from GetTTL while leaving Get alone, which
 	// is how a key that expires mid-command looks to the TTL handler.
 	zeroTTL map[string]bool
+
+	// stats is what Stats reports beside the live key count, so a test can
+	// pick the numbers INFO and STATS are supposed to render.
+	stats Stats
+
+	// scanCalls records what the handler asked for, which is how the option
+	// parsing is checked without a real cursor behind it, and released records
+	// the connections whose cursors were dropped.
+	scanCalls []scanCall
+	released  []uint64
+}
+
+// scanCall is one recorded Scan request.
+type scanCall struct {
+	owner  uint64
+	cursor string
+	count  int
+	match  string
 }
 
 func newFakeStore() *fakeStore {
@@ -117,6 +140,118 @@ func (f *fakeStore) SetTTL(key []byte, ttl time.Duration) bool {
 	}
 	f.expiry[name] = time.Now().Add(ttl)
 	return true
+}
+
+func (f *fakeStore) SetNX(key, value []byte, ttl time.Duration) (bool, error) {
+	f.mu.Lock()
+	name := string(key)
+	if _, taken := f.values[name]; taken && !f.expired(name) {
+		f.mu.Unlock()
+		return false, nil
+	}
+	f.mu.Unlock()
+
+	if err := f.Set(key, value, ttl); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (f *fakeStore) Exists(key []byte) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	name := string(key)
+	_, ok := f.values[name]
+	return ok && !f.expired(name)
+}
+
+func (f *fakeStore) Keys(pattern string) [][]byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	// The fake matches literally, or on a trailing star. Glob semantics are the
+	// engine's and are tested against real Redis there; what is being tested
+	// here is the reply shape.
+	var keys [][]byte
+	for name := range f.values {
+		if f.expired(name) {
+			continue
+		}
+		if fakeMatches(pattern, name) {
+			keys = append(keys, []byte(name))
+		}
+	}
+	sort.Slice(keys, func(i, j int) bool { return string(keys[i]) < string(keys[j]) })
+	return keys
+}
+
+func fakeMatches(pattern, name string) bool {
+	switch {
+	case pattern == "*":
+		return true
+	case strings.HasSuffix(pattern, "*"):
+		return strings.HasPrefix(name, strings.TrimSuffix(pattern, "*"))
+	default:
+		return pattern == name
+	}
+}
+
+// Scan hands out one key per page, which is the shape that matters here: the
+// handler must render whatever cursor it is given and must not decide on its
+// own when a scan has finished.
+func (f *fakeStore) Scan(owner uint64, cursor string, count int, match string) ([][]byte, string, error) {
+	f.mu.Lock()
+	f.scanCalls = append(f.scanCalls, scanCall{owner: owner, cursor: cursor, count: count, match: match})
+	err := f.scanErr
+	f.mu.Unlock()
+
+	if err != nil {
+		return nil, "0", err
+	}
+
+	keys := f.Keys(match)
+	position, convErr := strconv.Atoi(cursor)
+	if convErr != nil {
+		return nil, "0", convErr
+	}
+	if position >= len(keys) {
+		return nil, "0", nil
+	}
+
+	next := "0"
+	if position+1 < len(keys) {
+		next = strconv.Itoa(position + 1)
+	}
+	return keys[position : position+1], next, nil
+}
+
+func (f *fakeStore) ReleaseScans(owner uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.released = append(f.released, owner)
+}
+
+// Stats reports whatever the test pinned, with the live key count filled in
+// when it pinned none — so a test about INFO's field names can state a key
+// count without writing a thousand keys, and a test about DBSIZE can write
+// keys without restating the number.
+func (f *fakeStore) Stats() Stats {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	stats := f.stats
+	if stats.Keys != 0 {
+		return stats
+	}
+
+	for name := range f.values {
+		if !f.expired(name) {
+			stats.Keys++
+		}
+	}
+	return stats
 }
 
 // expired reports whether the key's deadline has passed. The caller holds the
@@ -518,4 +653,345 @@ func readExactly(t *testing.T, conn net.Conn, r *bufio.Reader, n int) string {
 	require.NoError(t, err)
 
 	return string(buf)
+}
+
+// readFullReply decodes one whole reply, nested arrays included, into a form a
+// test can compare. It is deliberately not the codec: asserting against a
+// decoder that shares the encoder's assumptions proves only that they agree.
+func readFullReply(t *testing.T, conn net.Conn, r *bufio.Reader) string {
+	t.Helper()
+
+	line := strings.TrimRight(readReply(t, conn, r), "\r\n")
+	require.NotEmpty(t, line)
+
+	switch line[0] {
+	case '+', '-', ':':
+		return string(line[0]) + line[1:]
+
+	case '$':
+		size, err := strconv.Atoi(line[1:])
+		require.NoError(t, err)
+		if size < 0 {
+			return "NIL"
+		}
+		buf := make([]byte, size+2)
+		require.NoError(t, conn.SetReadDeadline(time.Now().Add(2*time.Second)))
+		_, err = io.ReadFull(r, buf)
+		require.NoError(t, err)
+		return "$" + string(buf[:size])
+
+	case '*':
+		count, err := strconv.Atoi(line[1:])
+		require.NoError(t, err)
+		items := make([]string, 0, count)
+		for i := 0; i < count; i++ {
+			items = append(items, readFullReply(t, conn, r))
+		}
+		return "[" + strings.Join(items, " ") + "]"
+	}
+
+	t.Fatalf("unexpected reply frame %q", line)
+	return ""
+}
+
+// session opens a connection and returns a function that sends one command on
+// it and decodes the whole reply. The connection is reused across calls, which
+// is what a SCAN needs: its cursors are scoped to one connection.
+func conversation(t *testing.T, srv *Server) func(args ...string) string {
+	t.Helper()
+
+	conn, reader := dial(t, srv)
+
+	return func(args ...string) string {
+		t.Helper()
+
+		var request strings.Builder
+		request.WriteString("*" + strconv.Itoa(len(args)) + "\r\n")
+		for _, arg := range args {
+			request.WriteString("$" + strconv.Itoa(len(arg)) + "\r\n" + arg + "\r\n")
+		}
+		send(t, conn, request.String())
+
+		return readFullReply(t, conn, reader)
+	}
+}
+
+func TestSetNX(t *testing.T) {
+	store := newFakeStore()
+	srv, serveErr := newTestServerWith(t, store)
+	defer shutdownServer(t, srv, serveErr)
+
+	assert.Equal(t, ":1", ask(t, srv, "SETNX", "k", "first"))
+	assert.Equal(t, ":0", ask(t, srv, "SETNX", "k", "second"), "a live key blocks the write")
+	assert.Equal(t, "$first", ask(t, srv, "GET", "k"), "and the value it holds is untouched")
+
+	t.Run("a store failure is reported, not swallowed", func(t *testing.T) {
+		store.setErr = ErrOutOfMemory
+		defer func() { store.setErr = nil }()
+
+		assert.Equal(t, "-OOM command not allowed when used memory > 'maxmemory'.",
+			ask(t, srv, "SETNX", "other", "v"))
+	})
+
+	t.Run("arity", func(t *testing.T) {
+		assert.Equal(t, "-ERR wrong number of arguments for 'setnx' command", ask(t, srv, "SETNX", "k"))
+		assert.Equal(t, "-ERR wrong number of arguments for 'setnx' command", ask(t, srv, "SETNX", "k", "v", "x"))
+	})
+}
+
+// TestExistsCountsDuplicates is the reply semantics clients depend on. It reads
+// like a bug and is not: Redis counts each argument, so naming one key three
+// times answers 3, and de-duplicating would break every client that relies on
+// the documented behavior.
+func TestExistsCountsDuplicates(t *testing.T) {
+	store := newFakeStore()
+	require.NoError(t, store.Set([]byte("a"), []byte("1"), 0))
+	require.NoError(t, store.Set([]byte("b"), []byte("2"), 0))
+
+	srv, serveErr := newTestServerWith(t, store)
+	defer shutdownServer(t, srv, serveErr)
+
+	assert.Equal(t, ":1", ask(t, srv, "EXISTS", "a"))
+	assert.Equal(t, ":0", ask(t, srv, "EXISTS", "missing"))
+	assert.Equal(t, ":2", ask(t, srv, "EXISTS", "a", "b"))
+	assert.Equal(t, ":3", ask(t, srv, "EXISTS", "a", "a", "a"))
+	assert.Equal(t, ":3", ask(t, srv, "EXISTS", "a", "missing", "a", "missing", "a"))
+	assert.Equal(t, ":0", ask(t, srv, "EXISTS", "missing", "missing"))
+
+	assert.Equal(t, "-ERR wrong number of arguments for 'exists' command", ask(t, srv, "EXISTS"))
+}
+
+func TestKeys(t *testing.T) {
+	store := newFakeStore()
+	for _, key := range []string{"user:1", "user:2", "session:1"} {
+		require.NoError(t, store.Set([]byte(key), []byte("v"), 0))
+	}
+
+	srv, serveErr := newTestServerWith(t, store)
+	defer shutdownServer(t, srv, serveErr)
+
+	assert.Equal(t, "[$session:1 $user:1 $user:2]", ask(t, srv, "KEYS", "*"))
+	assert.Equal(t, "[$user:1 $user:2]", ask(t, srv, "KEYS", "user:*"))
+	assert.Equal(t, "[$session:1]", ask(t, srv, "KEYS", "session:1"))
+	assert.Equal(t, "[]", ask(t, srv, "KEYS", "nothing:*"))
+
+	assert.Equal(t, "-ERR wrong number of arguments for 'keys' command", ask(t, srv, "KEYS"))
+	assert.Equal(t, "-ERR wrong number of arguments for 'keys' command", ask(t, srv, "KEYS", "a", "b"))
+}
+
+// ask sends one command on a fresh connection and returns the whole decoded
+// reply. exchange, which the P1 tests use, reads raw wire bytes; these commands
+// answer with arrays, and asserting an array as raw bytes reads terribly.
+func ask(t *testing.T, srv *Server, args ...string) string {
+	t.Helper()
+	return conversation(t, srv)(args...)
+}
+
+func TestScan(t *testing.T) {
+	store := newFakeStore()
+	for _, key := range []string{"a", "b", "c"} {
+		require.NoError(t, store.Set([]byte(key), []byte("v"), 0))
+	}
+
+	srv, serveErr := newTestServerWith(t, store)
+	defer shutdownServer(t, srv, serveErr)
+
+	t.Run("a page is the cursor then the keys", func(t *testing.T) {
+		send := conversation(t, srv)
+
+		assert.Equal(t, "[$1 [$a]]", send("SCAN", "0"))
+		assert.Equal(t, "[$2 [$b]]", send("SCAN", "1"))
+		assert.Equal(t, "[$0 [$c]]", send("SCAN", "2"), "a cursor of 0 is the only thing that means finished")
+	})
+
+	t.Run("options are parsed and passed through", func(t *testing.T) {
+		store.mu.Lock()
+		store.scanCalls = nil
+		store.mu.Unlock()
+
+		send := conversation(t, srv)
+		send("SCAN", "0", "MATCH", "a*", "COUNT", "42")
+		send("SCAN", "0", "count", "7", "match", "b*")
+		send("SCAN", "0")
+
+		store.mu.Lock()
+		calls := append([]scanCall(nil), store.scanCalls...)
+		store.mu.Unlock()
+
+		require.Len(t, calls, 3)
+		assert.Equal(t, scanCall{owner: calls[0].owner, cursor: "0", count: 42, match: "a*"}, calls[0])
+		assert.Equal(t, scanCall{owner: calls[1].owner, cursor: "0", count: 7, match: "b*"}, calls[1],
+			"option names are case-insensitive, as they are in Redis")
+		assert.Equal(t, scanCall{owner: calls[2].owner, cursor: "0", count: 0, match: MatchAllPattern}, calls[2],
+			"no COUNT leaves the page size to the store")
+	})
+
+	t.Run("a cursor is decimal, and anything else is refused before it is looked up", func(t *testing.T) {
+		for _, cursor := range []string{"notanumber", "-1", "0xff", "9f3c1ab2d4e5f607", "", " 1"} {
+			assert.Equalf(t, "-ERR invalid cursor", ask(t, srv, "SCAN", cursor), "cursor %q", cursor)
+		}
+
+		// A canonical cursor reaches the store as it was issued, so "007" finds
+		// the cursor filed under "7".
+		store.mu.Lock()
+		store.scanCalls = nil
+		store.mu.Unlock()
+
+		ask(t, srv, "SCAN", "007")
+
+		store.mu.Lock()
+		calls := append([]scanCall(nil), store.scanCalls...)
+		store.mu.Unlock()
+		require.Len(t, calls, 1)
+		assert.Equal(t, "7", calls[0].cursor)
+	})
+
+	t.Run("malformed options", func(t *testing.T) {
+		assert.Equal(t, "-ERR syntax error", ask(t, srv, "SCAN", "0", "COUNT", "0"))
+		assert.Equal(t, "-ERR syntax error", ask(t, srv, "SCAN", "0", "COUNT", "-5"))
+		assert.Equal(t, "-ERR value is not an integer or out of range", ask(t, srv, "SCAN", "0", "COUNT", "abc"))
+		assert.Equal(t, "-ERR syntax error", ask(t, srv, "SCAN", "0", "NOSUCH", "x"))
+		assert.Equal(t, "-ERR syntax error", ask(t, srv, "SCAN", "0", "MATCH"))
+		assert.Equal(t, "-ERR wrong number of arguments for 'scan' command", ask(t, srv, "SCAN"))
+	})
+
+	t.Run("store failures each have their own reply", func(t *testing.T) {
+		cases := map[error]string{
+			ErrScanCursorUnknown:   "-ERR invalid cursor",
+			ErrTooManyScanCursors:  "-ERR too many open scan cursors; finish or abandon one before starting another",
+			ErrScanMemoryExhausted: "-ERR scan snapshot memory limit reached",
+			errUnexpected:          "-ERR " + errUnexpected.Error(),
+		}
+		for failure, want := range cases {
+			store.mu.Lock()
+			store.scanErr = failure
+			store.mu.Unlock()
+
+			assert.Equalf(t, want, ask(t, srv, "SCAN", "0"), "failure %v", failure)
+		}
+
+		store.mu.Lock()
+		store.scanErr = nil
+		store.mu.Unlock()
+	})
+}
+
+// TestScanCursorsAreReleasedWithTheConnection is the other half of the cursor
+// bound. An abandoned scan holds a snapshot of a whole shard, and a connection
+// that has gone away is never coming back to finish it.
+func TestScanCursorsAreReleasedWithTheConnection(t *testing.T) {
+	store := newFakeStore()
+	srv, serveErr := newTestServerWith(t, store)
+	defer shutdownServer(t, srv, serveErr)
+
+	conn, reader := dial(t, srv)
+	send(t, conn, "*1\r\n$4\r\nPING\r\n")
+	assert.Equal(t, "+PONG\r\n", readReply(t, conn, reader))
+	require.NoError(t, conn.Close())
+
+	assert.Eventually(t, func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return len(store.released) > 0
+	}, 2*time.Second, 10*time.Millisecond, "the connection's cursors must be dropped when it goes")
+}
+
+// TestSessionsHaveDistinctIdentities is what makes a cursor scoped to one
+// connection a checkable rule rather than a claim.
+func TestSessionsHaveDistinctIdentities(t *testing.T) {
+	store := newFakeStore()
+	require.NoError(t, store.Set([]byte("a"), []byte("v"), 0))
+
+	srv, serveErr := newTestServerWith(t, store)
+	defer shutdownServer(t, srv, serveErr)
+
+	first, second := conversation(t, srv), conversation(t, srv)
+	first("SCAN", "0")
+	second("SCAN", "0")
+
+	store.mu.Lock()
+	calls := append([]scanCall(nil), store.scanCalls...)
+	store.mu.Unlock()
+
+	require.Len(t, calls, 2)
+	assert.NotEqual(t, calls[0].owner, calls[1].owner, "two connections must not share a cursor namespace")
+}
+
+func TestEchoDBSizeAndCommand(t *testing.T) {
+	store := newFakeStore()
+	require.NoError(t, store.Set([]byte("a"), []byte("1"), 0))
+	require.NoError(t, store.Set([]byte("b"), []byte("2"), 0))
+
+	srv, serveErr := newTestServerWith(t, store)
+	defer shutdownServer(t, srv, serveErr)
+
+	assert.Equal(t, ":2", ask(t, srv, "DBSIZE"))
+	assert.Equal(t, "-ERR wrong number of arguments for 'dbsize' command", ask(t, srv, "DBSIZE", "x"))
+
+	assert.Equal(t, "$hello", ask(t, srv, "ECHO", "hello"))
+	assert.Equal(t, "$", ask(t, srv, "ECHO", ""))
+	assert.Equal(t, "$a\r\nb\x00c", ask(t, srv, "ECHO", "a\r\nb\x00c"), "ECHO is binary-safe")
+	assert.Equal(t, "-ERR wrong number of arguments for 'echo' command", ask(t, srv, "ECHO"))
+	assert.Equal(t, "-ERR wrong number of arguments for 'echo' command", ask(t, srv, "ECHO", "a", "b"))
+
+	// The stub. A fabricated command table would make clients reject commands
+	// this server accepts, which is worse than answering nothing.
+	assert.Equal(t, "[]", ask(t, srv, "COMMAND"))
+	assert.Equal(t, "[]", ask(t, srv, "COMMAND", "DOCS"))
+	assert.Equal(t, "[]", ask(t, srv, "COMMAND", "INFO", "GET"))
+}
+
+func TestStatsIsAFlattenedMap(t *testing.T) {
+	store := newFakeStore()
+	store.stats = Stats{
+		KeysWithTTL: 3, MemoryUsed: 1024, MemoryMax: 4096,
+		Gets: 10, Sets: 5, Deletes: 2, Hits: 7, Misses: 3,
+		Evictions: 1, Expirations: 4, OOMRejected: 6,
+		ScanCursors: 2, ScanSnapshotBytes: 512,
+	}
+	require.NoError(t, store.Set([]byte("a"), []byte("1"), 0))
+
+	srv, serveErr := newTestServerWith(t, store)
+	defer shutdownServer(t, srv, serveErr)
+
+	fields := replyFields(t, ask(t, srv, "STATS"))
+
+	// A logical Map rendered by the RESP2 codec is an array of 2n elements,
+	// key then value. The handler builds the map and does not know that; in
+	// P6 the same handler returns a real map (ADR-0028).
+	assert.Equal(t, "1", fields["keys"])
+	assert.Equal(t, "3", fields["keys_with_ttl"])
+	assert.Equal(t, "1024", fields["memory_used"])
+	assert.Equal(t, "4096", fields["memory_max"])
+	assert.Equal(t, "10", fields["gets"])
+	assert.Equal(t, "5", fields["sets"])
+	assert.Equal(t, "2", fields["deletes"])
+	assert.Equal(t, "7", fields["hits"])
+	assert.Equal(t, "3", fields["misses"])
+	assert.Equal(t, "1", fields["evictions"])
+	assert.Equal(t, "4", fields["expirations"])
+	assert.Equal(t, "6", fields["oom_rejected"])
+	assert.Equal(t, "2", fields["scan_cursors"])
+	assert.Equal(t, "512", fields["scan_snapshot_bytes"])
+	assert.Contains(t, fields, "connected_clients")
+	assert.Contains(t, fields, "commands_processed")
+	assert.Contains(t, fields, "connections_received")
+	assert.Contains(t, fields, "uptime_seconds")
+
+	assert.Equal(t, "-ERR wrong number of arguments for 'stats' command", ask(t, srv, "STATS", "x"))
+}
+
+// replyFields reads a flattened map reply — "[$k $v $k $v]" — back into pairs.
+func replyFields(t *testing.T, reply string) map[string]string {
+	t.Helper()
+
+	require.True(t, strings.HasPrefix(reply, "[") && strings.HasSuffix(reply, "]"), "not an array: %s", reply)
+	parts := strings.Split(strings.TrimSuffix(strings.TrimPrefix(reply, "["), "]"), " ")
+	require.Zero(t, len(parts)%2, "a flattened map has an even number of elements")
+
+	fields := make(map[string]string, len(parts)/2)
+	for i := 0; i < len(parts); i += 2 {
+		fields[strings.TrimPrefix(parts[i], "$")] = strings.TrimPrefix(parts[i+1], ":")
+	}
+	return fields
 }

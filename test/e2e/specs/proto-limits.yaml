@@ -1,0 +1,40 @@
+version: 1
+name: proto-limits
+tier: full
+feature: FEAT-0025
+issue: ISSUE-0016
+description: >
+  The parser's limits, asserted on what the server spent rather than on what it
+  replied. ISSUE-0016 is the reason: all three of its bugs returned the correct
+  error, after allocating from a size an unauthenticated client had declared.
+
+  A bulk header declaring 512MB and a multibulk header declaring a million
+  elements are each sent two hundred times, and the server's resident set is
+  sampled from outside the process between them. Before the fixes that is a
+  hundred gigabytes of allocation churn; it must now move the resident set by
+  nothing.
+
+  The third limit is measured differently because it has a better instrument: a
+  client streaming a line with no newline in it can count how many bytes the
+  server was willing to take. A parser that applies the inline limit as the line
+  accumulates stops taking bytes near the limit; one that applies it afterwards
+  swallows everything sent.
+
+  Auth is off by default (ADR-0009), so every request here is one anyone who can
+  open a socket may make.
+
+steps:
+  - scenario: proto_declared_sizes_cost_nothing
+
+  - scenario: proto_unterminated_line_is_refused
+
+  # A request at a size the limits do allow is still served, so the assertions
+  # above are about rejecting the impossible and not about rejecting everything.
+  - cmd: SET limits:k a-value-of-an-ordinary-size
+    expect: OK
+
+  - cmd: GET limits:k
+    expect: a-value-of-an-ordinary-size
+
+  - cmd: PING
+    expect: PONG

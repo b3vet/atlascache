@@ -1,4 +1,4 @@
-.PHONY: build build-e2e test tidy-check lint bench clean fmt vet cover check deps tools e2e e2e-smoke e2e-full e2e-soak phase-check dev-index help
+.PHONY: build build-e2e test tidy-check fuzz lint bench clean fmt vet cover check deps tools e2e e2e-smoke e2e-full e2e-soak phase-check dev-index help
 
 BINARY_NAME := atlascache
 BUILD_DIR   := bin
@@ -47,6 +47,11 @@ fmt:
 vet:
 	$(GO) vet ./...
 	cd $(E2E_DIR) && $(GO) vet ./...
+
+## fuzz: fuzz the protocol decoder (FUZZTIME=30s by default)
+FUZZTIME ?= 30s
+fuzz:
+	$(GO) test ./internal/protocol/ -run=^$$ -fuzz=FuzzDecode -fuzztime=$(FUZZTIME)
 
 ## bench: run benchmarks
 bench:

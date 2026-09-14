@@ -2,8 +2,6 @@ package storage
 
 import (
 	"errors"
-	"path/filepath"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -60,10 +58,10 @@ type StorageEngine interface {
 	// Iteration
 	Keys(pattern string) [][]byte
 
-	// Scan returns one page of a snapshot scan owned by owner. See
-	// ShardedEngine.Scan and the package note in scan.go for the guarantee it
-	// offers and the bounds that hold it in place.
-	Scan(owner ScanOwner, cursor string, count int) (keys [][]byte, nextCursor string, err error)
+	// Scan returns one page of a snapshot scan owned by owner, keeping only the
+	// keys matching match. See ShardedEngine.Scan and the package note in
+	// scan.go for the guarantee it offers and the bounds that hold it in place.
+	Scan(owner ScanOwner, cursor string, count int, match string) (keys [][]byte, nextCursor string, err error)
 
 	// ReleaseScans drops every scan cursor owned by owner. A connection handler
 	// must call it when the connection goes away.
@@ -337,10 +335,10 @@ func (e *ShardedEngine) validateWrite(key, value []byte, ttl time.Duration) (*En
 		return nil, ErrEngineClosed
 	}
 
-	if len(key) == 0 {
-		return nil, ErrInvalidKey
-	}
-
+	// An empty key is a legal key. Redis stores one like any other, the engine
+	// has no technical reason to refuse it, and rejecting it made a legal Redis
+	// operation fail against a server whose whole premise is that existing
+	// clients work unmodified (ISSUE-0013, ADR-0006).
 	if uint64(len(value)) > e.maxValueSize {
 		return nil, ErrValueTooLarge
 	}
@@ -550,46 +548,32 @@ func (e *ShardedEngine) GetAllShards() []*Shard {
 	return e.shards
 }
 
-// Keys returns all keys matching a pattern
-// Pattern supports * (match any characters) and ? (match single character)
+// Keys returns every live key matching pattern, under Redis's glob semantics
+// (see glob.go). It walks the whole keyspace and holds each shard's read lock
+// while it does, which is why the protocol documentation points callers at
+// Scan instead.
+//
+// A bare "*" is answered without consulting the matcher, exactly as Redis's
+// KEYS does. That short circuit is not an optimization detail: Redis's matcher
+// does not match an empty pattern against an empty subject the way a caller
+// would guess, so `KEYS *` returns the empty key only because of it.
 func (e *ShardedEngine) Keys(pattern string) [][]byte {
 	if atomic.LoadInt32(&e.closed) == 1 {
 		return nil
 	}
 
-	var keys [][]byte
-	matchAll := pattern == "*" || pattern == ""
+	matchAll := MatchesEveryKey(pattern)
 
+	var keys [][]byte
 	for _, shard := range e.shards {
-		shardKeys := shard.Keys()
-		for _, key := range shardKeys {
-			if matchAll || matchPattern(pattern, key) {
+		for _, key := range shard.Keys() {
+			if matchAll || MatchGlob(pattern, key) {
 				keys = append(keys, []byte(key))
 			}
 		}
 	}
 
 	return keys
-}
-
-// matchPattern matches a key against a glob pattern
-func matchPattern(pattern, key string) bool {
-	// Use filepath.Match for glob-style matching
-	matched, err := filepath.Match(pattern, key)
-	if err != nil {
-		// If pattern is invalid, try simple prefix/suffix matching
-		if strings.HasPrefix(pattern, "*") && strings.HasSuffix(pattern, "*") {
-			return strings.Contains(key, pattern[1:len(pattern)-1])
-		}
-		if strings.HasPrefix(pattern, "*") {
-			return strings.HasSuffix(key, pattern[1:])
-		}
-		if strings.HasSuffix(pattern, "*") {
-			return strings.HasPrefix(key, pattern[:len(pattern)-1])
-		}
-		return key == pattern
-	}
-	return matched
 }
 
 // Scan returns one page of a snapshot scan, and the cursor to present for the
@@ -614,6 +598,14 @@ func matchPattern(pattern, key string) bool {
 // Only a returned cursor of ScanCursorStart means that. A count above
 // maxScanCount is clamped, and a non-positive one means defaultScanCount.
 //
+// # What match means
+//
+// match is a glob filter applied after the page has been retrieved, so it
+// removes keys from a page rather than making the page look further for
+// replacements. That is Redis's behavior, and it is the other reason a page
+// may come back empty with the scan still running. An empty match, like "*",
+// filters nothing.
+//
 // # Errors
 //
 // ErrScanCursorUnknown for a cursor this connection does not hold — never
@@ -623,7 +615,9 @@ func matchPattern(pattern, key string) bool {
 // caller has no way to detect. ErrTooManyScanCursors when the connection is at
 // its cursor limit, and ErrScanMemoryExhausted when a shard's snapshot does not
 // fit under the global cap.
-func (e *ShardedEngine) Scan(owner ScanOwner, cursor string, count int) (keys [][]byte, nextCursor string, err error) {
+func (e *ShardedEngine) Scan(
+	owner ScanOwner, cursor string, count int, match string,
+) (keys [][]byte, nextCursor string, err error) {
 	if atomic.LoadInt32(&e.closed) == 1 {
 		return nil, ScanCursorStart, ErrEngineClosed
 	}
@@ -635,7 +629,12 @@ func (e *ShardedEngine) Scan(owner ScanOwner, cursor string, count int) (keys []
 		count = maxScanCount
 	}
 
-	return e.scans.page(e.shards, owner, cursor, count)
+	filter := match
+	if MatchesEveryKey(filter) {
+		filter = ""
+	}
+
+	return e.scans.page(e.shards, owner, cursor, count, filter)
 }
 
 // ReleaseScans drops every scan cursor owned by owner, giving back the snapshot
@@ -678,6 +677,13 @@ func (e *ShardedEngine) Stats() Stats {
 	}
 
 	return stats
+}
+
+// MaxValueSize is the largest value the engine will store. The protocol layer
+// derives its bulk-string limit from it, so a frame the engine would reject is
+// refused before it is buffered rather than after (ISSUE-0016).
+func (e *ShardedEngine) MaxValueSize() uint64 {
+	return e.maxValueSize
 }
 
 // MemoryUsed returns current memory usage

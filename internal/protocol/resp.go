@@ -192,12 +192,28 @@ func (c *RESP) Encode(w io.Writer, reply Reply) error {
 	return nil
 }
 
+// decodeMultiBulk reads a "*<count>\r\n" header and the bulk strings behind it.
+//
+// The request grammar is flat by construction: a request is one array, and
+// every element of it is a bulk string. Nothing here recurses, so a frame that
+// nests — "*1\r\n*1\r\n*1..." — is refused by decodeBulk at the first inner
+// element, in constant stack and after reading one line, however deep the
+// client meant to go. That is the nesting cap FEAT-0025 asks for, and it is
+// structural rather than a counter; a depth limit only becomes a limit with
+// something to count when FEAT-0048 decodes RESP3 aggregates, which do nest.
 func (c *RESP) decodeMultiBulk(r *bufio.Reader, header []byte) (Command, error) {
+	// A count that does not parse — including one too large for an int, which
+	// is how "99999999999999999999" arrives — is refused on the declared text,
+	// before anything is sized from it. A negative count is refused too: Redis
+	// skips one as an empty request, but "*-3" is not something a client sends
+	// and reading it as "nothing to do" is how a malformed frame stays quiet.
 	count, err := strconv.Atoi(string(header[1:]))
-	if err != nil || count > c.limits.MaxMultiBulkLength {
+	if err != nil || count < 0 || count > c.limits.MaxMultiBulkLength {
 		return Command{}, protocolErrorf("invalid multibulk length")
 	}
-	if count <= 0 {
+	if count == 0 {
+		// "*0" is the empty request Redis skips, and the one a client really
+		// does send when it pipelines nothing.
 		return Command{}, nil
 	}
 
@@ -314,9 +330,22 @@ func unexpectedEOF(err error) error {
 	return err
 }
 
+// printableByte renders the first byte of a line for an error message the
+// client reads back on the wire.
+//
+// The byte is quoted rather than pasted in. It came from an unauthenticated
+// client and every byte is reachable, so pasting it puts arbitrary bytes into a
+// reply and into the server's logs — and a raw CR or LF in an error is a reply
+// that frames a second reply. The RESP2 encoder folds those two to spaces
+// today, which makes this latent rather than exploitable; a latent
+// reply-splitting bug is still one, and FEAT-0048 adds a second encoder that
+// would have to remember to fold them too.
 func printableByte(line []byte) string {
 	if len(line) == 0 {
 		return ""
 	}
-	return string(line[:1])
+	// Quote escapes the byte, then the surrounding quotes are dropped so the
+	// message reads `got '\r'` rather than `got '"\r"'`.
+	quoted := strconv.Quote(string(line[:1]))
+	return quoted[1 : len(quoted)-1]
 }

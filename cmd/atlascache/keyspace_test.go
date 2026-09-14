@@ -50,12 +50,16 @@ func TestKeyspaceTranslatesEngineFailures(t *testing.T) {
 		assert.ErrorIs(t, err, server.ErrOutOfMemory)
 	})
 
-	t.Run("an empty key", func(t *testing.T) {
+	t.Run("an empty key is not a failure", func(t *testing.T) {
+		// ISSUE-0013: Redis stores an empty key like any other, and the engine
+		// no longer refuses one. The sentinel is still translated, for whatever
+		// key-level limit lands here next.
 		k := newTestKeyspace(t)
 
-		err := k.Set(nil, []byte("value"), 0)
+		assert.NoError(t, k.Set(nil, []byte("value"), 0))
+		assert.True(t, k.Exists([]byte("")))
 
-		assert.ErrorIs(t, err, server.ErrInvalidKey)
+		assert.ErrorIs(t, translate(storage.ErrInvalidKey), server.ErrInvalidKey)
 	})
 
 	t.Run("anything else passes through", func(t *testing.T) {
@@ -170,6 +174,96 @@ func TestWiredServerServesDataCommands(t *testing.T) {
 	require.NoError(t, srv.Shutdown(ctx))
 	require.NoError(t, <-serveErr)
 	require.NoError(t, c.stop(ctx))
+}
+
+// TestKeyspaceIntrospectionAndIteration covers the adapter methods P2 added.
+// They are thin, and thin is exactly where a mistranslation hides: a swapped
+// return value or an unmapped sentinel here reaches a client as a wrong answer
+// with nothing in between to catch it.
+func TestKeyspaceIntrospectionAndIteration(t *testing.T) {
+	k := newTestKeyspace(t)
+
+	t.Run("SetNX reports whether it stored, and the failure if it could not", func(t *testing.T) {
+		stored, err := k.SetNX([]byte("nx"), []byte("first"), 0)
+		require.NoError(t, err)
+		assert.True(t, stored)
+
+		stored, err = k.SetNX([]byte("nx"), []byte("second"), 0)
+		require.NoError(t, err)
+		assert.False(t, stored, "a live key blocks the write")
+
+		value, exists := k.Get([]byte("nx"))
+		assert.True(t, exists)
+		assert.Equal(t, "first", string(value))
+
+		// The engine's sentinel arrives as the server's, so the handler can
+		// answer it without importing the storage package.
+		stored, err = k.SetNX([]byte("big"), make([]byte, 2048), 0)
+		assert.False(t, stored)
+		assert.ErrorIs(t, err, server.ErrValueTooLarge)
+	})
+
+	t.Run("Keys matches Redis globs", func(t *testing.T) {
+		for _, key := range []string{"user:1", "user:2", "cdn/eu/logo.png"} {
+			require.NoError(t, k.Set([]byte(key), []byte("v"), 0))
+		}
+
+		assert.Len(t, k.Keys("user:*"), 2)
+		assert.Len(t, k.Keys("cdn/*"), 1, "a wildcard crosses a path separator")
+		assert.Empty(t, k.Keys("nothing:*"))
+	})
+
+	t.Run("Scan pages, and its cursors belong to one connection", func(t *testing.T) {
+		const owner = 7
+
+		seen := map[string]bool{}
+		cursor := server.ScanCursorStart
+		for i := 0; ; i++ {
+			require.Less(t, i, 1000, "the scan never finished")
+
+			keys, next, err := k.Scan(owner, cursor, 1, "user:*")
+			require.NoError(t, err)
+			for _, key := range keys {
+				assert.False(t, seen[string(key)], "a key came back twice")
+				seen[string(key)] = true
+			}
+			if next == server.ScanCursorStart {
+				break
+			}
+			cursor = next
+		}
+		assert.Len(t, seen, 2)
+
+		// A cursor nobody issued is refused rather than silently restarted.
+		_, _, err := k.Scan(owner, "123456789", 10, "*")
+		assert.ErrorIs(t, err, server.ErrScanCursorUnknown)
+
+		// And a connection's cursors go when the connection does.
+		_, cursor, err = k.Scan(owner, server.ScanCursorStart, 1, "*")
+		require.NoError(t, err)
+		require.NotEqual(t, server.ScanCursorStart, cursor)
+
+		k.ReleaseScans(owner)
+		_, _, err = k.Scan(owner, cursor, 1, "*")
+		assert.ErrorIs(t, err, server.ErrScanCursorUnknown)
+	})
+
+	t.Run("Stats carries the engine's accounting and the process sample", func(t *testing.T) {
+		stats := k.Stats()
+		assert.Equal(t, uint64(4), stats.Keys)
+		assert.Positive(t, stats.MemoryUsed)
+		assert.Positive(t, stats.Sets)
+		assert.Zero(t, stats.Process.SampledAt, "with no sampler wired there is no process reading to report")
+
+		sampler := storage.NewProcessMemorySampler(time.Hour)
+		sampler.Start()
+		defer sampler.Stop()
+
+		sampled := keyspace{engine: k.engine, procmem: sampler}.Stats()
+		assert.Positive(t, sampled.Process.HeapAlloc)
+		assert.Positive(t, sampled.Process.Goroutines)
+		assert.False(t, sampled.Process.SampledAt.IsZero())
+	})
 }
 
 func newTestKeyspace(t *testing.T) keyspace {

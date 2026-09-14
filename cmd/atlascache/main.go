@@ -56,6 +56,12 @@ func run() int {
 	logging.Configure(logging.Config{Level: cfg.Logging.Level, Format: cfg.Logging.Format})
 	log := logging.WithComponent("atlascache")
 
+	// HELLO and INFO report the version, and the build stamp lives here rather
+	// than in internal/server — which is why the two have to be joined
+	// somewhere, and the composition root is that somewhere (FEAT-0021). Before
+	// this, a released binary told every monitoring tool it was 0.1.0-dev.
+	server.Version = version
+
 	// Established before the listeners bind so a signal arriving during startup
 	// is respected rather than racing the handler installed further down.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
@@ -68,9 +74,17 @@ func run() int {
 	}
 	defer cache.close()
 
+	// Process memory is read on a timer and served from the last reading, so
+	// that INFO — which dashboards poll by the second — never triggers the
+	// stop-the-world that runtime.ReadMemStats is (ISSUE-0015).
+	procmem := storage.NewProcessMemorySampler(0)
+	procmem.Start()
+	defer procmem.Stop()
+
 	// The engine reaches the server through the keyspace seam, so the transport
 	// layer holds no storage types (FEAT-0017).
-	srv, err := server.New(ctx, cfg.ClientAddr(), logging.WithComponent("server"), keyspace{engine: cache.engine})
+	store := keyspace{engine: cache.engine, procmem: procmem}
+	srv, err := server.New(ctx, cfg.ClientAddr(), logging.WithComponent("server"), store)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to bind client port")
 		return 1

@@ -1,0 +1,78 @@
+version: 1
+name: compat-empty-key
+tier: smoke
+feature: FEAT-0020
+issue: ISSUE-0013
+description: >
+  An empty string is a key. Redis stores one like any other, and AtlasCache used
+  to answer `SET "" v` with `ERR invalid key` — a legal Redis operation failing
+  against a server whose entire premise is that existing clients work
+  unmodified (ADR-0006).
+
+  It was never a deliberate divergence: the check predated the RESP work and the
+  engine has no technical reason to refuse an empty map key. Found by
+  differential testing against redis:7-alpine, where it was the single
+  disagreement in 38 commands.
+
+  It is in the smoke tier because it is cheap and because a rejection would come
+  back through a validation check added for some other reason entirely, which is
+  the kind of regression a fast gate is for.
+
+steps:
+  - cmd: SET "" v1
+    expect: OK
+
+  - cmd: GET ""
+    expect: v1
+
+  - cmd: EXISTS ""
+    expect: 1
+
+  # The empty key is in the keyspace like any other.
+  #
+  # KEYS is deliberately not asserted here. The runner renders an array of one
+  # empty string and an empty array as the same text, so `KEYS *` against a lone
+  # empty key cannot be told apart from a miss at this layer — the assertion
+  # would pass whatever the server did. That `KEYS *` returns the empty key is
+  # checked where it can be checked honestly: in TestKeysPatternMatching, and in
+  # the differential run against redis:7-alpine.
+  - cmd: DBSIZE
+    expect: 1
+
+  - cmd: TTL ""
+    expect: -1
+
+  - cmd: EXPIRE "" 100
+    expect: 1
+
+  - cmd: TTL ""
+    expect: 100
+
+  - cmd: SETNX "" v2
+    expect: 0
+
+  - cmd: GET ""
+    expect: v1
+
+  - cmd: DEL ""
+    expect: 1
+
+  - cmd: GET ""
+    expect: NIL
+
+  - cmd: EXISTS ""
+    expect: 0
+
+  - cmd: DBSIZE
+    expect: 0
+
+  # An empty key holding an empty value, which is the pair most likely to be
+  # confused with "absent" by an implementation that conflates the two.
+  - cmd: SET "" ""
+    expect: OK
+
+  - cmd: GET ""
+    expect: ""
+
+  - cmd: EXISTS ""
+    expect: 1

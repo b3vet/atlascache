@@ -1,0 +1,47 @@
+version: 1
+name: proto-malformed
+tier: full
+feature: FEAT-0025
+description: >
+  Every malformed input class FEAT-0025 names, sent as raw bytes to a real
+  server: truncated frames, negative lengths, enormous declared lengths, a
+  length that disagrees with its payload, missing and wrong terminators, deep
+  nesting, RESP3 type bytes where RESP2 expects a bulk string, and integer
+  overflow in a length field.
+
+  Each one must be refused the same way: a protocol error, then a close, because
+  a stream that cannot be resynchronised must not stay open offering to parse
+  what follows as a fresh request. The exception is an input that is a bad
+  command rather than a bad frame -- an unknown inline request is answered and
+  the connection carries on.
+
+  The assertion that matters most is the one after each case rather than the
+  case itself: a new connection must be served normally. A parser that refuses
+  malformed input correctly and takes the process down with it has still lost,
+  and one connection per class is what makes a crash attributable.
+
+  This is a Go scenario because the step format sends commands, and none of
+  these inputs is one.
+
+steps:
+  - scenario: proto_malformed_input_is_refused
+
+  # Binary safety is a correctness requirement, not a robustness one: a bulk
+  # string carries arbitrary bytes, and a server that reads them as text
+  # corrupts stored data with nothing in the logs. Proved end to end, through a
+  # real process, because the decoder is only the first place it can go wrong.
+  - scenario: proto_binary_values_round_trip
+
+  # Ordinary traffic still works after all of it, on the connection the steps
+  # run on rather than on one the scenarios opened.
+  - cmd: PING
+    expect: PONG
+
+  - cmd: SET malformed:k after-the-storm
+    expect: OK
+
+  - cmd: GET malformed:k
+    expect: after-the-storm
+
+  - cmd: DEL malformed:k
+    expect: 1

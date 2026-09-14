@@ -61,7 +61,6 @@ func TestMemoryTrackerCounters(t *testing.T) {
 	assert.Equal(t, uint64(2), stats.Evictions)
 	assert.Equal(t, uint64(1), stats.OOMRejected)
 	assert.Equal(t, uint64(100), stats.Max)
-	assert.Positive(t, stats.HeapAlloc)
 }
 
 func TestMemoryTrackerConcurrentSub(t *testing.T) {

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	"strings"
 
 	"github.com/rs/zerolog"
 
@@ -22,6 +21,10 @@ type Server struct {
 	store     Store
 	addr      string
 	log       zerolog.Logger
+
+	// conns is the connection accounting INFO reports, and the source of the
+	// per-connection ids SCAN cursors are scoped to. See commands.go.
+	conns connCounters
 }
 
 // New binds the client port and returns a server ready to Serve.
@@ -41,7 +44,7 @@ func New(ctx context.Context, addr string, log zerolog.Logger, store Store) (*Se
 
 	return &Server{
 		transport: transport,
-		codec:     protocol.NewRESP(),
+		codec:     protocol.NewRESPWithLimits(protocol.LimitsForValueSize(store.MaxValueSize())),
 		store:     store,
 		addr:      transport.Addr(),
 		log:       log,
@@ -69,6 +72,13 @@ func (s *Server) Handle(ctx context.Context, c Conn) {
 	log.Debug().Msg("connection opened")
 	defer log.Debug().Msg("connection closed")
 
+	// The session holds what is scoped to this connection rather than to the
+	// server: its id, and through it the SCAN cursors filed under that id.
+	// Closing it gives the snapshots back immediately instead of at the idle
+	// timeout, for a connection that can never come back to finish them.
+	sess := s.newSession()
+	defer sess.close()
+
 	for {
 		cmd, err := s.codec.Decode(c.Reader())
 		if err != nil {
@@ -76,7 +86,7 @@ func (s *Server) Handle(ctx context.Context, c Conn) {
 			return
 		}
 
-		reply, closeConn := s.dispatch(cmd)
+		reply, closeConn := sess.dispatch(cmd)
 		if err := s.reply(c, reply); err != nil {
 			log.Debug().Err(err).Msg("write failed")
 			return
@@ -87,25 +97,6 @@ func (s *Server) Handle(ctx context.Context, c Conn) {
 			return
 		}
 	}
-}
-
-// dispatch resolves a command to a reply, reporting whether the connection
-// should close afterwards.
-//
-// Every failure here is a reply and not a hang-up: an unknown command, a wrong
-// argument count and a malformed argument all leave the session usable, because
-// a client that mistypes one command has not lost the right to send the next
-// one. Only a request the codec cannot resynchronize after closes a connection.
-func (s *Server) dispatch(cmd protocol.Command) (protocol.Reply, bool) {
-	spec, known := commands[cmd.Name]
-	if !known {
-		return protocol.Errorf("unknown command '%s'", cmd.Name), false
-	}
-	if !spec.accepts(len(cmd.Args)) {
-		return protocol.Errorf("wrong number of arguments for '%s' command", strings.ToLower(cmd.Name)), false
-	}
-
-	return spec.handler(s, cmd), spec.closes
 }
 
 func (s *Server) reply(c Conn, reply protocol.Reply) error {

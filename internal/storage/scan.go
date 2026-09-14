@@ -3,8 +3,9 @@ package storage
 import (
 	"container/list"
 	"crypto/rand"
-	"encoding/hex"
+	"encoding/binary"
 	"errors"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -72,10 +73,22 @@ import (
 //
 // # Cursor ids
 //
-// Ids are 128 random bits from crypto/rand and are bound to the connection that
-// created them. A cursor presented by another connection is answered exactly as
-// an unknown one is, so the reply does not confirm that some other client's
-// cursor exists.
+// Ids are the decimal text of 64 random bits from crypto/rand, and are bound to
+// the connection that created them. A cursor presented by another connection is
+// answered exactly as an unknown one is, so the reply does not confirm that some
+// other client's cursor exists.
+//
+// Decimal, not hex, and that is a compatibility requirement rather than a
+// preference (ADR-0017, revised). Redis sends the SCAN cursor as a bulk string,
+// but essentially every mainstream client parses it back as an unsigned
+// integer — go-redis with ParseUint, redis-py with int(), `redis-cli --scan`
+// with strtoull. A hex id fails or silently truncates in all three, and the
+// failure is invisible to a single-page test because a scan that finishes in one
+// page returns "0" either way.
+//
+// 64 bits is ample: ids are already scoped to one connection, so an id is not a
+// capability another client could use even if it guessed one. Zero is skipped,
+// because it is the start-and-finished sentinel.
 
 // ScanCursorStart is the cursor a client presents to begin a scan, and the
 // cursor the engine returns once one has finished. It is deliberately not a
@@ -119,8 +132,8 @@ const (
 	// case rather than the best one.
 	scanKeyOverhead = 16
 
-	// cursorIDBytes is the entropy in a cursor id.
-	cursorIDBytes = 16
+	// cursorIDBytes is the entropy in a cursor id, rendered as decimal text.
+	cursorIDBytes = 8
 
 	// cursorIDAttempts bounds the retries on a generated id that collides with
 	// a live one. At 128 bits this never runs, and the loop is bounded so a
@@ -230,15 +243,24 @@ func newScanRegistry(cfg EngineConfig) *scanRegistry {
 	}
 }
 
-// randomCursorID returns 128 unguessable bits in hex. A client must not be able
-// to guess another connection's cursor, and connection scoping alone would not
-// stop it from guessing its own past cursors back into existence.
+// randomCursorID returns 64 unguessable bits as decimal text. A client must not
+// be able to guess another connection's cursor, and connection scoping alone
+// would not stop it from guessing its own past cursors back into existence.
+//
+// Zero is the one value it never returns: that is the sentinel meaning "start"
+// on the way in and "finished" on the way out, and an id equal to it would end
+// a scan that had not ended.
 func randomCursorID() (string, error) {
-	buf := make([]byte, cursorIDBytes)
-	if _, err := rand.Read(buf); err != nil {
+	var buf [cursorIDBytes]byte
+	if _, err := rand.Read(buf[:]); err != nil {
 		return "", err
 	}
-	return hex.EncodeToString(buf), nil
+
+	id := binary.BigEndian.Uint64(buf[:])
+	if id == 0 {
+		id = 1
+	}
+	return strconv.FormatUint(id, 10), nil
 }
 
 // scanStats is what the registry contributes to Stats.
@@ -260,7 +282,14 @@ func (r *scanRegistry) stats() scanStats {
 
 // page returns the next page of a scan, and the cursor to present for the one
 // after it. See ShardedEngine.Scan for the contract this implements.
-func (r *scanRegistry) page(shards []*Shard, owner ScanOwner, id string, count int) ([][]byte, string, error) {
+//
+// match, when non-empty, is a glob filter applied as the page is assembled. It
+// removes keys from the page and does nothing else: the count of entries
+// examined is unchanged, so a heavily filtered scan walks the keyspace at the
+// same rate an unfiltered one does and simply returns less of it.
+func (r *scanRegistry) page(
+	shards []*Shard, owner ScanOwner, id string, count int, match string,
+) ([][]byte, string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -296,7 +325,7 @@ func (r *scanRegistry) page(shards []*Shard, owner ScanOwner, id string, count i
 		cursor.pos += take
 		examined += take
 
-		keys = shards[cursor.shard].liveKeys(batch, keys)
+		keys = shards[cursor.shard].liveKeys(batch, match, keys)
 	}
 
 	return keys, cursor.id, nil

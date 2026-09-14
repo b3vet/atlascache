@@ -382,8 +382,8 @@ func (s *Shard) Keys() []string {
 	return keys
 }
 
-// liveKeys appends the candidates that are still resident and unexpired to dst,
-// as copies the caller owns.
+// liveKeys appends the candidates that are still resident, unexpired and
+// matching to dst, as copies the caller owns. An empty match keeps everything.
 //
 // It is the read-time filter behind a scan page: the snapshot a cursor holds
 // says which keys the shard had when the scan began, and this says which of
@@ -393,13 +393,21 @@ func (s *Shard) Keys() []string {
 //
 // Expired-but-resident entries are treated as gone: a key that expired mid-scan
 // must not surface just because nothing has reclaimed it yet.
-func (s *Shard) liveKeys(candidates []string, dst [][]byte) [][]byte {
+//
+// The glob is applied before the copy rather than after the page is returned,
+// which is what keeps a filtered scan from allocating the keys it is about to
+// discard. It costs the matcher a turn under the read lock; a glob over a page
+// of at most maxScanCount keys is cheap beside the lock acquisition it shares.
+func (s *Shard) liveKeys(candidates []string, match string, dst [][]byte) [][]byte {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	for _, key := range candidates {
 		entry, exists := s.data[key]
 		if !exists || entry.IsExpired() {
+			continue
+		}
+		if match != "" && !MatchGlob(match, key) {
 			continue
 		}
 		dst = append(dst, []byte(key))

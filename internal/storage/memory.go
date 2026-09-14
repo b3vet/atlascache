@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"runtime"
 	"sync/atomic"
 )
 
@@ -138,24 +137,28 @@ func (m *MemoryTracker) GetOOMRejections() uint64 {
 	return atomic.LoadUint64(&m.oomRejected)
 }
 
-// MemoryStats holds memory statistics
+// MemoryStats holds the cache's own memory accounting.
+//
+// It holds no Go runtime figures, and that omission is the fix for ISSUE-0015
+// rather than an oversight. Reading them meant runtime.ReadMemStats, which
+// stops the world, on a call that STATS, INFO and the admin API all sit on top
+// of — a client-triggerable stop-the-world once P2 put those on the wire, and a
+// periodic one once a scraper polls them every fifteen seconds. Every field
+// below is an atomic counter the cache maintains as it goes.
+//
+// Process-level memory is reported separately, from a sampler that reads the
+// runtime on a timer off any request path. See ProcessMemorySampler.
 type MemoryStats struct {
 	Used        uint64
 	Max         uint64
 	Available   uint64
 	Evictions   uint64
 	OOMRejected uint64
-	HeapAlloc   uint64
-	HeapSys     uint64
-	HeapInuse   uint64
-	NumGC       uint32
 }
 
-// Stats returns memory statistics
+// Stats returns the cache's memory accounting. It is four atomic loads and
+// costs nothing, which is what makes it safe to poll.
 func (m *MemoryTracker) Stats() MemoryStats {
-	var memStats runtime.MemStats
-	runtime.ReadMemStats(&memStats)
-
 	max := atomic.LoadUint64(&m.maxMemory)
 	used := atomic.LoadUint64(&m.usedMemory)
 
@@ -172,9 +175,5 @@ func (m *MemoryTracker) Stats() MemoryStats {
 		Available:   available,
 		Evictions:   atomic.LoadUint64(&m.evictions),
 		OOMRejected: atomic.LoadUint64(&m.oomRejected),
-		HeapAlloc:   memStats.HeapAlloc,
-		HeapSys:     memStats.HeapSys,
-		HeapInuse:   memStats.HeapInuse,
-		NumGC:       memStats.NumGC,
 	}
 }

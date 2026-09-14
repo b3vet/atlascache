@@ -258,3 +258,49 @@ func (f *floodReader) Read(p []byte) (int, error) {
 	f.read += n
 	return n, nil
 }
+
+// TestOneAcceptedRequestHasABoundedCost pins what the most expensive request
+// the limits *accept* costs the server, which is the question the three bugs
+// above leave open.
+//
+// Each of ISSUE-0016's fixes bounds one field: no single declared number sizes
+// an allocation any more. None of them bounds the product. A request is allowed
+// MaxMultiBulkLength elements, so a client that really does send a million
+// one-byte arguments is inside every limit and is entitled to all of it.
+//
+// The ratio is what this measures, because that is the part that can regress
+// silently: the bytes are sent, so a client pays for them, but a per-element
+// overhead that grew would turn a request a client paid 7MB for into one the
+// server pays far more than 155MB for. The absolute number is reported for
+// FEAT-0024, which owns the per-connection accounting that would cap it.
+func TestOneAcceptedRequestHasABoundedCost(t *testing.T) {
+	limits := DefaultLimits()
+
+	// The worst case within the limits: every element as small as an element
+	// can be, so the per-element overhead dominates what was sent.
+	var request strings.Builder
+	fmt.Fprintf(&request, "*%d\r\n$3\r\nDEL\r\n", limits.MaxMultiBulkLength)
+	for range limits.MaxMultiBulkLength - 1 {
+		request.WriteString("$1\r\nk\r\n")
+	}
+	input := request.String()
+
+	var cmd Command
+	allocated := measureAlloc(func() {
+		var err error
+		cmd, err = NewRESP().Decode(decoderFor(input))
+		require.NoError(t, err)
+	})
+	require.Len(t, cmd.Args, limits.MaxMultiBulkLength-1)
+
+	ratio := float64(allocated) / float64(len(input))
+	t.Logf("the largest request the limits accept is %d bytes of %d elements, and decoding it "+
+		"allocated %d bytes (%.1fx)", len(input), limits.MaxMultiBulkLength, allocated, ratio)
+
+	// A slice header and a one-byte payload per element, over the seven bytes
+	// each element costs to send. Anything much above this is a new overhead
+	// per element, which is the regression worth catching — the element limit
+	// itself is FEAT-0025's, and lowering it is a product decision.
+	assert.Lessf(t, ratio, 32.0,
+		"decoding the largest accepted request allocated %.1f times what it took to send it", ratio)
+}

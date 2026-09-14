@@ -1,0 +1,191 @@
+version: 1
+name: cmd-data
+tier: full
+feature: FEAT-0020
+description: >
+  SETNX, EXISTS, KEYS and SCAN answer exactly as Redis answers, because
+  compatibility is the whole point of speaking RESP at all (ADR-0006).
+
+  Three of the assertions below are the ones that matter. EXISTS counts
+  duplicates separately, so `EXISTS k k k` on one key is 3 and not 1 — clients
+  rely on that and the obvious de-duplicating "fix" breaks them. KEYS matches
+  Redis's glob and not Go's filepath.Match, so a wildcard crosses '/', which
+  cache keys are full of. And SCAN reports a cursor of 0 only when the
+  iteration is genuinely over: a short or empty page says nothing, because
+  COUNT bounds the work a page does and MATCH filters what that work found.
+
+  Where a reply is a list, the pattern is chosen so exactly one key matches.
+  Neither Redis nor AtlasCache defines an order for KEYS or a SCAN page, and a
+  spec that asserted one would be asserting an implementation detail.
+
+config:
+  storage:
+    shard_count: 1
+
+steps:
+  # ---- SETNX ----------------------------------------------------------------
+
+  - cmd: SETNX nx:fresh first
+    expect: 1
+
+  - cmd: GET nx:fresh
+    expect: first
+
+  # A live key blocks the write, and the value it holds is untouched.
+  - cmd: SETNX nx:fresh second
+    expect: 0
+
+  - cmd: GET nx:fresh
+    expect: first
+
+  # An expired key does not block it. The key is gone as far as any client can
+  # tell, so SETNX treats it as free.
+  - cmd: SET nx:short v EX 1
+    expect: OK
+
+  - sleep: 1500ms
+
+  - cmd: SETNX nx:short reclaimed
+    expect: 1
+
+  - cmd: GET nx:short
+    expect: reclaimed
+
+  - cmd: SETNX nx:fresh
+    expect_error: "ERR wrong number of arguments for 'setnx' command"
+
+  - cmd: SETNX nx:fresh a b
+    expect_error: "ERR wrong number of arguments for 'setnx' command"
+
+  # ---- EXISTS ---------------------------------------------------------------
+
+  - cmd: SET ex:a 1
+    expect: OK
+
+  - cmd: SET ex:b 2
+    expect: OK
+
+  - cmd: EXISTS ex:a
+    expect: 1
+
+  - cmd: EXISTS ex:missing
+    expect: 0
+
+  - cmd: EXISTS ex:a ex:b
+    expect: 2
+
+  # The case the command is famous for. Redis counts each argument, so the same
+  # key named three times is three.
+  - cmd: EXISTS ex:a ex:a ex:a
+    expect: 3
+
+  - cmd: EXISTS ex:a ex:missing ex:a ex:missing ex:a
+    expect: 3
+
+  - cmd: EXISTS
+    expect_error: "ERR wrong number of arguments for 'exists' command"
+
+  # ---- KEYS -----------------------------------------------------------------
+
+  - cmd: SET keys:only:one v
+    expect: OK
+
+  - cmd: SET cdn/eu/logo.png v
+    expect: OK
+
+  - cmd: KEYS keys:only:one
+    expect: "[keys:only:one]"
+
+  - cmd: KEYS keys:only:*
+    expect: "[keys:only:one]"
+
+  - cmd: KEYS keys:only:on?
+    expect: "[keys:only:one]"
+
+  # The filepath.Match divergence, in one line: Go refuses to let '*' cross a
+  # path separator. Redis has no such rule, and neither does a cache key.
+  - cmd: KEYS cdn/*
+    expect: "[cdn/eu/logo.png]"
+
+  - cmd: KEYS "*/*/*"
+    expect: "[cdn/eu/logo.png]"
+
+  - cmd: KEYS "*.png"
+    expect: "[cdn/eu/logo.png]"
+
+  - cmd: KEYS "[c]dn/*"
+    expect: "[cdn/eu/logo.png]"
+
+  - cmd: KEYS "[^c]dn/*"
+    expect: "[]"
+
+  - cmd: KEYS "cdn/[a-f]u/*"
+    expect: "[cdn/eu/logo.png]"
+
+  - cmd: KEYS nothing:here:*
+    expect: "[]"
+
+  - cmd: KEYS
+    expect_error: "ERR wrong number of arguments for 'keys' command"
+
+  - cmd: KEYS a b
+    expect_error: "ERR wrong number of arguments for 'keys' command"
+
+  # ---- SCAN -----------------------------------------------------------------
+
+  # A scan that fits in one page returns the finished cursor, which is "0" and
+  # is the only thing that means finished.
+  - cmd: SCAN 0 COUNT 10000 MATCH keys:only:*
+    expect: "[0 [keys:only:one]]"
+
+  - cmd: SCAN 0 MATCH keys:only:* COUNT 10000
+    expect: "[0 [keys:only:one]]"
+
+  # MATCH filters after retrieval, so a page may be empty. Here the scan also
+  # finishes, and the cursor is what says so.
+  - cmd: SCAN 0 COUNT 10000 MATCH nothing:here:*
+    expect: "[0 []]"
+
+  # Options are case-insensitive, as they are in Redis.
+  - cmd: SCAN 0 match keys:only:* count 10000
+    expect: "[0 [keys:only:one]]"
+
+  # A cursor is a decimal unsigned integer (ADR-0017). Anything else is
+  # rejected rather than looked up, so a client that mangled one is told.
+  - cmd: SCAN notanumber
+    expect_error: "ERR invalid cursor"
+
+  - cmd: SCAN -1
+    expect_error: "ERR invalid cursor"
+
+  - cmd: SCAN 0xff
+    expect_error: "ERR invalid cursor"
+
+  # A cursor that parses but was never issued. It is an error and not a silent
+  # restart: a scan that quietly reset would hand back duplicates the caller
+  # has no way to detect.
+  - cmd: SCAN 123456789
+    expect_error: "ERR invalid cursor"
+
+  - cmd: SCAN 0 COUNT 0
+    expect_error: "ERR syntax error"
+
+  - cmd: SCAN 0 COUNT abc
+    expect_error: "ERR value is not an integer or out of range"
+
+  - cmd: SCAN 0 NOSUCHOPTION x
+    expect_error: "ERR syntax error"
+
+  - cmd: SCAN 0 MATCH
+    expect_error: "ERR syntax error"
+
+  - cmd: SCAN
+    expect_error: "ERR wrong number of arguments for 'scan' command"
+
+  # Every refusal above was a reply, not a hang-up. The connection is still
+  # serving, which is the property that makes a mistyped command survivable.
+  - cmd: PING
+    expect: PONG
+
+  - cmd: GET nx:fresh
+    expect: first

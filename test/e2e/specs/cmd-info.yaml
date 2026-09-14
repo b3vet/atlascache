@@ -1,0 +1,178 @@
+version: 1
+name: cmd-info
+tier: full
+feature: FEAT-0021
+description: >
+  INFO, STATS, DBSIZE, ECHO and COMMAND — the commands a client library or a
+  monitoring agent probes for on connect, and which make a working server look
+  broken when they answer with an error.
+
+  INFO is asserted as `key:value` lines, which is what it has to be: every
+  exporter ever written for Redis parses that format, and the runner's
+  expect_field reads it the same way one of them would. Field names follow
+  Redis's spelling wherever there is a direct equivalent — used_memory,
+  keyspace_hits, keyspace_misses, expired_keys, connected_clients — so a
+  dashboard built for Redis reads them unchanged; everything AtlasCache-specific
+  carries an atlascache_ prefix so a field Redis adds later cannot collide.
+
+  STATS is the native command and returns a logical map. RESP2 has no map frame,
+  so it arrives flattened into an array of pairs and expect_field reads it as
+  one — the handler does not know which of the two happened, and when RESP3
+  lands in P6 the same handler starts returning a real map (ADR-0028).
+
+config:
+  storage:
+    shard_count: 1
+
+steps:
+  - cmd: SET info:a 1
+    expect: OK
+
+  - cmd: SET info:b 2 EX 600
+    expect: OK
+
+  - cmd: GET info:a
+    expect: 1
+
+  - cmd: GET info:missing
+    expect: NIL
+
+  # ---- DBSIZE ---------------------------------------------------------------
+
+  - cmd: DBSIZE
+    expect: 2
+
+  - cmd: DBSIZE extra
+    expect_error: "ERR wrong number of arguments for 'dbsize' command"
+
+  # ---- ECHO -----------------------------------------------------------------
+
+  - cmd: ECHO hello
+    expect: hello
+
+  - cmd: ECHO "hello world"
+    expect: hello world
+
+  - cmd: ECHO ""
+    expect: ""
+
+  # Binary-safe. Clients use ECHO as a health probe and some push arbitrary
+  # bytes through it, so it must not be treated as text.
+  - cmd: "ECHO \"a\\r\\nb\\x00c\""
+    expect: "a\r\nb\x00c"
+
+  - cmd: ECHO
+    expect_error: "ERR wrong number of arguments for 'echo' command"
+
+  - cmd: ECHO a b
+    expect_error: "ERR wrong number of arguments for 'echo' command"
+
+  # ---- COMMAND --------------------------------------------------------------
+
+  # A deliberate stub. redis-cli sends COMMAND DOCS on startup and tolerates an
+  # empty reply; a fabricated command table would be worse than nothing, since
+  # clients use it for arity validation and would start rejecting commands this
+  # server accepts.
+  - cmd: COMMAND
+    expect: "[]"
+
+  - cmd: COMMAND DOCS
+    expect: "[]"
+
+  - cmd: COMMAND COUNT
+    expect: "[]"
+
+  # ---- STATS ----------------------------------------------------------------
+
+  - cmd: STATS
+    expect_field:
+      keys: 2
+      keys_with_ttl: 1
+      hits: 1
+      misses: 1
+      memory_used: "> 0"
+      evictions: 0
+      expirations: 0
+      oom_rejected: 0
+      scan_cursors: 0
+      connected_clients: "> 0"
+      commands_processed: "> 0"
+      connections_received: "> 0"
+
+  - cmd: STATS extra
+    expect_error: "ERR wrong number of arguments for 'stats' command"
+
+  # ---- INFO -----------------------------------------------------------------
+
+  # The whole document, read as a monitoring tool reads it: section headers and
+  # blank lines skipped, every other line split at the first colon.
+  - cmd: INFO
+    expect_field:
+      # The build stamp, not the package default. The two happen to agree on
+      # this branch, which is the point of asserting it: cmd/atlascache sets
+      # server.Version from the -X ldflag the Makefile fills from the VERSION
+      # file, and before FEAT-0021 wired them a released binary reported
+      # 0.1.0-dev to every monitoring tool no matter what it was built as.
+      atlascache_version: "0.1.0-dev"
+      atlascache_mode: standalone
+      arch_bits: 64
+      process_id: "> 0"
+      uptime_in_seconds: ">= 0"
+      connected_clients: "> 0"
+      used_memory: "> 0"
+      maxmemory: 0
+      keyspace_hits: 1
+      keyspace_misses: 1
+      expired_keys: 0
+      evicted_keys: 0
+      total_commands_processed: "> 0"
+      total_connections_received: "> 0"
+      db0: "keys=2,expires=1,avg_ttl=0"
+
+  # A single section returns only that section, so a tool polling for memory
+  # does not pay for the rest.
+  - cmd: INFO memory
+    expect_field:
+      used_memory: "> 0"
+      maxmemory: 0
+
+  - cmd: INFO keyspace
+    expect_field:
+      db0: "keys=2,expires=1,avg_ttl=0"
+
+  - cmd: INFO server
+    expect_field:
+      atlascache_mode: standalone
+
+  # Section names are case-insensitive, and `all` means every section, both as
+  # in Redis.
+  - cmd: INFO MEMORY
+    expect_field:
+      used_memory: "> 0"
+
+  - cmd: INFO all
+    expect_field:
+      atlascache_mode: standalone
+      used_memory: "> 0"
+      keyspace_hits: 1
+
+  # An unknown section is an empty reply rather than an error: tools probe for
+  # sections they are not sure exist, and Redis answers them the same way.
+  - cmd: INFO nosuchsection
+    expect: ""
+
+  # The keyspace counters track what happened to the keyspace, not what the
+  # process wishes had happened.
+  - cmd: DEL info:a info:b
+    expect: 2
+
+  - cmd: DBSIZE
+    expect: 0
+
+  # Redis omits the db0 line entirely when the keyspace is empty, and several
+  # exporters use its absence to tell an empty database from a missing one.
+  - cmd: INFO keyspace
+    expect: "# Keyspace\r\n"
+
+  - cmd: PING
+    expect: PONG

@@ -526,7 +526,7 @@ func BenchmarkScanPage(b *testing.B) {
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			owner := ScanOwner(i)
-			if _, _, err := engine.Scan(owner, ScanCursorStart, 100); err != nil {
+			if _, _, err := engine.Scan(owner, ScanCursorStart, 100, ""); err != nil {
 				b.Fatal(err)
 			}
 			b.StopTimer()
@@ -536,7 +536,7 @@ func BenchmarkScanPage(b *testing.B) {
 	})
 
 	b.Run("later-page-walks-the-snapshot", func(b *testing.B) {
-		_, cursor, err := engine.Scan(1, ScanCursorStart, 1)
+		_, cursor, err := engine.Scan(1, ScanCursorStart, 1, "")
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -544,7 +544,7 @@ func BenchmarkScanPage(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
-			keys, next, pageErr := engine.Scan(1, cursor, 100)
+			keys, next, pageErr := engine.Scan(1, cursor, 100, "")
 			if pageErr != nil {
 				b.Fatal(pageErr)
 			}
@@ -553,7 +553,7 @@ func BenchmarkScanPage(b *testing.B) {
 				// paging rather than restarting.
 				b.StopTimer()
 				engine.ReleaseScans(1)
-				_, next, err = engine.Scan(1, ScanCursorStart, 1)
+				_, next, err = engine.Scan(1, ScanCursorStart, 1, "")
 				if err != nil {
 					b.Fatal(err)
 				}

@@ -1,0 +1,121 @@
+version: 1
+name: setnx-memory
+tier: full
+feature: FEAT-0020
+issue: ISSUE-0010
+description: >
+  SETNX is accounted exactly as SET is, end to end.
+
+  ISSUE-0010 was that the two had separate write paths and the conditional one
+  did its own memory bookkeeping, so a SETNX could take memory the limit never
+  saw. The fix shipped in P1 — both now go through one admission path — but it
+  could not be proved from outside the process, because SETNX was not among
+  P1's five commands and there was no wire path to reach it. This is that proof,
+  written where the command finally exists.
+
+  Two halves, and the second is the one the issue was actually about. A SETNX
+  that stores is charged for what it stored; a SETNX that is refused is charged
+  for nothing, takes no victim, and leaves the resident set exactly as it was.
+  A leak on the refused path is invisible to any test that only writes.
+
+config:
+  storage:
+    shard_count: 1
+    # Entries here are 102 bytes each: a 2-byte key, a 20-byte value and the
+    # 80-byte fixed overhead. Three fit in 306; a fourth does not.
+    max_memory: "306"
+  eviction:
+    # No policy, so max_memory is a wall rather than a prompt to make room.
+    # A refused write is then visible as a refusal instead of as an eviction.
+    policy: none
+    sample_size: 100
+
+steps:
+  - cmd: SETNX k1 vvvvvvvvvvvvvvvvvvvv
+    expect: 1
+
+  - cmd: SETNX k2 vvvvvvvvvvvvvvvvvvvv
+    expect: 1
+
+  - cmd: STATS
+    expect_field:
+      keys: 2
+      memory_used: 204
+      evictions: 0
+      oom_rejected: 0
+
+  # A refused SETNX is free. Five of them in a row move nothing: not the byte
+  # count, not the key count, and nothing is evicted to make room for a write
+  # that never happens.
+  - cmd: SETNX k1 vvvvvvvvvvvvvvvvvvvv
+    expect: 0
+
+  - cmd: SETNX k1 vvvvvvvvvvvvvvvvvvvv
+    expect: 0
+
+  - cmd: SETNX k2 vvvvvvvvvvvvvvvvvvvv
+    expect: 0
+
+  - cmd: SETNX k2 vvvvvvvvvvvvvvvvvvvv
+    expect: 0
+
+  - cmd: SETNX k1 vvvvvvvvvvvvvvvvvvvv
+    expect: 0
+
+  - cmd: STATS
+    expect_field:
+      keys: 2
+      memory_used: 204
+      evictions: 0
+      oom_rejected: 0
+
+  - cmd: SETNX k3 vvvvvvvvvvvvvvvvvvvv
+    expect: 1
+
+  - cmd: STATS
+    expect_field:
+      keys: 3
+      memory_used: 306
+
+  # The cache is exactly full. A fourth entry is refused with the OOM error
+  # clients back off on, and the refusal is charged to nobody.
+  - cmd: SETNX k4 vvvvvvvvvvvvvvvvvvvv
+    expect_error: "OOM command not allowed when used memory > 'maxmemory'."
+
+  - cmd: STATS
+    expect_field:
+      keys: 3
+      memory_used: 306
+      evictions: 0
+      oom_rejected: 1
+
+  # SET is refused identically. The whole point of the shared admission path is
+  # that the two commands cannot disagree about the limit.
+  - cmd: SET k4 vvvvvvvvvvvvvvvvvvvv
+    expect_error: "OOM command not allowed when used memory > 'maxmemory'."
+
+  - cmd: STATS
+    expect_field:
+      keys: 3
+      memory_used: 306
+      oom_rejected: 2
+
+  # Freeing a slot makes room for exactly one more, and the bytes come back.
+  - cmd: DEL k1
+    expect: 1
+
+  - cmd: STATS
+    expect_field:
+      keys: 2
+      memory_used: 204
+
+  - cmd: SETNX k4 vvvvvvvvvvvvvvvvvvvv
+    expect: 1
+
+  - cmd: STATS
+    expect_field:
+      keys: 3
+      memory_used: 306
+
+  - cmd: GET k4
+    expect: vvvvvvvvvvvvvvvvvvvv

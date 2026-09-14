@@ -19,7 +19,6 @@ func TestWriteValidation(t *testing.T) {
 		ttl   time.Duration
 		want  error
 	}{
-		{"empty key", nil, []byte("v"), 0, ErrInvalidKey},
 		{"value too large", []byte("k"), make([]byte, 65), 0, ErrValueTooLarge},
 		{"negative ttl", []byte("k"), []byte("v"), -time.Second, ErrInvalidTTL},
 	}
@@ -33,6 +32,43 @@ func TestWriteValidation(t *testing.T) {
 			assert.False(t, ok)
 		})
 	}
+}
+
+// TestEmptyKeyIsAKey closes ISSUE-0013. Redis stores an empty key like any
+// other; the engine used to refuse one, which made a legal Redis operation fail
+// against a server whose whole premise is that existing clients work unmodified
+// (ADR-0006). It was never a deliberate divergence, and nothing in the engine
+// needs it — an empty string is a perfectly good map key.
+func TestEmptyKeyIsAKey(t *testing.T) {
+	engine := NewShardedEngine(EngineConfig{ShardCount: 4, MaxValueSize: 64})
+	defer engine.Close()
+
+	empty := []byte("")
+
+	require.NoError(t, engine.Set(empty, []byte("v"), 0))
+	assert.True(t, engine.Exists(empty))
+
+	value, _, exists := engine.Get(empty)
+	assert.True(t, exists)
+	assert.Equal(t, "v", string(value))
+
+	// It participates in everything else a key participates in.
+	stored, err := engine.SetNX(empty, []byte("other"), 0)
+	require.NoError(t, err)
+	assert.False(t, stored, "an empty key already holding a value blocks SetNX like any other")
+
+	assert.True(t, engine.SetTTL(empty, time.Hour))
+	ttl, exists := engine.GetTTL(empty)
+	assert.True(t, exists)
+	assert.Positive(t, ttl)
+
+	assert.True(t, engine.Delete(empty))
+	assert.False(t, engine.Exists(empty))
+
+	// A nil key is the same key: both are zero bytes long.
+	require.NoError(t, engine.Set(nil, []byte("v"), 0))
+	assert.True(t, engine.Exists(empty))
+	assert.True(t, engine.Delete(nil))
 }
 
 func TestClosedEngineRejectsEverything(t *testing.T) {
@@ -62,7 +98,7 @@ func TestClosedEngineRejectsEverything(t *testing.T) {
 
 	assert.Nil(t, engine.Keys("*"))
 
-	keys, cursor, err := engine.Scan(1, ScanCursorStart, 10)
+	keys, cursor, err := engine.Scan(1, ScanCursorStart, 10, "")
 	assert.ErrorIs(t, err, ErrEngineClosed)
 	assert.Nil(t, keys)
 	assert.Equal(t, ScanCursorStart, cursor)
@@ -202,22 +238,55 @@ func TestKeysPatternMatching(t *testing.T) {
 		require.NoError(t, engine.Set([]byte(key), []byte("v"), 0))
 	}
 
-	assert.Len(t, engine.Keys(""), 4, "an empty pattern matches everything")
 	assert.Len(t, engine.Keys("*"), 4)
 	assert.Len(t, engine.Keys("user:*"), 2)
 	assert.Len(t, engine.Keys("user:?"), 2)
 	assert.Len(t, engine.Keys("session:1"), 1)
 	assert.Empty(t, engine.Keys("nothing:*"))
 
-	// filepath.Match rejects an unterminated character class, and matchPattern
-	// falls back to literal prefix/suffix/contains handling.
-	t.Run("malformed patterns fall back to literal matching", func(t *testing.T) {
-		assert.Len(t, engine.Keys("*a[b*"), 1, "contains")
-		assert.Len(t, engine.Keys("*a[b"), 1, "suffix")
-		assert.Len(t, engine.Keys("a[b*"), 1, "prefix")
-		assert.Len(t, engine.Keys("a[b"), 1, "equality")
-		assert.Empty(t, engine.Keys("z[q"))
+	// Keys containing a separator are the case filepath.Match got wrong: it
+	// refuses to let '*' cross one, and cache keys are made of them.
+	t.Run("a wildcard crosses path separators", func(t *testing.T) {
+		require.NoError(t, engine.Set([]byte("cdn/eu/logo.png"), []byte("v"), 0))
+
+		assert.Len(t, engine.Keys("cdn/*"), 1)
+		assert.Len(t, engine.Keys("*.png"), 1)
+		assert.Len(t, engine.Keys("*/*/*"), 1)
 	})
+
+	// An empty pattern is not a match-all pattern in Redis; it matches the
+	// empty key and nothing else. Only a bare "*" is short circuited.
+	t.Run("an empty pattern is not a wildcard", func(t *testing.T) {
+		assert.Empty(t, engine.Keys(""))
+
+		require.NoError(t, engine.Set([]byte(""), []byte("v"), 0))
+		assert.Len(t, engine.Keys(""), 1, "the empty pattern matches the empty key")
+		assert.Contains(t, stringKeys(engine.Keys("*")), "", "a bare star returns the empty key too")
+
+		assert.True(t, engine.Delete([]byte("")))
+	})
+
+	// Redis tolerates a malformed pattern rather than rejecting it, and
+	// tolerating it does not mean matching it literally: none of these find
+	// "a[b". Every expectation here was read off redis:7-alpine.
+	t.Run("malformed patterns match what Redis matches", func(t *testing.T) {
+		assert.Empty(t, engine.Keys("*a[b*"))
+		assert.Empty(t, engine.Keys("*a[b"))
+		assert.Empty(t, engine.Keys("a[b*"))
+		assert.Empty(t, engine.Keys("a[b"))
+		assert.Empty(t, engine.Keys("z[q"))
+
+		assert.Len(t, engine.Keys(`a\[b`), 1, "an escaped bracket is a literal bracket")
+	})
+}
+
+// stringKeys renders a Keys result for assertions that care about membership.
+func stringKeys(keys [][]byte) []string {
+	out := make([]string, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, string(key))
+	}
+	return out
 }
 
 func TestNextPowerOfTwo(t *testing.T) {

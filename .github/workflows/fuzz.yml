@@ -1,0 +1,79 @@
+name: Fuzz
+
+# The protocol parser is the only attacker-reachable surface that exists before
+# authentication, and auth is off by default (ADR-0009), so every byte sequence
+# a socket can carry is real input (FEAT-0025). This job spends a bounded budget
+# looking for the ones that break it.
+#
+# It is a separate workflow rather than another job in ci.yml because its budget
+# is time rather than work: it never "finishes", it stops. Keeping it apart lets
+# the budget change without touching the gate.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # A longer budget on demand, for the sustained runs a phase close asks for.
+  workflow_dispatch:
+    inputs:
+      fuzztime:
+        description: "How long each fuzz target runs (Go duration)"
+        required: false
+        default: "10m"
+  schedule:
+    # Nightly, where a long run costs nobody's pull request any time.
+    - cron: "0 3 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: Fuzz the RESP decoder
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # The floor declared in go.mod (ADR-0011). Fuzzing the version every
+          # other gate builds is what makes a finding actionable.
+          go-version: "1.24"
+          cache: true
+
+      # The seed corpus is committed, so this always runs against every input
+      # class FEAT-0025 names and every crash ever found. The generated corpus
+      # is cached on top of it: a fuzzer restarting from seeds alone spends its
+      # whole budget rediscovering coverage it had last week.
+      - name: Restore the generated corpus
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/go-build/fuzz
+          key: fuzz-corpus-${{ github.sha }}
+          restore-keys: |
+            fuzz-corpus-
+
+      # The committed corpus runs as an ordinary test first. It is fast, and it
+      # is what fails loudly on a regression: a budgeted fuzz run can miss a
+      # reintroduced bug, but the seed that found it the first time cannot.
+      - name: Run the committed corpus
+        run: go test ./internal/protocol/
+
+      - name: Fuzz the decoder
+        env:
+          FUZZTIME: ${{ github.event.inputs.fuzztime || (github.event_name == 'schedule' && '30m') || '3m' }}
+        run: |
+          go test ./internal/protocol/ \
+            -run=FuzzDecode -fuzz=FuzzDecode -fuzztime="$FUZZTIME" -fuzzminimizetime=30s
+
+      # A crash is minimized into testdata/fuzz/FuzzDecode. It has to be
+      # committed to be a regression seed, so it is published here rather than
+      # left in a runner that is about to be destroyed.
+      - name: Upload any crashing input
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashers
+          path: internal/protocol/testdata/fuzz/
+          if-no-files-found: ignore
