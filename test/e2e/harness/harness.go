@@ -251,7 +251,7 @@ func (p *Process) startOnce(ctx context.Context) error {
 	mark := p.logs.Offset()
 	p.logs.Printf("launching %s --config %s (client %s, admin %s)", p.binary, p.cfgPath, clientAddr, adminAddr)
 
-	if err := cmd.Start(); err != nil {
+	if err := startWithRetry(cmd); err != nil {
 		release(ports...)
 		return fmt.Errorf("launching %s: %w", p.binary, err)
 	}
@@ -670,4 +670,31 @@ func sanitize(name string) string {
 			return '-'
 		}
 	}, name)
+}
+
+// startWithRetry works around ETXTBSY, which Linux returns when the binary
+// being exec'd is open for writing anywhere on the system. It happens without
+// anyone doing anything wrong: a Go program that both writes executables and
+// forks can have a child briefly holding the write descriptor between its fork
+// and its exec, and an exec landing in that window fails.
+//
+// Two ways in here. `make build` writes bin/atlascache and the suite execs it
+// moments later; and the harness's own tests write stand-in scripts and launch
+// them while other tests are forking. Neither is a real failure, and both
+// resolve in microseconds.
+//
+// Retrying is the standard remedy — the alternative is a gate that goes red for
+// reasons unrelated to the code under test, which is how a gate stops being
+// read. Anything that is not ETXTBSY fails immediately.
+func startWithRetry(cmd *exec.Cmd) error {
+	const attempts = 20
+
+	var err error
+	for i := 0; i < attempts; i++ {
+		if err = cmd.Start(); !errors.Is(err, syscall.ETXTBSY) {
+			return err
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return fmt.Errorf("%w (still busy after %d attempts)", err, attempts)
 }

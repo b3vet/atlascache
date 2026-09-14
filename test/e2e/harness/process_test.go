@@ -47,7 +47,9 @@ func launched(t *testing.T, settings Settings, script string) (*Process, *proc) 
 	cmd := exec.CommandContext(t.Context(), standIn(t, script))
 	cmd.Env = append(os.Environ(), "READY="+ready)
 	cmd.SysProcAttr = sysProcAttr()
-	if err := cmd.Start(); err != nil {
+	// Same ETXTBSY window the real spawn guards against: this test writes an
+	// executable and launches it while sibling tests are forking.
+	if err := startWithRetry(cmd); err != nil {
 		t.Fatalf("starting the stand-in: %v", err)
 	}
 
