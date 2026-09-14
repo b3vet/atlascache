@@ -56,6 +56,40 @@ func writeConfig(path, dataDir string, specName string, clientPort, adminPort in
 	return nil
 }
 
+// tlsRequested reports whether the spec's config block turns TLS on.
+//
+// It is read before the server is launched, because the certificate has to
+// exist before the config naming it is written.
+func tlsRequested(config map[string]any) bool {
+	section, ok := asMap(config["tls"])
+	if !ok {
+		return false
+	}
+	enabled, ok := section["enabled"].(bool)
+	return ok && enabled
+}
+
+// withTLSPaths returns the spec's config with the certificate paths forced to
+// the harness's own.
+//
+// They belong to the harness for the same reason the ports and the data
+// directory do: they live inside the directory it creates and removes, and a
+// spec that pointed the server somewhere else would leave files behind and
+// break the isolation every other spec depends on.
+func withTLSPaths(config map[string]any, certFile, keyFile string) map[string]any {
+	// Copied down to the block being written, because the map belongs to the
+	// spec: the runner parsed it, and a harness that edited it in place would
+	// be changing what the spec says it wants.
+	updated := mergeConfig(map[string]any{}, config)
+	if section, ok := asMap(updated["tls"]); ok {
+		updated["tls"] = mergeConfig(map[string]any{}, section)
+	}
+
+	setPath(updated, certFile, "tls", "cert_file")
+	setPath(updated, keyFile, "tls", "key_file")
+	return updated
+}
+
 // mergeConfig overlays override onto base, recursing into nested maps so that a
 // spec setting one key under `storage:` does not delete the rest of the block.
 func mergeConfig(base, override map[string]any) map[string]any {

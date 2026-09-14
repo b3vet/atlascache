@@ -45,6 +45,16 @@ data/
 config.yaml
 !config.example.yaml
 
+# Development TLS material from `make dev-certs`. Never commit a certificate or
+# a key: committed test certificates get copied into production, and they expire.
+#
+# Anchored to the repository root, so it ignores what `make dev-certs` writes
+# and not the Go package at test/e2e/certs.
+/certs/
+*.pem
+*.crt
+*.key
+
 # Temporary files
 tmp/
 temp/

@@ -12,6 +12,7 @@ package harness
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -25,6 +26,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/b3vet/atlascache/test/e2e/certs"
 	"github.com/b3vet/atlascache/test/e2e/client"
 	"github.com/b3vet/atlascache/test/e2e/runner"
 )
@@ -107,6 +109,17 @@ type Process struct {
 	logs   *logBuffer
 	health *http.Client
 
+	// TLS material, generated per spec when the spec asks for TLS. The paths
+	// are the harness's, like the ports and the data directory, so a spec says
+	// only `tls: {enabled: true}` and a rotation scenario knows where to write.
+	tls      bool
+	certFile string
+	keyFile  string
+	// trusted accumulates every certificate this harness has seen on disk, so a
+	// client keeps working across a rotation — and across a rotation to a pair
+	// that was then replaced with a broken one.
+	trusted [][]byte
+
 	mu         sync.Mutex
 	current    *proc
 	conn       *client.Client
@@ -150,7 +163,7 @@ func New(opts runner.HarnessOptions, settings Settings) (*Process, error) {
 		return nil, fmt.Errorf("creating the data directory: %w", err)
 	}
 
-	return &Process{
+	p := &Process{
 		settings: settings,
 		specName: opts.SpecName,
 		binary:   binary,
@@ -165,7 +178,87 @@ func New(opts runner.HarnessOptions, settings Settings) (*Process, error) {
 			// admin server's graceful shutdown wait on the test client.
 			Transport: &http.Transport{DisableKeepAlives: true},
 		},
-	}, nil
+	}
+
+	if err := p.prepareTLS(); err != nil {
+		_ = os.RemoveAll(root)
+		return nil, err
+	}
+
+	return p, nil
+}
+
+// prepareTLS generates the spec's certificate, when the spec asked for TLS.
+//
+// The pair is generated once per harness rather than per launch, so a restart
+// serves the same certificate and a rotation scenario's replacement is not
+// undone by one. The paths are then forced into the config the server is given,
+// exactly as the ports are: a spec that chose its own would be writing outside
+// the directory the harness cleans up.
+func (p *Process) prepareTLS() error {
+	if !tlsRequested(p.config) {
+		return nil
+	}
+
+	certFile, keyFile, err := certs.Write(filepath.Join(p.root, "certs"), "atlascache-e2e")
+	if err != nil {
+		return err
+	}
+
+	p.tls = true
+	p.certFile = certFile
+	p.keyFile = keyFile
+	p.config = withTLSPaths(p.config, certFile, keyFile)
+	p.logs.Printf("generated a TLS certificate for this run: %s", certFile)
+
+	return nil
+}
+
+// TLSEnabled reports whether the server under test is serving TLS.
+func (p *Process) TLSEnabled() bool { return p.tls }
+
+// CertPaths returns the certificate and key the server was given. A rotation
+// scenario writes over these.
+func (p *Process) CertPaths() (certFile, keyFile string) { return p.certFile, p.keyFile }
+
+// ClientTLSConfig is what a scenario dialing its own connection should verify
+// against: every certificate this harness has seen, and nothing else.
+func (p *Process) ClientTLSConfig() (*tls.Config, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.tlsConfigLocked()
+}
+
+// tlsConfigLocked builds the client configuration, folding in the certificate
+// currently on disk. The caller holds the lock.
+//
+// Certificates already seen are kept: during a rotation the file on disk may be
+// the new certificate while a connection is still being made against the old
+// one, and after a *failed* rotation the file is not a certificate at all. A
+// client that trusted only the current file would fail for reasons that are the
+// test rig's rather than the server's.
+func (p *Process) tlsConfigLocked() (*tls.Config, error) {
+	if pemBytes, err := certs.ReadCertificate(p.certFile); err == nil {
+		if !p.alreadyTrusted(pemBytes) {
+			p.trusted = append(p.trusted, pemBytes)
+		}
+	} else {
+		p.logs.Printf("could not read %s (%v); trusting the certificates seen so far", p.certFile, err)
+	}
+
+	if len(p.trusted) == 0 {
+		return nil, fmt.Errorf("no usable certificate has been seen at %s", p.certFile)
+	}
+	return certs.ClientConfig(p.trusted...)
+}
+
+func (p *Process) alreadyTrusted(pemBytes []byte) bool {
+	for _, known := range p.trusted {
+		if string(known) == string(pemBytes) {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveBinary checks the server binary exists and is executable before any
@@ -469,12 +562,28 @@ func (p *Process) connect(ctx context.Context) (*client.Client, bool, error) {
 	if p.conn != nil {
 		return p.conn, true, nil
 	}
-	conn, err := client.Dial(ctx, p.clientAddr)
+
+	conn, err := p.dial(ctx)
 	if err != nil {
 		return nil, false, err
 	}
 	p.conn = conn
 	return conn, false, nil
+}
+
+// dial opens a connection of whatever kind the server is serving. A spec that
+// enabled TLS gets a verified TLS connection and says nothing about it; the
+// steps it runs are identical either way.
+func (p *Process) dial(ctx context.Context) (*client.Client, error) {
+	if !p.tls {
+		return client.Dial(ctx, p.clientAddr)
+	}
+
+	cfg, err := p.tlsConfigLocked()
+	if err != nil {
+		return nil, err
+	}
+	return client.DialTLS(ctx, p.clientAddr, cfg)
 }
 
 func (p *Process) dropConn() {

@@ -1,0 +1,46 @@
+version: 1
+name: config-ttl-lazy-only
+tier: full
+feature: FEAT-0012
+issue: ISSUE-0017
+description: >
+  The other legitimate half of ISSUE-0017: active expiration off, lazy
+  expiration on. The server starts, and an expired key is reclaimed when it is
+  read.
+
+  Only the combination of the two flags is broken. A validation that refused
+  either one on its own would be refusing a configuration people legitimately
+  run -- a node that would rather spend nothing on background sweeps.
+
+config:
+  storage:
+    shard_count: 1
+  ttl:
+    active_expiration: false
+    lazy_expiration: true
+
+steps:
+  - cmd: PING
+    expect: PONG
+
+  - cmd: SET lazy:key v EX 1
+    expect: OK
+
+  - cmd: GET lazy:key
+    expect: v
+
+  - sleep: 1500ms
+
+  # Nothing has swept in the background -- the wheel is not running. The read
+  # is what both reports the miss and reclaims the entry.
+  - cmd: GET lazy:key
+    expect: NIL
+
+  - cmd: EXISTS lazy:key
+    expect: 0
+
+  - cmd: SET lazy:key2 v
+    expect: OK
+
+  - cmd: GET lazy:key2
+    expect: v

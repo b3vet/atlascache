@@ -1,9 +1,12 @@
-.PHONY: build build-e2e test tidy-check fuzz lint bench clean fmt vet cover check deps tools e2e e2e-smoke e2e-full e2e-soak phase-check dev-index help
+.PHONY: build build-e2e test tidy-check fuzz lint bench clean fmt vet cover check deps tools e2e e2e-smoke e2e-full e2e-soak phase-check dev-index dev-certs help
 
 BINARY_NAME := atlascache
 BUILD_DIR   := bin
 GO          := go
 E2E_DIR     := test/e2e
+# Where `make dev-certs` writes. Gitignored: a committed test certificate gets
+# copied into production with depressing regularity, and it expires.
+CERT_DIR    := certs
 # Keep in step with .github/workflows/ci.yml
 GOLANGCI_VERSION := 2.12.2
 VERSION     := $(shell cat VERSION 2>/dev/null || echo "0.0.0-unknown")
@@ -86,6 +89,25 @@ phase-check:
 ## dev-index: regenerate dev/INDEX.md from front-matter
 dev-index:
 	$(GO) run ./tools/devindex
+
+## dev-certs: generate a self-signed localhost certificate and key for local TLS
+# For development only. The E2E suite does not use these -- it generates its own
+# pair per run into a temp directory, so nothing under test depends on a file
+# somebody has to remember to create, or on one that quietly expired.
+dev-certs:
+	@command -v openssl >/dev/null 2>&1 || { echo "openssl is required for dev-certs"; exit 1; }
+	@mkdir -p $(CERT_DIR)
+	@openssl req -x509 -newkey rsa:2048 -sha256 -days 365 -nodes \
+		-keyout $(CERT_DIR)/server.key -out $(CERT_DIR)/server.crt \
+		-subj "/CN=localhost/O=AtlasCache Development" \
+		-addext "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1" >/dev/null 2>&1
+	@chmod 600 $(CERT_DIR)/server.key
+	@echo "wrote $(CERT_DIR)/server.crt and $(CERT_DIR)/server.key (self-signed, localhost, 365 days)"
+	@echo "enable them with:"
+	@echo "  tls:"
+	@echo "    enabled: true"
+	@echo "    cert_file: \"$(CERT_DIR)/server.crt\""
+	@echo "    key_file: \"$(CERT_DIR)/server.key\""
 
 ## check: fmt, vet, lint, test
 check: fmt vet lint test

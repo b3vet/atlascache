@@ -15,7 +15,8 @@ lands in P6 (FEAT-0048, ADR-0028).
 |---------|-------|
 | `PING [message]` | `+PONG`, or the message as a bulk string |
 | `QUIT` | `+OK`, then the connection closes |
-| `HELLO [2]` | Server properties; any other version is `-NOPROTO` |
+| `HELLO [2] [AUTH user pass]` | Server properties; any other version is `-NOPROTO` |
+| `AUTH [username] password` | `+OK`, or `-WRONGPASS`; `-ERR` when no password is set |
 | `SET key value [EX s \| PX ms]` | `+OK` |
 | `SETNX key value` | `:1` if stored, `:0` if a live key was in the way |
 | `GET key` | The value, or the null bulk string on a miss |
@@ -37,6 +38,45 @@ null bulk string, because clients read null as "not cached" and an error as
 
 An argument error is a reply, not a hang-up. A wrong argument count, a bad
 option and an unknown command all leave the connection usable.
+
+### Authentication
+
+Authentication is off by default (ADR-0009). The server says so at startup,
+naming what it costs, and every command is served to anyone who can reach the
+port.
+
+With `auth.enabled` set, one shared token guards the connection (ADR-0020):
+
+| Invocation | Reply |
+|-----------|-------|
+| `AUTH <token>` | `+OK` |
+| `AUTH default <token>` | `+OK`; `default` is the only username there is |
+| `AUTH <other> <token>` | `-WRONGPASS invalid username-password pair` |
+| `HELLO 2 AUTH default <token>` | Server properties, and the connection is authenticated |
+| Any other command first | `-NOAUTH Authentication required` |
+| `AUTH` with no password set | `-ERR Client sent AUTH, but no password is set` |
+
+`AUTH`, `HELLO`, `PING` and `QUIT` are the only commands served before
+authenticating. Authentication is per-connection and ends with the connection.
+A wrong token is answered and not hung up on, and an unknown command from an
+unauthenticated client is answered `-NOAUTH` rather than with the name of a
+command that does not exist.
+
+Rotating `auth.token` in the config file takes effect without a restart, for
+authentications made after it; connections that have already authenticated are
+left alone.
+
+### TLS
+
+TLS is off by default too, and the same startup warning applies. With
+`tls.enabled` set, the client port speaks TLS 1.3 and nothing older — there is
+no configurable floor, because an adjustable one is the one that gets lowered.
+A plaintext client connecting to a TLS port is refused rather than left waiting.
+
+Certificate and key are re-read when the files change, so a renewal needs no
+restart, and a replacement that does not parse is rejected with the running
+certificate left in place. Connections established before a rotation keep the
+certificate they handshook with.
 
 ### `EXISTS` counts duplicates
 
@@ -180,6 +220,9 @@ the server would make them reject commands the server accepts.
 | `INFO` `redis_version` | Present | Absent; `atlascache_version` instead |
 | Inline commands ending `\n` | Accepted | Rejected with `ERR Protocol error: expected CRLF line terminator` |
 | Command set | Several hundred | The table above |
+| `PING` before `AUTH` | `-NOAUTH` | Served, so health checks and pools work |
+| `AUTH` error text | Ends "or user is disabled." / "Did you mean...?" | The shorter forms in the table above |
+| TLS versions | 1.2 and 1.3, configurable | 1.3 only, not configurable |
 
 Empty keys are **not** a divergence. `SET "" v` works, and the empty key behaves
 like any other (ISSUE-0013).

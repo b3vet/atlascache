@@ -191,7 +191,7 @@ func TestNewFailsOnBusyPort(t *testing.T) {
 }
 
 func TestTransportInterfaceSatisfied(t *testing.T) {
-	transport, err := newNetTransport(context.Background(), "127.0.0.1:0", zerolog.Nop())
+	transport, err := newNetTransport(context.Background(), "127.0.0.1:0", zerolog.Nop(), nil)
 	require.NoError(t, err)
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)

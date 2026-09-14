@@ -67,6 +67,14 @@ func run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
+	// Before anything binds or starts: a TLS configuration that cannot be
+	// honored must stop the process, not degrade it to plaintext (FEAT-0023).
+	sec, err := newSecurity(cfg, logging.WithComponent("security"))
+	if err != nil {
+		log.Error().Err(err).Msg("failed to load the TLS certificate")
+		return 1
+	}
+
 	cache, err := newCore(cfg)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to build the storage engine")
@@ -84,7 +92,7 @@ func run() int {
 	// The engine reaches the server through the keyspace seam, so the transport
 	// layer holds no storage types (FEAT-0017).
 	store := keyspace{engine: cache.engine, procmem: procmem}
-	srv, err := server.New(ctx, cfg.ClientAddr(), logging.WithComponent("server"), store)
+	srv, err := server.New(ctx, cfg.ClientAddr(), logging.WithComponent("server"), store, sec.options()...)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to bind client port")
 		return 1
@@ -105,7 +113,7 @@ func run() int {
 
 	// Hot-reload is best-effort: a node that cannot watch its config file still
 	// serves, it just needs a restart to pick up a policy change.
-	watcher := watchConfig(configFile, cache, log)
+	watcher := watchConfig(configFile, cache, sec, log)
 	if watcher != nil {
 		defer func() {
 			if err := watcher.Stop(); err != nil {
@@ -270,7 +278,7 @@ func (c *core) applyConfig(cfg *config.Config, log zerolog.Logger) {
 // watchConfig starts the config watcher, returning nil when there is nothing to
 // watch or the watch could not be established. Neither is fatal: hot-reload is
 // a convenience, and the node runs the configuration it started with.
-func watchConfig(path string, c *core, log zerolog.Logger) *config.Watcher {
+func watchConfig(path string, c *core, sec *security, log zerolog.Logger) *config.Watcher {
 	if path == "" {
 		return nil
 	}
@@ -281,7 +289,19 @@ func watchConfig(path string, c *core, log zerolog.Logger) *config.Watcher {
 		return nil
 	}
 
-	watcher.OnChange(func(cfg *config.Config) { c.applyConfig(cfg, log) })
+	watcher.OnChange(func(cfg *config.Config) {
+		c.applyConfig(cfg, log)
+		if sec != nil {
+			sec.applyConfig(cfg, log)
+		}
+	})
+
+	// The certificate files are watched separately from the config file: they
+	// change on their own schedule — every 90 days with Let's Encrypt, more
+	// often elsewhere — and nothing in the config file changes when they do.
+	if sec != nil {
+		sec.watchCertificates(watcher, log)
+	}
 
 	if err := watcher.Start(); err != nil {
 		log.Warn().Err(err).Msg("config hot-reload unavailable")
@@ -355,12 +375,32 @@ func logBanner(log zerolog.Logger, cfg *config.Config, configFile, clientAddr, a
 		Int("ttl_batch_size", cfg.TTL.BatchSize).
 		Bool("ttl_active_expiration", cfg.TTL.ActiveExpiration).
 		Bool("ttl_lazy_expiration", cfg.TTL.LazyExpiration).
+		Bool("tls_enabled", cfg.TLS.Enabled).
+		Bool("auth_enabled", cfg.Auth.Enabled).
 		Str("log_level", cfg.Logging.Level).
 		Msg("atlascache starting")
+
+	logExposure(log, cfg)
 
 	if !cfg.AdminIsLoopback() {
 		log.Warn().
 			Str("admin_addr", adminAddr).
 			Msg("admin API is not bound to loopback — it is unauthenticated and reachable from other hosts")
+	}
+}
+
+// logExposure names what is exposed by the defaults, which ADR-0009 requires
+// and P0 could not do because neither config section existed yet.
+//
+// The wording names the consequence rather than the setting. "tls.enabled is
+// false" tells an operator what they already typed; "traffic is unencrypted"
+// tells them what it costs, and that is the difference between a warning that
+// is acted on and one that is scrolled past.
+func logExposure(log zerolog.Logger, cfg *config.Config) {
+	if !cfg.TLS.Enabled {
+		log.Warn().Msg("TLS disabled — traffic is unencrypted. Do not use in production.")
+	}
+	if !cfg.Auth.Enabled {
+		log.Warn().Msg("auth disabled — any client that can reach this port has full access.")
 	}
 }

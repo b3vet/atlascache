@@ -20,6 +20,8 @@ type Config struct {
 	TTL      TTLConfig      `mapstructure:"ttl"`
 	Eviction EvictionConfig `mapstructure:"eviction"`
 	Logging  LoggingConfig  `mapstructure:"logging"`
+	TLS      TLSConfig      `mapstructure:"tls"`
+	Auth     AuthConfig     `mapstructure:"auth"`
 }
 
 // NodeConfig contains node identification settings
@@ -39,6 +41,37 @@ type ServerConfig struct {
 type AdminConfig struct {
 	BindAddr string `mapstructure:"bind_addr"` // Loopback by default (ADR-0023)
 	Port     int    `mapstructure:"port"`      // Admin HTTP port
+}
+
+// TLSConfig contains client-facing TLS settings.
+//
+// Disabled by default (ADR-0009): the first run needs no certificates, and the
+// startup warning names what that costs. There is deliberately no minimum
+// version setting — the floor is TLS 1.3 and offering 1.2 would invite a
+// deployment that quietly used it (FEAT-0023).
+type TLSConfig struct {
+	Enabled  bool   `mapstructure:"enabled"`   // false = plaintext, with a startup warning
+	CertFile string `mapstructure:"cert_file"` // PEM certificate chain, leaf first
+	KeyFile  string `mapstructure:"key_file"`  // PEM private key for cert_file
+}
+
+// AuthConfig contains client authentication settings.
+//
+// One shared token (ADR-0020), disabled by default (ADR-0009). The token is
+// never logged, at any level, so nothing here is safe to print by reflection —
+// see Redacted.
+type AuthConfig struct {
+	Enabled bool   `mapstructure:"enabled"` // false = open port, with a startup warning
+	Token   string `mapstructure:"token"`   // the shared secret AUTH compares against
+}
+
+// Redacted renders the auth configuration without its secret, so a config dump
+// or a debug log cannot leak the token by accident.
+func (c AuthConfig) Redacted() AuthConfig {
+	if c.Token != "" {
+		c.Token = "<redacted>"
+	}
+	return c
 }
 
 // StorageConfig contains storage engine settings
@@ -104,6 +137,17 @@ func Defaults() *Config {
 		Logging: LoggingConfig{
 			Level:  "info",
 			Format: "json",
+		},
+		// Both security features ship disabled (ADR-0009) so the first run
+		// needs no setup. The cost is named in a startup warning, not hidden.
+		TLS: TLSConfig{
+			Enabled:  false,
+			CertFile: "",
+			KeyFile:  "",
+		},
+		Auth: AuthConfig{
+			Enabled: false,
+			Token:   "",
 		},
 	}
 }

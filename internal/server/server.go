@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"net"
@@ -10,6 +11,34 @@ import (
 
 	"github.com/b3vet/atlascache/internal/protocol"
 )
+
+// Option configures a server at construction. Both of the P2 security features
+// arrive this way rather than as constructor parameters, so that the common
+// case — neither enabled, which is the default (ADR-0009) — stays a four
+// argument call.
+type Option func(*options)
+
+type options struct {
+	tls  *tls.Config
+	auth *Authenticator
+}
+
+// WithTLS serves the client port over TLS.
+//
+// The configuration is applied to the listener, inside the transport. Nothing
+// above the transport is told about it: a handler cannot discover whether its
+// connection is encrypted, which is what keeps the gnet transport in P8 from
+// having to reproduce the leak (ADR-0007).
+func WithTLS(cfg *tls.Config) Option {
+	return func(o *options) { o.tls = cfg }
+}
+
+// WithAuth requires clients to authenticate before running commands outside the
+// pre-auth allowlist. Enforcement is in dispatch, not in the handlers — see
+// session.dispatch.
+func WithAuth(auth *Authenticator) Option {
+	return func(o *options) { o.auth = auth }
+}
 
 // Server serves RESP commands over a Transport, against the keyspace it is
 // given. The skeleton answered PING and QUIT only (FEAT-0010); P1 adds the five
@@ -22,6 +51,11 @@ type Server struct {
 	addr      string
 	log       zerolog.Logger
 
+	// auth is the gate every command passes through. It is never nil; a server
+	// built without WithAuth gets one with authentication disabled, so the
+	// dispatch path has no special case to forget.
+	auth *Authenticator
+
 	// conns is the connection accounting INFO reports, and the source of the
 	// per-connection ids SCAN cursors are scoped to. See commands.go.
 	conns connCounters
@@ -32,12 +66,20 @@ type Server struct {
 // The store is required: a server with no keyspace could answer PING and
 // nothing else, which is a wiring mistake worth failing at startup rather than
 // discovering one GET later.
-func New(ctx context.Context, addr string, log zerolog.Logger, store Store) (*Server, error) {
+func New(ctx context.Context, addr string, log zerolog.Logger, store Store, opts ...Option) (*Server, error) {
 	if store == nil {
 		return nil, errors.New("server: a keyspace is required")
 	}
 
-	transport, err := newNetTransport(ctx, addr, log)
+	var settings options
+	for _, opt := range opts {
+		opt(&settings)
+	}
+	if settings.auth == nil {
+		settings.auth = NewAuthenticator(false, "")
+	}
+
+	transport, err := newNetTransport(ctx, addr, log, settings.tls)
 	if err != nil {
 		return nil, err
 	}
@@ -48,6 +90,7 @@ func New(ctx context.Context, addr string, log zerolog.Logger, store Store) (*Se
 		store:     store,
 		addr:      transport.Addr(),
 		log:       log,
+		auth:      settings.auth,
 	}, nil
 }
 
@@ -76,7 +119,7 @@ func (s *Server) Handle(ctx context.Context, c Conn) {
 	// server: its id, and through it the SCAN cursors filed under that id.
 	// Closing it gives the snapshots back immediately instead of at the idle
 	// timeout, for a connection that can never come back to finish them.
-	sess := s.newSession()
+	sess := s.newSession(c.RemoteAddr())
 	defer sess.close()
 
 	for {

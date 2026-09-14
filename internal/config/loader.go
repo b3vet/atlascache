@@ -127,6 +127,15 @@ func (l *Loader) setDefaults() {
 	// Logging defaults
 	l.v.SetDefault("logging.level", defaults.Logging.Level)
 	l.v.SetDefault("logging.format", defaults.Logging.Format)
+
+	// TLS defaults (ADR-0009: shipped, and off)
+	l.v.SetDefault("tls.enabled", defaults.TLS.Enabled)
+	l.v.SetDefault("tls.cert_file", defaults.TLS.CertFile)
+	l.v.SetDefault("tls.key_file", defaults.TLS.KeyFile)
+
+	// Auth defaults (ADR-0009: shipped, and off)
+	l.v.SetDefault("auth.enabled", defaults.Auth.Enabled)
+	l.v.SetDefault("auth.token", defaults.Auth.Token)
 }
 
 // buildConfig creates a Config from viper values

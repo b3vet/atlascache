@@ -1,0 +1,78 @@
+version: 1
+name: auth-required
+tier: full
+feature: FEAT-0022
+description: >
+  With auth enabled, every command outside the pre-auth allowlist is refused
+  with -NOAUTH until the connection authenticates, and works afterwards.
+
+  The gate is in dispatch rather than in the handlers, so this is one check and
+  not fourteen. The test that walks the whole dispatch table lives in
+  internal/server, where it can read the table itself; this asserts the same
+  thing through a socket, against a real process, where a connection that
+  somehow arrived pre-authenticated would also show up.
+
+config:
+  auth:
+    enabled: true
+    token: "e2e-auth-required-9d41c7a2"
+
+steps:
+  # PING is on the allowlist: connection pools and health checks send it before
+  # anything else. Note this is a deliberate divergence from Redis, which does
+  # gate PING.
+  - cmd: PING
+    expect: PONG
+
+  # HELLO too, because a client negotiates before it authenticates.
+  - cmd: HELLO
+    expect_field:
+      server: atlascache
+      proto: 2
+
+  - scenario: auth_gates_every_command
+
+  - cmd: GET auth:key
+    expect_error: NOAUTH Authentication required
+
+  - cmd: SET auth:key v
+    expect_error: NOAUTH Authentication required
+
+  # A wrong token is WRONGPASS, and leaves the connection usable: a client that
+  # mistyped a password has not lost the right to try again.
+  - cmd: AUTH not-the-token
+    expect_error: WRONGPASS invalid username-password pair
+
+  - cmd: GET auth:key
+    expect_error: NOAUTH Authentication required
+
+  - cmd: AUTH e2e-auth-required-9d41c7a2
+    expect: OK
+
+  # Through the gate: the same connection now serves everything.
+  - cmd: SET auth:key v1
+    expect: OK
+
+  - cmd: GET auth:key
+    expect: v1
+
+  - cmd: TTL auth:key
+    expect: -1
+
+  - cmd: DBSIZE
+    expect_value: ">= 1"
+
+  - cmd: DEL auth:key
+    expect: 1
+
+  # The token is never logged, at any level, on failure or on success.
+  - scenario: auth_token_never_logged
+
+  # QUIT is on the allowlist, and the connection the harness opens next is a
+  # new one, which starts unauthenticated all over again: auth state belongs to
+  # the connection and dies with it.
+  - cmd: QUIT
+    expect: OK
+
+  - cmd: GET auth:key
+    expect_error: NOAUTH Authentication required

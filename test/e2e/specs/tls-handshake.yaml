@@ -1,0 +1,50 @@
+version: 1
+name: tls-handshake
+tier: full
+feature: FEAT-0023
+description: >
+  The encrypted path works end to end, and only the encrypted path works. A TLS
+  1.3 client connects, verifies the certificate properly and runs commands; a
+  plaintext client is refused quickly rather than left hanging; and TLS 1.2 and
+  below are refused outright, because a configurable floor is one somebody
+  lowers.
+
+  The certificate is generated per run into the harness's temp directory. There
+  are deliberately no certificate fixtures in this repository: committed test
+  certificates get copied into production, and they expire.
+
+config:
+  tls:
+    # cert_file and key_file are the harness's, like the ports and the data
+    # directory. A spec only says that it wants TLS.
+    enabled: true
+
+steps:
+  # Every step below this one runs over TLS: the harness dials the way the
+  # server listens, and the spec cannot tell the difference. That is the point
+  # of the transport seam -- no handler knows either.
+  - cmd: PING
+    expect: PONG
+
+  - cmd: SET tls:basic hello
+    expect: OK
+
+  - cmd: GET tls:basic
+    expect: hello
+
+  - scenario: tls_connection_is_encrypted
+
+  - scenario: tls_refuses_old_versions
+
+  - scenario: tls_rejects_plaintext
+
+  # tls.enabled with a certificate that is not there must exit non-zero naming
+  # the file. Silently serving plaintext would be the worst outcome available.
+  - scenario: tls_missing_certificate_fails_fast
+
+  # The refusals above were other connections; this one is still good.
+  - cmd: GET tls:basic
+    expect: hello
+
+  - cmd: DEL tls:basic
+    expect: 1

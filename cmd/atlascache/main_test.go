@@ -204,11 +204,11 @@ func TestNewCoreRejectsBadConfiguration(t *testing.T) {
 
 func TestWatchConfig(t *testing.T) {
 	t.Run("no config file, no watcher", func(t *testing.T) {
-		assert.Nil(t, watchConfig("", nil, zerolog.Nop()))
+		assert.Nil(t, watchConfig("", nil, nil, zerolog.Nop()))
 	})
 
 	t.Run("an unreadable path is not fatal", func(t *testing.T) {
-		assert.Nil(t, watchConfig(filepath.Join(t.TempDir(), "absent.yaml"), nil, zerolog.Nop()))
+		assert.Nil(t, watchConfig(filepath.Join(t.TempDir(), "absent.yaml"), nil, nil, zerolog.Nop()))
 	})
 
 	t.Run("a real file is watched and applied", func(t *testing.T) {
@@ -216,7 +216,7 @@ func TestWatchConfig(t *testing.T) {
 		require.NoError(t, os.WriteFile(path, []byte("eviction:\n  policy: \"lru\"\n"), 0o600))
 
 		c := startedCore(t, testConfig())
-		watcher := watchConfig(path, c, zerolog.Nop())
+		watcher := watchConfig(path, c, nil, zerolog.Nop())
 		require.NotNil(t, watcher)
 		defer func() { assert.NoError(t, watcher.Stop()) }()
 

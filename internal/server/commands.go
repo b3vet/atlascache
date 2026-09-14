@@ -175,6 +175,7 @@ const (
 	cmdTTL    = "TTL"
 	cmdExpire = "EXPIRE"
 	cmdHello  = "HELLO"
+	cmdAuth   = "AUTH"
 
 	cmdStats   = "STATS"
 	cmdInfo    = "INFO"
@@ -249,6 +250,10 @@ var commands = map[string]commandSpec{
 	// how to fall back from, rather than an arity error it does not.
 	cmdHello: {minArgs: 0, maxArgs: unbounded, handler: (*session).hello},
 
+	// AUTH takes one argument (the token) or two (a username and the token);
+	// both forms are in use by current clients (ADR-0020).
+	cmdAuth: {minArgs: 1, maxArgs: 2, handler: (*session).auth},
+
 	cmdStats:  {minArgs: 0, maxArgs: 0, handler: (*session).stats},
 	cmdDBSize: {minArgs: 0, maxArgs: 0, handler: (*session).dbsize},
 	cmdEcho:   {minArgs: 1, maxArgs: 1, handler: (*session).echo},
@@ -260,6 +265,28 @@ var commands = map[string]commandSpec{
 	// same empty array to all of them. See the handler for why that is better
 	// than a fabricated table.
 	cmdCommand: {minArgs: 0, maxArgs: unbounded, handler: (*session).command},
+}
+
+// noAuthCommands is the allowlist of commands a connection may run before it
+// has authenticated.
+//
+// It is deliberately a set beside the dispatch table rather than a flag on each
+// row: the gate reads this one map, so a command added to the table above is
+// gated by default. The opposite arrangement — a check inside each handler, or
+// an opt-in flag — is a list that will eventually be missed, and a missed entry
+// is a silent authentication bypass on one command (FEAT-0022).
+//
+// AUTH is here because it is how a connection authenticates. HELLO is here
+// because clients negotiate the protocol before authenticating. QUIT is here
+// because refusing to let an unauthenticated client hang up cleanly serves
+// nobody. PING is here because health checks and connection pools send it
+// before anything else; note that Redis does *not* exempt PING, so a client
+// that relies on PING being refused will see a difference.
+var noAuthCommands = map[string]bool{
+	cmdAuth:  true,
+	cmdHello: true,
+	cmdPing:  true,
+	cmdQuit:  true,
 }
 
 // accepts reports whether the command was given a workable number of arguments.
@@ -294,14 +321,28 @@ type connCounters struct {
 type session struct {
 	srv *Server
 	id  uint64
+
+	// remoteAddr identifies the connection in the authentication log. It is the
+	// only thing about a failed AUTH that is ever recorded — never the token
+	// supplied, at any level (ADR-0020).
+	remoteAddr string
+
+	// authenticated is this connection's own state, which is why it lives here
+	// and not on the server. It is set by AUTH and by HELLO's AUTH option, and
+	// it goes away with the connection: there is nothing to clear on disconnect
+	// because there is nothing outside the session holding it.
+	//
+	// No lock: one connection is served by one goroutine, and this field is
+	// read and written by that goroutine only.
+	authenticated bool
 }
 
 // newSession registers a connection and returns its handle.
-func (s *Server) newSession() *session {
+func (s *Server) newSession(remoteAddr string) *session {
 	s.conns.connectionsReceived.Add(1)
 	s.conns.connected.Add(1)
 
-	return &session{srv: s, id: s.conns.nextID.Add(1)}
+	return &session{srv: s, id: s.conns.nextID.Add(1), remoteAddr: remoteAddr}
 }
 
 // close releases everything the connection was holding. The scan cursors are
@@ -328,13 +369,66 @@ func (s *session) dispatch(cmd protocol.Command) (protocol.Reply, bool) {
 
 	spec, known := commands[cmd.Name]
 	if !known {
+		// An unauthenticated client is told to authenticate rather than which
+		// commands exist. Redis does the same, and the reason is that the
+		// command table is a fingerprint: version, build, modules loaded.
+		if s.authRequired() {
+			return errNoAuth(), false
+		}
 		return protocol.Errorf("unknown command '%s'", cmd.Name), false
 	}
 	if !spec.accepts(len(cmd.Args)) {
 		return protocol.Errorf("wrong number of arguments for '%s' command", strings.ToLower(cmd.Name)), false
 	}
 
+	// The gate. One check, covering every row of the table above, with an
+	// explicit allowlist — see noAuthCommands for why it is not a per-handler
+	// check and not a per-row flag.
+	if s.authRequired() && !noAuthCommands[cmd.Name] {
+		return errNoAuth(), false
+	}
+
 	return spec.handler(s, cmd), spec.closes
+}
+
+// authRequired reports whether this connection still owes an AUTH.
+func (s *session) authRequired() bool {
+	return s.srv.auth.Required() && !s.authenticated
+}
+
+// auth authenticates the connection, accepting both argument forms.
+//
+// `AUTH <token>` is the legacy single-secret form; `AUTH default <token>` is
+// what a client written against Redis 6 ACLs sends, and many client libraries
+// now send it unconditionally. Both check the same shared token, and any
+// username other than "default" is refused explicitly (ADR-0020).
+func (s *session) auth(cmd protocol.Command) protocol.Reply {
+	var username, token []byte
+	if len(cmd.Args) == 2 {
+		username, token = cmd.Args[0], cmd.Args[1]
+	} else {
+		token = cmd.Args[0]
+	}
+
+	switch err := s.srv.auth.Verify(username, token); {
+	case err == nil:
+		s.authenticated = true
+		s.srv.log.Info().Str("remote_addr", s.remoteAddr).Msg("client authenticated")
+		return protocol.SimpleString("OK")
+
+	case errors.Is(err, ErrAuthDisabled):
+		// Redis's exact wording, which clients configured with a password
+		// against a passwordless server surface verbatim. Answering WRONGPASS
+		// instead would send an operator hunting for a mistyped secret.
+		return protocol.Errorf("Client sent AUTH, but no password is set")
+
+	default:
+		// The address and the outcome, never the token — not at debug, not
+		// anywhere. A log that records failed secrets is a log that leaks the
+		// successful ones the moment someone mistypes a trailing character.
+		s.srv.log.Warn().Str("remote_addr", s.remoteAddr).Msg("authentication failed")
+		return errWrongPass()
+	}
 }
 
 // ping answers PONG, or echoes its argument as a bulk string.
@@ -387,16 +481,41 @@ func (s *session) hello(cmd protocol.Command) protocol.Reply {
 		return errNoProto()
 	}
 
-	// AUTH and SETNAME arrive with FEAT-0022 and FEAT-0024. Naming the option
-	// that was refused is what tells a client which of the two it was.
-	if len(cmd.Args) > 1 {
-		return protocol.Errorf("syntax error in HELLO option '%s'", cmd.Args[1])
+	if reply, ok := s.helloOptions(cmd.Args[1:]); !ok {
+		return reply
 	}
 
 	// Redis answers HELLO 2 with the same properties map as a bare HELLO, not a
 	// status reply. A client that asks for 2 and parses a map would otherwise
 	// break on a +OK it did not expect.
 	return helloProperties()
+}
+
+// helloOptions applies HELLO's option tail, reporting the reply to send in
+// place of the properties map when an option failed.
+//
+// AUTH is delegated to the AUTH handler rather than reimplemented, so there is
+// one place where a token is checked and one place that can be got wrong.
+// `HELLO 2 AUTH default <token>` is a client authenticating and negotiating in
+// a single round trip, which is why HELLO is on the pre-auth allowlist at all.
+func (s *session) helloOptions(args [][]byte) (protocol.Reply, bool) {
+	for i := 0; i < len(args); {
+		if strings.ToUpper(string(args[i])) == cmdAuth && len(args)-i >= 3 {
+			reply := s.auth(protocol.Command{Name: cmdAuth, Args: args[i+1 : i+3]})
+			if _, ok := reply.(protocol.SimpleString); !ok {
+				// WRONGPASS, or the no-password-set error. Either way the
+				// negotiation does not continue on a failed authentication.
+				return reply, false
+			}
+			i += 3
+			continue
+		}
+
+		// SETNAME arrives with FEAT-0024. Naming the option that was refused is
+		// what tells a client which of them it was.
+		return protocol.Errorf("syntax error in HELLO option '%s'", args[i]), false
+	}
+	return nil, true
 }
 
 // helloProperties is the map HELLO answers with when it is asked for no
@@ -805,6 +924,20 @@ func scanFailure(err error) protocol.Reply {
 	default:
 		return protocol.Errorf("%v", err)
 	}
+}
+
+// errNoAuth is what every gated command answers on an unauthenticated
+// connection. Clients switch on the NOAUTH prefix to know they must send AUTH,
+// as opposed to having sent something wrong.
+func errNoAuth() protocol.Reply {
+	return protocol.Error{Kind: "NOAUTH", Message: "Authentication required"}
+}
+
+// errWrongPass is the single answer to a bad token and to an unknown username.
+// It does not distinguish between them, because saying which half was wrong
+// would turn one guess into two.
+func errWrongPass() protocol.Reply {
+	return protocol.Error{Kind: "WRONGPASS", Message: "invalid username-password pair"}
 }
 
 // errNoProto is the documented fallback signal for a protocol version this

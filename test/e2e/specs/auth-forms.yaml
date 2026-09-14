@@ -1,0 +1,78 @@
+version: 1
+name: auth-forms
+tier: full
+feature: FEAT-0022
+description: >
+  Both AUTH argument forms authenticate against the one shared token
+  (ADR-0020), any username other than "default" is refused explicitly, and
+  HELLO carries the same credentials in one round trip.
+
+  The two-argument form exists because client libraries written against Redis 6
+  ACLs send it unconditionally with "default" in front. Refusing it would look
+  to them exactly like a wrong password.
+
+config:
+  auth:
+    enabled: true
+    token: "e2e-auth-forms-4b8e12f6"
+
+steps:
+  # The legacy single-secret form.
+  - cmd: AUTH e2e-auth-forms-4b8e12f6
+    expect: OK
+
+  - cmd: SET forms:one v
+    expect: OK
+
+  # A fresh connection: QUIT drops this one, and the next command dials again
+  # unauthenticated.
+  - cmd: QUIT
+    expect: OK
+
+  # The two-argument form, with the only username there is.
+  - cmd: AUTH default e2e-auth-forms-4b8e12f6
+    expect: OK
+
+  - cmd: GET forms:one
+    expect: v
+
+  - cmd: QUIT
+    expect: OK
+
+  # A username that is not "default" is refused even with the right token.
+  # Accepting it would imply a user model that does not exist; refusing it
+  # explicitly is what tells an operator there is none.
+  - cmd: AUTH admin e2e-auth-forms-4b8e12f6
+    expect_error: WRONGPASS invalid username-password pair
+
+  - cmd: AUTH default wrong-token
+    expect_error: WRONGPASS invalid username-password pair
+
+  - cmd: GET forms:one
+    expect_error: NOAUTH Authentication required
+
+  # HELLO 2 AUTH: negotiate and authenticate in one round trip. The reply is
+  # the properties map, as Redis answers HELLO 2, not a status.
+  - cmd: HELLO 2 AUTH default e2e-auth-forms-4b8e12f6
+    expect_field:
+      server: atlascache
+      proto: 2
+
+  - cmd: GET forms:one
+    expect: v
+
+  - cmd: QUIT
+    expect: OK
+
+  # A wrong token in HELLO is the same WRONGPASS, and leaves the connection
+  # gated rather than negotiated.
+  - cmd: HELLO 2 AUTH default wrong-token
+    expect_error: WRONGPASS invalid username-password pair
+
+  - cmd: GET forms:one
+    expect_error: NOAUTH Authentication required
+
+  # RESP3 is still refused before the credentials are even looked at: a client
+  # probing for RESP3 needs the reply it knows how to fall back from.
+  - cmd: HELLO 3 AUTH default e2e-auth-forms-4b8e12f6
+    expect_error: NOPROTO unsupported protocol version

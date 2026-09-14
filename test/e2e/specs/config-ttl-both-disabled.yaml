@@ -1,0 +1,51 @@
+version: 1
+name: config-ttl-both-disabled
+tier: full
+feature: FEAT-0012
+issue: ISSUE-0017
+description: >
+  Turning off both reclamation paths is refused at startup, naming both fields.
+
+  ttl.active_expiration and ttl.lazy_expiration are each legitimate on their
+  own, and each is supported and tested. Together they leave nothing to reclaim
+  an expired key: the wheel never runs and the read path never deletes, which
+  is ISSUE-0007 -- the unbounded leak P1 was largely built to fix -- reachable
+  again through two flags that each look harmless.
+
+  This server runs with lazy expiration off, which is one of the legitimate
+  halves, and reclaims through the wheel alone. config-ttl-lazy-only runs the
+  other half.
+
+config:
+  storage:
+    shard_count: 1
+  ttl:
+    check_interval: 50ms
+    active_expiration: true
+    lazy_expiration: false
+
+steps:
+  - cmd: PING
+    expect: PONG
+
+  # The combination is refused before anything binds, with both fields named.
+  - scenario: ttl_both_disabled_refused
+
+  # And this half of it works: nothing ever reads these keys, so the wheel is
+  # the only thing that can reclaim them.
+  - cmd: SET reclaim:a v EX 1
+    expect: OK
+
+  - cmd: SET reclaim:b v EX 1
+    expect: OK
+
+  - cmd: DBSIZE
+    expect_value: ">= 2"
+
+  - sleep: 2s
+
+  - cmd: DBSIZE
+    expect_value: "== 0"
+
+  - cmd: GET reclaim:a
+    expect: NIL

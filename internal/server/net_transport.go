@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -28,12 +29,20 @@ type netTransport struct {
 	wg    sync.WaitGroup
 }
 
-// newNetTransport binds addr immediately so bind failures surface at startup
-func newNetTransport(parent context.Context, addr string, log zerolog.Logger) (*netTransport, error) {
+// newNetTransport binds addr immediately so bind failures surface at startup.
+//
+// A non-nil tlsConfig wraps the listener, and that is the whole of TLS as far as
+// the rest of the server is concerned: the Conn a handler receives is the same
+// type either way, and nothing above this file can tell the difference
+// (ADR-0007, FEAT-0023).
+func newNetTransport(parent context.Context, addr string, log zerolog.Logger, tlsConfig *tls.Config) (*netTransport, error) {
 	var lc net.ListenConfig
 	ln, err := lc.Listen(parent, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("listen on %s: %w", addr, err)
+	}
+	if tlsConfig != nil {
+		ln = tls.NewListener(ln, tlsConfig)
 	}
 
 	ctx, cancel := context.WithCancel(parent)
@@ -78,6 +87,14 @@ func (t *netTransport) Serve(handler ConnHandler) error {
 					t.log.Debug().Err(err).Str("remote_addr", c.RemoteAddr()).Msg("connection close failed")
 				}
 			}()
+
+			// The handshake runs here rather than in the accept loop: it talks
+			// to the peer, and a peer that stalls mid-handshake would otherwise
+			// stall every other client waiting to be accepted.
+			if err := c.handshake(t.ctx); err != nil {
+				t.log.Debug().Err(err).Str("remote_addr", c.RemoteAddr()).Msg("TLS handshake failed")
+				return
+			}
 			handler.Handle(t.ctx, c)
 		}()
 	}
@@ -178,4 +195,29 @@ func (c *netConn) Close() error {
 // unblockReads expires the read deadline so a blocked Read returns at once
 func (c *netConn) unblockReads() error {
 	return c.raw.SetReadDeadline(time.Now())
+}
+
+// handshake completes the TLS handshake under a deadline, and does nothing at
+// all on a plaintext connection.
+//
+// Doing it here rather than letting the first Read trigger it buys two things: a
+// peer that opens a connection and never speaks is dropped instead of holding a
+// goroutine forever, and a plaintext client that has dialed a TLS port fails
+// immediately with a handshake error rather than hanging until something times
+// out. The failure is the transport's; no handler is ever started for it, so
+// none of this is visible above this file.
+func (c *netConn) handshake(ctx context.Context) error {
+	conn, ok := c.raw.(*tls.Conn)
+	if !ok {
+		return nil
+	}
+
+	if err := c.raw.SetDeadline(time.Now().Add(handshakeTimeout)); err != nil {
+		return err
+	}
+	if err := conn.HandshakeContext(ctx); err != nil {
+		return err
+	}
+	// Back to no deadline: a served connection may idle for as long as it likes.
+	return c.raw.SetDeadline(time.Time{})
 }

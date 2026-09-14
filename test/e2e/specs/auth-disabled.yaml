@@ -1,0 +1,34 @@
+version: 1
+name: auth-disabled
+tier: smoke
+feature: FEAT-0022
+description: >
+  The default configuration (ADR-0009): no token, nothing gated, and AUTH
+  answering the one error Redis answers.
+
+  That error matters more than it looks. A client configured with a password,
+  pointed at a server that has none, surfaces this string verbatim -- and
+  "WRONGPASS" instead would send an operator hunting for a mistyped secret that
+  was never wrong.
+
+steps:
+  - cmd: AUTH some-password
+    expect_error: ERR Client sent AUTH, but no password is set
+
+  - cmd: AUTH default some-password
+    expect_error: ERR Client sent AUTH, but no password is set
+
+  # HELLO's AUTH option goes through the same handler, so it answers the same
+  # thing rather than a syntax error.
+  - cmd: HELLO 2 AUTH default some-password
+    expect_error: ERR Client sent AUTH, but no password is set
+
+  # The connection is unharmed by any of it, and nothing is gated.
+  - cmd: SET open:key v
+    expect: OK
+
+  - cmd: GET open:key
+    expect: v
+
+  - cmd: DEL open:key
+    expect: 1

@@ -36,9 +36,21 @@ func (e *MultiValidationError) Error() string {
 	return fmt.Sprintf("multiple config errors:\n  - %s", strings.Join(msgs, "\n  - "))
 }
 
-// Validate checks if the configuration is valid
-const fieldAdminPort = "admin.port"
+// Field names used in more than one message. A combination check has to name
+// every field involved, since naming one of them does not say what to change.
+const (
+	fieldAdminPort = "admin.port"
+	fieldTTLActive = "ttl.active_expiration"
+	fieldTTLLazy   = "ttl.lazy_expiration"
+)
 
+// Validate checks whether the configuration is one the server can honor.
+//
+// Most checks are per-field, but not all: admin.port against server.client_port
+// and the two TTL reclamation flags are both defects only in combination, and a
+// per-field pass cannot see them. When adding a check, ask whether the field is
+// wrong on its own or only alongside another — the second kind is the one that
+// escapes review, which is how ISSUE-0017 reached a release.
 func Validate(cfg *Config) error {
 	var errs []*ValidationError
 
@@ -69,6 +81,16 @@ func Validate(cfg *Config) error {
 
 	// Validate logging config
 	if err := validateLogging(&cfg.Logging); err != nil {
+		errs = append(errs, err...)
+	}
+
+	// Validate TLS config
+	if err := validateTLS(&cfg.TLS); err != nil {
+		errs = append(errs, err...)
+	}
+
+	// Validate auth config
+	if err := validateAuth(&cfg.Auth); err != nil {
 		errs = append(errs, err...)
 	}
 
@@ -213,7 +235,66 @@ func validateTTL(cfg *TTLConfig) []*ValidationError {
 		})
 	}
 
+	// The combination check. Each flag is individually legitimate — active-only
+	// and lazy-only are both supported and both tested — but with both off
+	// nothing reclaims an expired key: the wheel never runs and the read path
+	// never deletes. That is ISSUE-0007, the unbounded leak P1 was built to
+	// fix, reachable again through two flags that each look harmless
+	// (ISSUE-0017). The configuration has no valid use, so refusing it costs
+	// nothing and a warning would leave the leak reachable.
+	if !cfg.ActiveExpiration && !cfg.LazyExpiration {
+		errs = append(errs, &ValidationError{
+			Field: fieldTTLActive,
+			Message: "must not be false while " + fieldTTLLazy + " is also false: " +
+				"with both disabled nothing reclaims an expired key and memory grows without bound; " +
+				"leave " + fieldTTLActive + " or " + fieldTTLLazy + " enabled",
+		})
+	}
+
 	return errs
+}
+
+// validateTLS checks the client-facing TLS settings.
+//
+// Only the shape is checked here: whether the files exist and hold a usable
+// pair is settled at startup, by loading them, so the message can name the file
+// and the exact failure. Validation stays free of I/O, which matters because
+// hot-reload runs it on every config change.
+func validateTLS(cfg *TLSConfig) []*ValidationError {
+	if !cfg.Enabled {
+		// The paths are allowed to be set while TLS is off, so turning it on is
+		// one flag rather than three.
+		return nil
+	}
+
+	var errs []*ValidationError
+	if strings.TrimSpace(cfg.CertFile) == "" {
+		errs = append(errs, &ValidationError{
+			Field:   "tls.cert_file",
+			Message: "must be set when tls.enabled is true",
+		})
+	}
+	if strings.TrimSpace(cfg.KeyFile) == "" {
+		errs = append(errs, &ValidationError{
+			Field:   "tls.key_file",
+			Message: "must be set when tls.enabled is true",
+		})
+	}
+	return errs
+}
+
+// validateAuth checks the authentication settings.
+//
+// An enabled auth with no token would accept `AUTH ""` from anyone, which is
+// indistinguishable from no auth at all while looking like protection.
+func validateAuth(cfg *AuthConfig) []*ValidationError {
+	if cfg.Enabled && cfg.Token == "" {
+		return []*ValidationError{{
+			Field:   "auth.token",
+			Message: "must be set when auth.enabled is true",
+		}}
+	}
+	return nil
 }
 
 func validateEviction(cfg *EvictionConfig) []*ValidationError {

@@ -18,6 +18,7 @@ package client
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -52,6 +53,40 @@ func Dial(ctx context.Context, addr string) (*Client, error) {
 		r:    bufio.NewReaderSize(conn, maxLineLength),
 		w:    bufio.NewWriter(conn),
 	}, nil
+}
+
+// DialTLS opens a TLS connection to addr, verifying the server against cfg.
+//
+// The handshake happens here rather than on the first command, so a certificate
+// problem is reported as a dial failure — which is what it is — instead of
+// surfacing later as an unreadable reply.
+func DialTLS(ctx context.Context, addr string, cfg *tls.Config) (*Client, error) {
+	dialer := &tls.Dialer{Config: cfg}
+
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, &ConnError{Op: "dial " + addr + " over TLS", Err: err}
+	}
+
+	return &Client{
+		conn: conn,
+		r:    bufio.NewReaderSize(conn, maxLineLength),
+		w:    bufio.NewWriter(conn),
+	}, nil
+}
+
+// ConnectionState reports the TLS state of the connection, and false for a
+// plaintext one. It is how a test asserts which protocol version was negotiated
+// and which certificate was presented.
+func (c *Client) ConnectionState() (tls.ConnectionState, bool) {
+	if c == nil || c.conn == nil {
+		return tls.ConnectionState{}, false
+	}
+	conn, ok := c.conn.(*tls.Conn)
+	if !ok {
+		return tls.ConnectionState{}, false
+	}
+	return conn.ConnectionState(), true
 }
 
 // Close closes the connection. It is safe to call more than once.

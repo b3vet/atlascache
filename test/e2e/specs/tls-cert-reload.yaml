@@ -1,0 +1,42 @@
+version: 1
+name: tls-cert-reload
+tier: full
+feature: FEAT-0023
+description: >
+  Certificate rotation, which is the routine operation this feature has to
+  survive: certificates are renewed every 90 days with Let's Encrypt and more
+  often elsewhere, and a renewal that needs a restart is an outage on a
+  schedule.
+
+  Three ways it goes wrong, all asserted here. The server does not notice the
+  new certificate. The swap drops connections that were already open. Or -- the
+  expensive one -- the server swaps in a broken file and can no longer complete
+  a handshake, at the exact moment nobody is watching.
+
+config:
+  tls:
+    enabled: true
+
+steps:
+  - cmd: PING
+    expect: PONG
+
+  - cmd: SET reload:key before
+    expect: OK
+
+  # Rotate mid-run: new connections get the new certificate, the connection
+  # opened before the rotation is undisturbed, an invalid replacement is
+  # rejected with the running certificate left in place, and the valid renewal
+  # after that one is still picked up.
+  - scenario: tls_rotates_certificates
+
+  # The keyspace went through all of it untouched: a certificate swap is a
+  # transport event and reaches nothing above the listener.
+  - cmd: GET reload:key
+    expect: before
+
+  - cmd: SET reload:key after
+    expect: OK
+
+  - cmd: GET reload:key
+    expect: after

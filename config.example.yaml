@@ -54,6 +54,38 @@ eviction:
   # Number of keys to sample for eviction victim selection
   sample_size: 5
 
+# TLS configuration
+#
+# Disabled by default so the first run needs no setup. The server says so at
+# startup, once per boot, naming what it costs -- do not run this way in
+# production. Enabling it takes a certificate and its key, nothing else: the
+# protocol floor is TLS 1.3 and is deliberately not configurable, because an
+# adjustable floor is one somebody lowers.
+#
+# `make dev-certs` writes a self-signed localhost pair into certs/ for local
+# use. Certificate and key are re-read when the files change, so a renewal
+# needs no restart; a replacement that does not parse is rejected and the
+# running certificate keeps serving.
+tls:
+  enabled: false
+  # PEM certificate chain, leaf first
+  cert_file: ""
+  # PEM private key for cert_file
+  key_file: ""
+
+# Authentication configuration
+#
+# Disabled by default, with the same warning at startup: any client that can
+# reach the port has full access. One shared token, checked in constant time;
+# clients send either `AUTH <token>` or `AUTH default <token>`. The token is
+# re-read when the config file changes, and a rotation leaves connections that
+# have already authenticated alone.
+auth:
+  enabled: false
+  # The shared secret. Keep this file readable only by the server user: a token
+  # in a world-readable config is not a token.
+  token: ""
+
 # Logging configuration
 logging:
   # Log level: debug, info, warn, error
