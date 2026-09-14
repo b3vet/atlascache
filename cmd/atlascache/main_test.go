@@ -74,14 +74,22 @@ func TestWiredCoreReclaimsExpiredKeys(t *testing.T) {
 	baselineKeys := c.engine.Stats().Keys
 	baselineMemory := c.engine.MemoryUsed()
 
+	const ttl = time.Second
+
 	for i := 0; i < keys; i++ {
-		require.NoError(t, c.engine.Set([]byte(fmt.Sprintf("key:%d", i)), []byte("value"), 50*time.Millisecond))
+		require.NoError(t, c.engine.Set([]byte(fmt.Sprintf("key:%d", i)), []byte("value"), ttl))
 	}
 
+	// Every key is either still resident or already reclaimed, whichever side of
+	// the TTL the write loop finished on. Asserting that all 5000 are still
+	// present instead makes the test a race against its own TTL: CI caught this
+	// with 4286 resident and 714 already correctly expired.
 	written := c.engine.Stats()
-	require.Equal(t, uint64(keys), written.Keys)
-	require.Positive(t, written.MemoryUsed)
-	t.Logf("after writing %d keys with a 50ms TTL: keys=%d memory=%dB", keys, written.Keys, written.MemoryUsed)
+	require.Equal(t, uint64(keys), written.Keys+written.Expirations,
+		"every key written is either resident or already expired")
+	require.Positive(t, written.MemoryUsed+written.Expirations)
+	t.Logf("after writing %d keys with a %s TTL: keys=%d expired=%d memory=%dB",
+		keys, ttl, written.Keys, written.Expirations, written.MemoryUsed)
 
 	reclaimed := eventually(t, 5*time.Second, func() bool {
 		return c.engine.Stats().Keys == baselineKeys && c.engine.MemoryUsed() == baselineMemory
