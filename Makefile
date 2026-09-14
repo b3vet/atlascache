@@ -1,4 +1,4 @@
-.PHONY: build build-e2e test tidy-check fuzz lint bench clean fmt vet cover check deps tools e2e e2e-smoke e2e-full e2e-soak phase-check dev-index dev-certs help
+.PHONY: build build-e2e test tidy-check fuzz lint bench bench-network clean fmt vet cover check deps tools e2e e2e-smoke e2e-full e2e-soak phase-check dev-index dev-certs help
 
 BINARY_NAME := atlascache
 BUILD_DIR   := bin
@@ -59,6 +59,18 @@ fuzz:
 ## bench: run benchmarks
 bench:
 	$(GO) test -bench=. -benchmem -run=^$$ ./...
+
+## bench-network: run the P2 end-to-end network sweep against a real server (FEAT-0026)
+# Minutes, not seconds, and the numbers are meaningless on a busy machine, so it
+# is deliberately not part of `make bench`. Set NETBENCH_OUT to keep the raw
+# table; NETBENCH_ARGS passes anything else through, e.g.
+#   make bench-network NETBENCH_ARGS="-netbench.duration=10s"
+NETBENCH_OUT  ?=
+NETBENCH_ARGS ?=
+bench-network: build
+	$(GO) test ./test/bench -run TestNetworkBaseline -v -timeout 60m -netbench \
+		-netbench.binary $(CURDIR)/$(BUILD_DIR)/$(BINARY_NAME) \
+		$(if $(NETBENCH_OUT),-netbench.out $(NETBENCH_OUT),) $(NETBENCH_ARGS)
 
 ## cover: generate an HTML coverage report
 cover:
