@@ -39,6 +39,13 @@ const (
 // against a running server, so this is a hang detector.
 const ctlBudget = 30 * time.Second
 
+// ctlGrace is what makes ctlBudget a bound rather than a hope ([[ISSUE-0014]]).
+// Canceling a run kills the process os/exec started, and Run then waits for
+// stdout and stderr to reach end of file — which a child the CLI forked and
+// left behind would never let happen. WaitDelay closes them instead, so the
+// scenario fails with a message rather than hanging until CI times out.
+const ctlGrace = 2 * time.Second
+
 // ctlBinaryEnv names a binary explicitly, for a run driven by hand rather than
 // by the Makefile.
 const ctlBinaryEnv = "ATLASCTL_BINARY"
@@ -181,6 +188,7 @@ func (t *ctl) runWith(c *runner.Ctx, stdin []byte, env []string, args ...string)
 	cmd := exec.CommandContext(ctx, t.path, full...) //nolint:gosec // the binary under test, with arguments the scenario wrote
 	cmd.Dir = t.root
 	cmd.Env = env
+	cmd.WaitDelay = ctlGrace
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}

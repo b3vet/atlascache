@@ -2,6 +2,7 @@ package harness
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"os/exec"
@@ -29,6 +30,12 @@ func standInHarness(t *testing.T, script string) *Process {
 	t.Cleanup(func() { _ = h.Close() })
 	return h
 }
+
+// cleanupGrace is how long a cleanup waits to observe the stand-in exiting on
+// its own before resorting to signaling the group. Comfortably longer than the
+// gap between Wait returning and `exited` closing, and short enough not to
+// matter on the few tests that end with the process still alive.
+const cleanupGrace = 250 * time.Millisecond
 
 // launched hands back a Process holding a running stand-in, wired up exactly as
 // startOnce would have wired a real server. Start insists on a health endpoint,
@@ -58,7 +65,25 @@ func launched(t *testing.T, settings Settings, script string) (*Process, *proc) 
 		running.waitErr = cmd.Wait()
 		close(running.exited)
 	}()
+	// Most tests here end with the stand-in already dead, because killing it is
+	// what they are testing. Signaling anyway is not merely redundant: once the
+	// process is reaped its pgid is free, and a busy machine hands it to
+	// something else. Signaling then either fails with EPERM — the flake this
+	// cleanup used to produce under parallel load — or, worse, succeeds against
+	// a process group that has nothing to do with this test.
+	//
+	// So the group is signaled only while a member is provably alive, the same
+	// rule drain follows and the reason the pgid cannot have been recycled
+	// underneath it. Waiting rather than polling matters because the pid becomes
+	// reusable the moment Wait reaps it and `exited` closes on the statement
+	// after, so a non-blocking check can still see a process that died
+	// microseconds ago. One that is genuinely running never closes the channel.
 	t.Cleanup(func() {
+		select {
+		case <-running.exited:
+			return
+		case <-time.After(cleanupGrace):
+		}
 		if err := signalGroup(running.pid, syscall.SIGKILL); err != nil {
 			t.Errorf("cleaning up the stand-in: %v", err)
 		}
@@ -82,6 +107,28 @@ func waitUntil(t *testing.T, done func() bool) bool {
 		time.Sleep(5 * time.Millisecond)
 	}
 	return false
+}
+
+// waitForPID reads the pid a stand-in wrote, waiting for the file to appear.
+func waitForPID(t *testing.T, path string) int {
+	t.Helper()
+
+	var pid int
+	if !waitUntil(t, func() bool {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return false
+		}
+		parsed, convErr := strconv.Atoi(strings.TrimSpace(string(data)))
+		if convErr != nil {
+			return false
+		}
+		pid = parsed
+		return true
+	}) {
+		t.Fatal("the stand-in never reported its child's pid")
+	}
+	return pid
 }
 
 // TestStopKillsAServerThatIgnoresSIGTERM. The graceful window is a bound, not a
@@ -287,8 +334,8 @@ func TestRunBinaryTellsALaunchFailureFromANonZeroExit(t *testing.T) {
 	t.Run("a binary that never exits is cut off by the context", func(t *testing.T) {
 		t.Parallel()
 		// `exec` so the stand-in *is* the long-running process rather than its
-		// parent: the context cancels the process it launched, and a forked
-		// child would keep the output pipe open long after that.
+		// parent. The forking case, which used to hang here rather than fail,
+		// has a test of its own below.
 		h := standInHarness(t, "exec sleep 120\n")
 
 		ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
@@ -306,4 +353,188 @@ func TestRunBinaryTellsALaunchFailureFromANonZeroExit(t *testing.T) {
 			t.Errorf("RunBinary took %s to honor a 200ms context", elapsed)
 		}
 	})
+}
+
+// TestRunBinaryReapsABinaryThatForks. This is the one that used to hang.
+//
+// RunBinary sets Setpgid, but exec.CommandContext cancels the process it
+// started and nothing else. A binary that forks a child which inherits stdout
+// and outlives it therefore kept the output pipe open with no one left to
+// close it, and the call never returned: the run stalled until `go test` or CI
+// gave up, reporting a timeout with nothing in it. A gate that hangs is worse
+// than one that fails, so the forked child is killed by group and the run comes
+// back with an error naming what happened.
+//
+// The stand-in below is a binary that forks: a child that inherits stdout and
+// sleeps well past the run, a parent that reports its pid and exits at once.
+func TestRunBinaryReapsABinaryThatForks(t *testing.T) {
+	t.Parallel()
+
+	pidFile := filepath.Join(t.TempDir(), "forked.pid")
+	h := standInHarness(t, "echo started\nsleep 120 &\necho $! > "+pidFile+"\nexit 0\n")
+
+	// Registered before the run, not after it: when this regresses the run does
+	// not return at all, and a test about not leaving processes behind must not
+	// leave one behind on its way to saying so.
+	t.Cleanup(func() { killLeftovers(pidFile) })
+
+	started := time.Now()
+	code, output, err := runBinaryWithin(t, h, "--version")
+	elapsed := time.Since(started)
+
+	child := waitForPID(t, pidFile)
+	if !waitUntil(t, func() bool { return !alive(child) }) {
+		t.Errorf("the forked child (pid %d) is still running %s after the run returned", child, elapsed)
+	}
+	if err == nil {
+		t.Fatalf("RunBinary reported success for a binary that left a process behind (exit %d)", code)
+	}
+	if !errors.Is(err, errForked) {
+		t.Errorf("error = %v, want it to say the binary left a process running", err)
+	}
+	if code != -1 {
+		t.Errorf("exit code = %d, want -1; a run that leaked a process is not a result to assert on", code)
+	}
+	if !strings.Contains(output, "started") {
+		t.Errorf("output = %q, want what the binary actually wrote before it forked", output)
+	}
+	if !strings.Contains(h.Logs(), "killing process group") {
+		t.Errorf("logs = %q, want the harness to record the group it killed", h.Logs())
+	}
+}
+
+// TestKillGroupRefusesAPidThatIsNotAGroup. kill(-0, sig) means "every process
+// in my own process group", which during a test run is the runner itself and
+// every spec it has in flight. Cleanup runs on the paths where something has
+// already gone wrong and a pid may well be zero, so it must refuse rather than
+// signal. If this ever regresses, the test binary dies where it stands — which
+// is the only way a bug like this announces itself honestly.
+func TestKillGroupRefusesAPidThatIsNotAGroup(t *testing.T) {
+	t.Parallel()
+
+	p := &Process{logs: &logBuffer{}}
+	for _, pid := range []int{0, -1} {
+		p.killGroup(pid, "a run that never started")
+	}
+
+	if !strings.Contains(p.Logs(), "not a group to signal") {
+		t.Errorf("logs = %q, want the refusal recorded", p.Logs())
+	}
+	if strings.Contains(p.Logs(), "killing process group") {
+		t.Errorf("logs = %q; a pid that is not a group must not be signaled at all", p.Logs())
+	}
+}
+
+// killLeftovers kills the pid a forking stand-in recorded, if it is still
+// there. Nothing to do on the passing path — the harness already killed it.
+func killLeftovers(pidFile string) {
+	data, err := os.ReadFile(pidFile)
+	if err != nil {
+		return
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 {
+		return
+	}
+	process, findErr := os.FindProcess(pid)
+	if findErr != nil {
+		return
+	}
+	if killErr := process.Kill(); killErr != nil {
+		return // already gone, which is what the passing path looks like
+	}
+}
+
+// runBinaryWithin calls RunBinary and fails the test rather than blocking when
+// it does not come back.
+//
+// The bug this guards against is a hang, so a test for it that could itself
+// hang would reproduce the very failure mode it exists to prevent: the package
+// would stall until `go test` killed it, minutes later, naming nothing. The
+// budget is kept inside the test binary's own deadline so the failure is this
+// test's, with this test's name on it.
+func runBinaryWithin(t *testing.T, h *Process, args ...string) (int, string, error) {
+	t.Helper()
+
+	budget := 10 * time.Second
+	if deadline, ok := t.Deadline(); ok {
+		if room := time.Until(deadline) - time.Second; room < budget {
+			budget = room
+		}
+	}
+
+	type outcome struct {
+		code   int
+		output string
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		code, output, err := h.RunBinary(t.Context(), args...)
+		done <- outcome{code: code, output: output, err: err}
+	}()
+
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+	select {
+	case got := <-done:
+		return got.code, got.output, got.err
+	case <-timer.C:
+		t.Fatalf("RunBinary did not return within %s; it is waiting on output no one is left to close", budget)
+		return 0, "", nil
+	}
+}
+
+// TestDrainGivesUpOnAPipeItCannotClose. The reaping above rests on the kill
+// closing the pipe. Something the harness cannot reach — a descriptor handed
+// outside the process group, or a run with no group left to signal at all —
+// must not be able to hold a run open anyway: the last resort is to close the
+// harness's own end and return. The point of the whole change is that RunBinary
+// always comes back.
+//
+// The pid here is zero, which is both the worst case and the safest one to
+// test with: drain must refuse to signal it (kill(-0, …) is this test run's own
+// process group) and must still finish. A drain that signaled it would take
+// the test binary with it, which is the only honest way for that bug to report
+// itself.
+func TestDrainGivesUpOnAPipeItCannotClose(t *testing.T) {
+	t.Parallel()
+
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	// Held by this test, so nothing the harness does will close it.
+	defer func() { _ = write.Close() }()
+
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		buffer := make([]byte, 64)
+		for {
+			if _, readErr := read.Read(buffer); readErr != nil {
+				return
+			}
+		}
+	}()
+
+	p := &Process{logs: &logBuffer{}}
+	done := make(chan bool, 1)
+	go func() { done <- p.drain(0, read, drained, "a binary holding its own output") }()
+
+	select {
+	case forked := <-done:
+		if !forked {
+			t.Error("drain reported nothing left behind while the pipe was still open")
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("drain never returned; a pipe nobody will close must not hold a run open")
+	}
+	if !strings.Contains(p.Logs(), "outlived the kill") {
+		t.Errorf("logs = %q, want the harness to say it closed the pipe itself", p.Logs())
+	}
+	if !strings.Contains(p.Logs(), "not a group to signal") {
+		t.Errorf("logs = %q, want drain to have refused the pid rather than signaled it", p.Logs())
+	}
+	<-drained
 }

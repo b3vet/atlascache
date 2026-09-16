@@ -115,6 +115,45 @@ func TestNewRefusesAHarnessThatCannotIsolateItsSpec(t *testing.T) {
 	})
 }
 
+// TestNewRefusesAConfigItCannotWriteItsOwnKeysInto. The harness owns the two
+// ports and the data directory, and forces them back over whatever the spec
+// wrote. A spec that replaced one of those blocks with a scalar used to lose
+// the rest of the block without a word — `node: "x"` took node.id and node.name
+// with it. The refusal belongs here, where the spec's config is first read: the
+// runner reports it in its harness phase, naming the path, before a directory
+// is made or a server is launched.
+func TestNewRefusesAConfigItCannotWriteItsOwnKeysInto(t *testing.T) {
+	t.Parallel()
+
+	base := t.TempDir()
+	h, err := New(
+		runner.HarnessOptions{
+			SpecName: "greedy-spec",
+			Binary:   standIn(t, "exit 0\n"),
+			Config:   map[string]any{"node": "not-a-map-at-all"},
+		},
+		Settings{BaseDir: base},
+	)
+	if err == nil {
+		_ = h.Close()
+		t.Fatal("New accepted a config block the harness cannot write its own keys into")
+	}
+	if !strings.Contains(err.Error(), "node.data_dir") {
+		t.Errorf("error = %v, want it to name the path that could not be set", err)
+	}
+	if !strings.Contains(err.Error(), "mapping") {
+		t.Errorf("error = %v, want it to say what the spec should have written instead", err)
+	}
+
+	entries, readErr := os.ReadDir(base)
+	if readErr != nil {
+		t.Fatalf("reading the base directory: %v", readErr)
+	}
+	if len(entries) != 0 {
+		t.Errorf("a refused harness left %d entries behind in %s", len(entries), base)
+	}
+}
+
 // TestNewSanitizesTheSpecNameIntoADirectoryName. Spec names come from files a
 // contributor writes; one containing a path separator would put the harness's
 // directory somewhere other than the base directory — outside it, in the case

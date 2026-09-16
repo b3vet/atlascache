@@ -7,8 +7,13 @@ import (
 	"github.com/b3vet/atlascache/test/e2e/runner"
 )
 
-// pong is what a healthy server answers PING with.
-const pong = "PONG"
+// ping is the liveness command, and pong is what a healthy server answers it
+// with. Both are named because several scenarios send one and compare the
+// other, and a typo in either reads as a server fault rather than a test one.
+const (
+	ping = "PING"
+	pong = "PONG"
+)
 
 // serverBinary is the escape hatch for the handful of behaviors that happen
 // outside the protocol: a config that must be rejected before a server exists,

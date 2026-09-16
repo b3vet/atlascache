@@ -5,6 +5,7 @@ package harness
 import (
 	"errors"
 	"fmt"
+	"os/exec"
 	"syscall"
 )
 
@@ -16,6 +17,17 @@ import (
 // cascade of them.
 func sysProcAttr() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{Setpgid: true}
+}
+
+// cancelGroup is what exec.CommandContext calls when a run's context expires:
+// a SIGTERM to the whole group led by the process it started.
+//
+// os/exec's own cancellation reaches that one process. A binary that forked
+// would survive it, and a forked child holding the output pipe open is exactly
+// how a run that should have failed turns into a run that hangs. Signaling the
+// group is what the harness already does to the server under test.
+func cancelGroup(cmd *exec.Cmd) func() error {
+	return func() error { return signalGroup(cmd.Process.Pid, syscall.SIGTERM) }
 }
 
 // signalGroup sends sig to the whole process group led by pid. A group that has

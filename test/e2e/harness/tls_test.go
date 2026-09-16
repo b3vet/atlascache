@@ -48,7 +48,10 @@ func TestWithTLSPaths(t *testing.T) {
 		"storage": map[string]any{"shard_count": 4},
 	}
 
-	updated := withTLSPaths(original, "/tmp/spec/server.crt", "/tmp/spec/server.key")
+	updated, err := withTLSPaths(original, "/tmp/spec/server.crt", "/tmp/spec/server.key")
+	if err != nil {
+		t.Fatalf("withTLSPaths: %v", err)
+	}
 
 	section, ok := asMap(updated["tls"])
 	if !ok {
@@ -69,6 +72,21 @@ func TestWithTLSPaths(t *testing.T) {
 	// elsewhere would leave files behind.
 	if before, _ := asMap(original["tls"]); before["cert_file"] != "/etc/somewhere/else.crt" {
 		t.Error("the spec's config map was mutated; it belongs to the spec")
+	}
+}
+
+// TestWithTLSPathsRefusesATLSBlockItCannotWriteInto. The certificate paths are
+// forced like the ports are, so the same rule applies: a `tls:` that is not a
+// mapping is reported rather than replaced. tlsRequested keeps this off the
+// live path today — it reads `tls.enabled`, which a scalar does not have — and
+// that is exactly why the guard has to be here rather than assumed elsewhere.
+func TestWithTLSPathsRefusesATLSBlockItCannotWriteInto(t *testing.T) {
+	updated, err := withTLSPaths(map[string]any{"tls": "enabled-please"}, "/tmp/s.crt", "/tmp/s.key")
+	if err == nil {
+		t.Fatalf("withTLSPaths = %#v, want an error naming the block", updated)
+	}
+	if !strings.Contains(err.Error(), "tls.cert_file") {
+		t.Errorf("error = %v, want it to name the path it could not set", err)
 	}
 }
 

@@ -947,7 +947,7 @@ func (rc *rawConn) probe() (served bool, line string, err error) {
 // reply. Redis accepts both terminators for an inline request and this server
 // now does too (ISSUE-0019).
 func (rc *rawConn) pingOver(terminator string) error {
-	if _, err := rc.write([]byte("PING" + terminator)); err != nil {
+	if _, err := rc.write([]byte(ping + terminator)); err != nil {
 		return fmt.Errorf("writing a PING terminated with %q: %w", terminator, err)
 	}
 	line, err := rc.readLine()

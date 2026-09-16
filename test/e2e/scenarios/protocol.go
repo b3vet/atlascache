@@ -615,7 +615,7 @@ func freshConnectionServes(c *runner.Ctx) error {
 	}
 	defer func() { _ = conn.Close() }()
 
-	reply, err := conn.Call(c.Context(), "PING")
+	reply, err := conn.Call(c.Context(), ping)
 	if err != nil {
 		return fmt.Errorf("a new connection did not get a reply to PING: %w", err)
 	}

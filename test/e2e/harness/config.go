@@ -1,8 +1,10 @@
 package harness
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -11,6 +13,25 @@ import (
 // a routable interface would be reachable from off the machine during a test
 // run, and on macOS it would also raise a firewall prompt on every run.
 const loopback = "127.0.0.1"
+
+// The config blocks and keys the harness writes itself. Named once because each
+// appears in three places — the defaults, the paths forced back over the spec,
+// and the check that those paths can be written — and a key spelled two ways
+// across them is a harness that quietly stops forcing it.
+const (
+	nodeBlock    = "node"
+	serverBlock  = "server"
+	adminBlock   = "admin"
+	loggingBlock = "logging"
+	tlsBlock     = "tls"
+
+	bindAddrKey   = "bind_addr"
+	clientPortKey = "client_port"
+	adminPortKey  = "port"
+	dataDirKey    = "data_dir"
+	certFileKey   = "cert_file"
+	keyFileKey    = "key_file"
+)
 
 // writeConfig renders the server's config file and returns its path.
 //
@@ -21,20 +42,20 @@ const loopback = "127.0.0.1"
 // collide on a port, and one spec's data would leak into another's.
 func writeConfig(path, dataDir string, specName string, clientPort, adminPort int, overrides map[string]any) error {
 	config := map[string]any{
-		"node": map[string]any{
+		nodeBlock: map[string]any{
 			"id":       "e2e-" + specName,
 			"name":     specName,
-			"data_dir": dataDir,
+			dataDirKey: dataDir,
 		},
-		"server": map[string]any{
-			"bind_addr":   loopback,
-			"client_port": clientPort,
+		serverBlock: map[string]any{
+			bindAddrKey:   loopback,
+			clientPortKey: clientPort,
 		},
-		"admin": map[string]any{
-			"bind_addr": loopback,
-			"port":      adminPort,
+		adminBlock: map[string]any{
+			bindAddrKey:  loopback,
+			adminPortKey: adminPort,
 		},
-		"logging": map[string]any{
+		loggingBlock: map[string]any{
 			// debug, because the log is only ever read when something failed.
 			"level":  "debug",
 			"format": "json",
@@ -42,9 +63,15 @@ func writeConfig(path, dataDir string, specName string, clientPort, adminPort in
 	}
 
 	config = mergeConfig(config, overrides)
-	setPath(config, clientPort, "server", "client_port")
-	setPath(config, adminPort, "admin", "port")
-	setPath(config, dataDir, "node", "data_dir")
+	// Every path is attempted rather than the first failure returned, so a spec
+	// that got two blocks wrong is told about both in one run.
+	if err := errors.Join(
+		setPath(config, clientPort, serverBlock, clientPortKey),
+		setPath(config, adminPort, adminBlock, adminPortKey),
+		setPath(config, dataDir, nodeBlock, dataDirKey),
+	); err != nil {
+		return err
+	}
 
 	data, err := yaml.Marshal(config)
 	if err != nil {
@@ -61,7 +88,7 @@ func writeConfig(path, dataDir string, specName string, clientPort, adminPort in
 // It is read before the server is launched, because the certificate has to
 // exist before the config naming it is written.
 func tlsRequested(config map[string]any) bool {
-	section, ok := asMap(config["tls"])
+	section, ok := asMap(config[tlsBlock])
 	if !ok {
 		return false
 	}
@@ -76,18 +103,56 @@ func tlsRequested(config map[string]any) bool {
 // directory do: they live inside the directory it creates and removes, and a
 // spec that pointed the server somewhere else would leave files behind and
 // break the isolation every other spec depends on.
-func withTLSPaths(config map[string]any, certFile, keyFile string) map[string]any {
+func withTLSPaths(config map[string]any, certFile, keyFile string) (map[string]any, error) {
 	// Copied down to the block being written, because the map belongs to the
 	// spec: the runner parsed it, and a harness that edited it in place would
 	// be changing what the spec says it wants.
 	updated := mergeConfig(map[string]any{}, config)
-	if section, ok := asMap(updated["tls"]); ok {
-		updated["tls"] = mergeConfig(map[string]any{}, section)
+	if section, ok := asMap(updated[tlsBlock]); ok {
+		updated[tlsBlock] = mergeConfig(map[string]any{}, section)
 	}
 
-	setPath(updated, certFile, "tls", "cert_file")
-	setPath(updated, keyFile, "tls", "key_file")
-	return updated
+	if err := errors.Join(
+		setPath(updated, certFile, tlsBlock, certFileKey),
+		setPath(updated, keyFile, tlsBlock, keyFileKey),
+	); err != nil {
+		return nil, err
+	}
+	return updated, nil
+}
+
+// forcedPaths are the config keys the harness writes over whatever the spec
+// said: the two ports and the data directory that keep parallel specs from
+// colliding, and — when the spec asks for TLS — the certificate the harness
+// generated into the directory it cleans up. Each of them has to be written
+// into a mapping, so each of them is a path a spec can make impossible.
+func forcedPaths(config map[string]any) [][]string {
+	paths := [][]string{
+		{serverBlock, clientPortKey},
+		{adminBlock, adminPortKey},
+		{nodeBlock, dataDirKey},
+	}
+	if tlsRequested(config) {
+		paths = append(paths, []string{tlsBlock, certFileKey}, []string{tlsBlock, keyFileKey})
+	}
+	return paths
+}
+
+// checkConfig reports a spec `config:` block the harness cannot write its own
+// keys into, naming every path at fault.
+//
+// It runs when the harness is built — before a directory is made, a certificate
+// is generated or a server is launched — so a spec asking for something
+// impossible is told when it is read rather than diagnosed later from a server
+// that started with a config nobody wrote.
+func checkConfig(config map[string]any) error {
+	var problems []error
+	for _, path := range forcedPaths(config) {
+		if err := checkPath(config, path...); err != nil {
+			problems = append(problems, err)
+		}
+	}
+	return errors.Join(problems...)
 }
 
 // mergeConfig overlays override onto base, recursing into nested maps so that a
@@ -128,7 +193,17 @@ func asMap(value any) (map[string]any, bool) {
 }
 
 // setPath writes value at the given nested key, creating maps as needed.
-func setPath(config map[string]any, value any, keys ...string) {
+//
+// A block on the way that is not a mapping is an error naming it, never an
+// overwrite: a spec writing `node: "somewhere"` would otherwise have it
+// replaced by `node: {data_dir: ...}`, taking node.id and node.name with it and
+// saying nothing. A spec that asked for something impossible is told so instead.
+// Nothing is written when the path is refused.
+func setPath(config map[string]any, value any, keys ...string) error {
+	if err := checkPath(config, keys...); err != nil {
+		return err
+	}
+
 	node := config
 	for _, key := range keys[:len(keys)-1] {
 		child, ok := asMap(node[key])
@@ -139,4 +214,32 @@ func setPath(config map[string]any, value any, keys ...string) {
 		node = child
 	}
 	node[keys[len(keys)-1]] = value
+	return nil
+}
+
+// checkPath reports whether setPath could write at keys without destroying
+// something the spec wrote, and changes nothing itself. Separating the question
+// from the write is what lets the check run when the spec is read, against the
+// spec's own map, rather than only when the config is rendered.
+//
+// An absent block is not a mismatch: setPath creates it, and there is nothing
+// underneath it to lose. A block written with no value at all decodes to nil,
+// which is the same thing.
+func checkPath(config map[string]any, keys ...string) error {
+	node := config
+	for depth, key := range keys[:len(keys)-1] {
+		value := node[key]
+		if value == nil {
+			return nil
+		}
+		child, ok := asMap(value)
+		if !ok {
+			at := strings.Join(keys[:depth+1], ".")
+			return fmt.Errorf(
+				"spec config: %s is %T, but the harness has to set %s; write %s as a mapping so the keys under it survive",
+				at, value, strings.Join(keys, "."), at)
+		}
+		node = child
+	}
+	return nil
 }

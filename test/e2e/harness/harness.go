@@ -11,10 +11,12 @@
 package harness
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -47,6 +49,17 @@ const (
 	healthTimeout     = 2 * time.Second
 	killWait          = 5 * time.Second
 	runBinaryTimeout  = 20 * time.Second
+	// runBinaryGrace is how long a canceled out-of-band run gets between the
+	// SIGTERM its cancellation sends to the process group and the kill that
+	// follows. Far shorter than the server's graceful window: nothing RunBinary
+	// launches is serving traffic, so there is nothing to drain.
+	runBinaryGrace = 2 * time.Second
+	// drainGrace is how long the output of an out-of-band run is given to reach
+	// end of file once the process has exited. A process that exited closed its
+	// own descriptors, so the pipe ends as soon as the reader drains what is
+	// buffered; anything still holding it open after this is a child the binary
+	// forked and left behind.
+	drainGrace = 500 * time.Millisecond
 )
 
 // errPortTaken means the server lost the race between the harness releasing a
@@ -153,6 +166,15 @@ func New(opts runner.HarnessOptions, settings Settings) (*Process, error) {
 		return nil, err
 	}
 
+	// Before anything is created or launched: a `config:` block the harness
+	// cannot write its own keys into is the spec's mistake, and the spec is the
+	// thing that can still be fixed. Reporting it here puts the failure in the
+	// runner's harness phase, naming the path, rather than leaving a server to
+	// start from a config that quietly lost half a block.
+	if configErr := checkConfig(opts.Config); configErr != nil {
+		return nil, configErr
+	}
+
 	root, err := os.MkdirTemp(settings.BaseDir, "atlas-e2e-"+sanitize(opts.SpecName)+"-")
 	if err != nil {
 		return nil, fmt.Errorf("creating the spec's temp directory: %w", err)
@@ -205,10 +227,15 @@ func (p *Process) prepareTLS() error {
 		return err
 	}
 
+	withPaths, err := withTLSPaths(p.config, certFile, keyFile)
+	if err != nil {
+		return err
+	}
+
 	p.tls = true
 	p.certFile = certFile
 	p.keyFile = keyFile
-	p.config = withTLSPaths(p.config, certFile, keyFile)
+	p.config = withPaths
 	p.logs.Printf("generated a TLS certificate for this run: %s", certFile)
 
 	return nil
@@ -634,10 +661,20 @@ func (p *Process) Root() string { return p.root }
 // Binary is the server binary under test.
 func (p *Process) Binary() string { return p.binary }
 
+// errForked means the binary was still represented by a running process after
+// the one the harness launched had exited: it forked, and the child outlived
+// its parent. Nothing an out-of-band run starts may outlive the run.
+var errForked = errors.New("the binary left a process running after it exited")
+
 // RunBinary runs the server binary out of band and returns its exit code and
 // combined output. It exists for the specs that must observe the binary itself
 // rather than the protocol — an invalid config that must fail fast, and
-// --version. The error return is reserved for a launch that never happened.
+// --version.
+//
+// The error return means the run did not happen as asked: a launch that never
+// started, a run the context cut short, or a binary that left a process behind.
+// A non-zero exit is a result, not an error, because for these specs it is the
+// thing under test.
 func (p *Process) RunBinary(ctx context.Context, args ...string) (int, string, error) {
 	ctx, cancel := context.WithTimeout(ctx, runBinaryTimeout)
 	defer cancel()
@@ -646,23 +683,140 @@ func (p *Process) RunBinary(ctx context.Context, args ...string) (int, string, e
 	cmd.Dir = p.root
 	cmd.Env = childEnv()
 	cmd.SysProcAttr = sysProcAttr()
+	// A canceled run signals the whole process group, which is what Stop and
+	// terminate do to the server: exec.CommandContext's own cancellation
+	// reaches only the process it started, and a binary that forked would
+	// outlive it.
+	cmd.Cancel = cancelGroup(cmd)
+	// SIGTERM first, from Cancel, and this is the escalation: os/exec kills
+	// what is left when the grace period runs out, so a binary that ignores
+	// SIGTERM cannot hold the run open either.
+	cmd.WaitDelay = runBinaryGrace
 
 	invocation := filepath.Base(p.binary) + " " + strings.Join(args, " ")
-	output, err := cmd.CombinedOutput()
+
+	output, waitErr, forked := p.capture(cmd, invocation)
 
 	var exitErr *exec.ExitError
-	if err != nil && !errors.As(err, &exitErr) {
-		p.logs.Printf("ran %s -> %v", invocation, err)
-		return -1, string(output), fmt.Errorf("running %s: %w", invocation, err)
+	if waitErr != nil && !errors.As(waitErr, &exitErr) {
+		p.logs.Printf("ran %s -> %v", invocation, waitErr)
+		return -1, output, fmt.Errorf("running %s: %w", invocation, waitErr)
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		p.logs.Printf("ran %s -> %v", invocation, ctxErr)
-		return -1, string(output), fmt.Errorf("running %s: %w", invocation, ctxErr)
+		return -1, output, fmt.Errorf("running %s: %w", invocation, ctxErr)
+	}
+	if forked {
+		p.logs.Printf("ran %s -> %v", invocation, errForked)
+		return -1, output, fmt.Errorf("running %s: %w", invocation, errForked)
 	}
 
 	code := cmd.ProcessState.ExitCode()
 	p.logs.Printf("ran %s -> exit %d", invocation, code)
-	return code, string(output), nil
+	return code, output, nil
+}
+
+// capture runs cmd to completion, collects everything it wrote, and makes sure
+// nothing it forked outlives it. It reports the output, what Wait said, and
+// whether the binary left a process behind.
+//
+// The output goes through a pipe this function owns rather than one os/exec
+// fills on its behalf, and that is the whole difference between a forking
+// binary failing the run and hanging it. With a pipe os/exec owns, Wait blocks
+// until the last writer closes it — and a forked child holding stdout never
+// does, however thoroughly the process os/exec started is killed. Here Wait
+// returns when that process exits; a pipe still open afterwards is the evidence
+// that something was forked, and that something is killed by group before this
+// returns.
+func (p *Process) capture(cmd *exec.Cmd, invocation string) (output string, waitErr error, forked bool) {
+	read, write, err := os.Pipe()
+	if err != nil {
+		return "", fmt.Errorf("creating the output pipe for %s: %w", invocation, err), false
+	}
+	defer func() { _ = read.Close() }()
+
+	// One file for both streams, so os/exec hands the child a single descriptor
+	// and the two arrive interleaved in the order the binary wrote them.
+	cmd.Stdout = write
+	cmd.Stderr = write
+
+	if startErr := startWithRetry(cmd); startErr != nil {
+		_ = write.Close()
+		return "", startErr, false
+	}
+	// The harness's own copy of the write end has to go, or the pipe would
+	// never reach end of file however well behaved the child is.
+	_ = write.Close()
+
+	var collected bytes.Buffer
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		if _, copyErr := io.Copy(&collected, read); copyErr != nil {
+			// Reached when drain had to close this end to get free. There is
+			// nothing to do about it here: the run's own error says more, and
+			// what was read before it is still worth reporting.
+			p.logs.Printf("reading the output of %s stopped: %v", invocation, copyErr)
+		}
+	}()
+
+	waitErr = cmd.Wait()
+	forked = p.drain(cmd.Process.Pid, read, drained, invocation)
+	return collected.String(), waitErr, forked
+}
+
+// drain waits for the output pipe to end now that the process has exited, and
+// reports whether it had to kill anything to get there. The caller must not
+// read what was collected until this returns.
+func (p *Process) drain(pid int, read *os.File, drained <-chan struct{}, invocation string) bool {
+	select {
+	case <-drained:
+		return false
+	case <-time.After(drainGrace):
+	}
+
+	// The process has been waited for and the pipe is still open, so a child it
+	// forked is holding the write end. That child is alive, which is also why
+	// its process group id is still ours to signal: the kernel keeps a group id
+	// reserved while the group has members, so the pid cannot have been reused
+	// by something unrelated in the meantime.
+	p.logs.Printf("%s left a child holding its output open", invocation)
+	p.killGroup(pid, invocation)
+
+	// The same grace again, and no more: a group that took the SIGKILL has its
+	// descriptors closed by the kernel as it goes, which is not something to
+	// wait seconds for, and a writer the signal never reached will not close
+	// them however long this waits.
+	select {
+	case <-drained:
+	case <-time.After(drainGrace):
+		// Whatever holds the pipe is beyond the harness's reach. Closing this
+		// end unblocks the reader so the run still returns an answer, which is
+		// the entire point: a spec that fails is diagnosable, a spec that hangs
+		// is a CI timeout with nothing in it.
+		p.logs.Printf("%s: the output pipe outlived the kill; closing it", invocation)
+		_ = read.Close()
+		<-drained
+	}
+	return true
+}
+
+// killGroup SIGKILLs the process group led by pid, logging what it could not
+// do rather than failing the caller: this runs on cleanup paths, where the
+// caller already has something more interesting to report.
+//
+// A pid of zero is refused here as well as in signalGroup, because kill(-0,
+// sig) means "every process in my own group" — which, in a test run, is the
+// runner itself and every spec it has in flight. It is worth refusing twice.
+func (p *Process) killGroup(pid int, invocation string) {
+	if pid <= 0 {
+		p.logs.Printf("refusing to kill the process group of %s: pid %d is not a group to signal", invocation, pid)
+		return
+	}
+	p.logs.Printf("killing process group %d left by %s", pid, invocation)
+	if err := signalGroup(pid, syscall.SIGKILL); err != nil {
+		p.logs.Printf("could not kill the process group of %s: %v", invocation, err)
+	}
 }
 
 // Close kills anything still running and removes the spec's directory. It is

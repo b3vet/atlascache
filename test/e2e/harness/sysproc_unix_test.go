@@ -3,10 +3,8 @@
 package harness
 
 import (
-	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -95,26 +93,4 @@ func TestSignalGroupReachesTheChildrenTheServerLeftBehind(t *testing.T) {
 	if !waitUntil(t, func() bool { return !alive(child) }) {
 		t.Errorf("child pid %d survived a signal to its process group %d", child, leader)
 	}
-}
-
-// waitForPID reads the pid a stand-in wrote, waiting for the file to appear.
-func waitForPID(t *testing.T, path string) int {
-	t.Helper()
-
-	var pid int
-	if !waitUntil(t, func() bool {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return false
-		}
-		parsed, convErr := strconv.Atoi(strings.TrimSpace(string(data)))
-		if convErr != nil {
-			return false
-		}
-		pid = parsed
-		return true
-	}) {
-		t.Fatal("the stand-in never reported its child's pid")
-	}
-	return pid
 }
