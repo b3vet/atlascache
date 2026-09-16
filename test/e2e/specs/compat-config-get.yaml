@@ -1,0 +1,117 @@
+version: 1
+name: compat-config-get
+tier: full
+feature: FEAT-0019
+issue: ISSUE-0021
+description: >
+  `CONFIG GET` answers the probes real tooling sends before it does anything
+  else. redis-benchmark asks for `save` and `appendonly` on startup and prints
+  "WARNING: Could not fetch server CONFIG" when the probe fails -- the first
+  line an evaluator sees, and it reads as "this server is incomplete".
+
+  The reply is a flat array of name/value pairs, which RESP2 has no map frame
+  for; expect_field reads it as the map it logically is.
+
+  Two things here are worth more than the command: `save` and `appendonly` are
+  present with empty values rather than absent or invented, because absence is
+  what makes redis-benchmark warn and a fabricated "appendonly:no" would be a
+  durability claim with no implementation behind it; and `CONFIG SET` names hot
+  reload rather than answering "unknown subcommand", because configuration is a
+  file here and an operator reaching for CONFIG SET needs to be told where the
+  knob actually is.
+
+config:
+  storage:
+    max_memory: "64MB"
+  server:
+    max_connections: 512
+    client_idle_timeout: 45s
+
+steps:
+  # What redis-benchmark asks for, in the order it asks.
+  - cmd: CONFIG GET save
+    expect_field:
+      save: ""
+
+  - cmd: CONFIG GET appendonly
+    expect_field:
+      appendonly: ""
+
+  # What monitoring agents ask for. Bytes as a decimal string, which is Redis's
+  # format for this parameter: 64MB is 67108864.
+  - cmd: CONFIG GET maxmemory
+    expect_field:
+      maxmemory: "67108864"
+
+  - cmd: CONFIG GET maxclients
+    expect_field:
+      maxclients: "512"
+
+  # Seconds, as Redis's `timeout` is. Note the default differs from Redis's --
+  # AtlasCache closes an idle connection where Redis keeps it -- and this is
+  # where an operator reads that back.
+  - cmd: CONFIG GET timeout
+    expect_field:
+      timeout: "45"
+
+  # Glob patterns, which is how `CONFIG GET max*` in a monitoring agent reaches
+  # both ceilings in one round trip. The matcher is the same port KEYS uses.
+  - cmd: CONFIG GET max*
+    expect_field:
+      maxmemory: "67108864"
+      maxclients: "512"
+
+  # Names are matched case-insensitively, and an exact name is echoed in the
+  # spelling the client used -- both are Redis behaviors a client that looks
+  # the reply up by the string it sent depends on.
+  - cmd: CONFIG GET MAXMEMORY
+    expect_field:
+      MAXMEMORY: "67108864"
+
+  # Every parameter at once, which is what an exporter sends.
+  - cmd: CONFIG GET *
+    expect_field:
+      save: ""
+      appendonly: ""
+      maxmemory: "67108864"
+      maxclients: "512"
+      timeout: "45"
+
+  # A parameter this server does not have is empty, never an error: tools probe
+  # for parameters they are not sure exist, and Redis answers them the same way.
+  - cmd: CONFIG GET appendfsync
+    expect: "[]"
+
+  - cmd: CONFIG GET maxmemory-policy
+    expect: "[]"
+
+  # A malformed pattern is answered rather than refused, exactly as Redis's
+  # matcher does -- it never returns an error for a pattern.
+  - cmd: CONFIG GET [a
+    expect: "[]"
+
+  # CONFIG SET names the path that works. This is the assertion that keeps the
+  # refusal from decaying into a generic "unknown subcommand" the day someone
+  # tidies the handler.
+  - cmd: CONFIG SET maxmemory 100mb
+    expect_error: >-
+      ERR CONFIG SET is not supported; AtlasCache reads its configuration from
+      the config file and reloads it when the file changes or on SIGHUP
+
+  - cmd: CONFIG RESETSTAT
+    expect_error: ERR unknown subcommand 'RESETSTAT'. Try CONFIG HELP.
+
+  # ...and that advice leads somewhere.
+  - cmd: CONFIG HELP
+    expect_value: "!= []"
+
+  # Arity errors name the subcommand, as Redis's do, and none of the refusals
+  # above cost the connection: the next command is answered normally.
+  - cmd: CONFIG GET
+    expect_error: ERR wrong number of arguments for 'config|get' command
+
+  - cmd: CONFIG
+    expect_error: ERR wrong number of arguments for 'config' command
+
+  - cmd: PING
+    expect: PONG

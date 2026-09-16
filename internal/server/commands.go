@@ -182,6 +182,7 @@ const (
 	cmdDBSize  = "DBSIZE"
 	cmdEcho    = "ECHO"
 	cmdCommand = "COMMAND"
+	cmdConfig  = "CONFIG"
 )
 
 // What HELLO and INFO report about this server. The protocol version is a
@@ -265,6 +266,11 @@ var commands = map[string]commandSpec{
 	// same empty array to all of them. See the handler for why that is better
 	// than a fabricated table.
 	cmdCommand: {minArgs: 0, maxArgs: unbounded, handler: (*session).command},
+
+	// CONFIG needs its subcommand and takes any tail, so that an unknown
+	// subcommand and a badly formed GET are the errors Redis reports rather
+	// than an arity error that names neither. Read-only: see config.go.
+	cmdConfig: {minArgs: 1, maxArgs: unbounded, handler: (*session).config},
 }
 
 // noAuthCommands is the allowlist of commands a connection may run before it
@@ -277,11 +283,16 @@ var commands = map[string]commandSpec{
 // is a silent authentication bypass on one command (FEAT-0022).
 //
 // AUTH is here because it is how a connection authenticates. HELLO is here
-// because clients negotiate the protocol before authenticating. QUIT is here
-// because refusing to let an unauthenticated client hang up cleanly serves
-// nobody. PING is here because health checks and connection pools send it
-// before anything else; note that Redis does *not* exempt PING, so a client
-// that relies on PING being refused will see a difference.
+// because `HELLO <n> AUTH <user> <pass>` negotiates and authenticates in one
+// round trip — and only for that: the handler refuses a HELLO that arrives
+// with no credentials on an unauthenticated connection, because the gate here
+// cannot see which form was sent and the properties map is not owed to a
+// client that has presented nothing (ISSUE-0020). That is a narrowing of this
+// allowlist rather than a hole in it. QUIT is here because refusing to let an
+// unauthenticated client hang up cleanly serves nobody. PING is here because
+// health checks and connection pools send it before anything else; note that
+// Redis does *not* exempt PING, so a client that relies on PING being refused
+// will see a difference — a deliberate one, listed in docs/protocol.md.
 var noAuthCommands = map[string]bool{
 	cmdAuth:  true,
 	cmdHello: true,
@@ -387,8 +398,13 @@ func (s *session) dispatch(cmd protocol.Command) (protocol.Reply, bool) {
 	spec, known := commands[cmd.Name]
 	if !known {
 		// An unauthenticated client is told to authenticate rather than which
-		// commands exist. Redis does the same, and the reason is that the
-		// command table is a fingerprint: version, build, modules loaded.
+		// commands exist, because the command table is a fingerprint: version,
+		// build, modules loaded.
+		//
+		// This is a deliberate divergence, and the comment that used to be here
+		// had it backwards: Redis 7.4 answers an unknown command with
+		// "unknown command '<name>'" before it checks authentication, measured
+		// against redis:7-alpine (ISSUE-0020). docs/protocol.md lists it.
 		if s.authRequired() {
 			return errNoAuth(), false
 		}
@@ -434,10 +450,20 @@ func (s *session) auth(cmd protocol.Command) protocol.Reply {
 		return protocol.SimpleString("OK")
 
 	case errors.Is(err, ErrAuthDisabled):
-		// Redis's exact wording, which clients configured with a password
-		// against a passwordless server surface verbatim. Answering WRONGPASS
-		// instead would send an operator hunting for a mistyped secret.
-		return protocol.Errorf("Client sent AUTH, but no password is set")
+		// Clients configured with a password against a passwordless server
+		// surface this verbatim. Answering WRONGPASS instead would send an
+		// operator hunting for a mistyped secret.
+		//
+		// This is the one auth string that is deliberately not Redis 7's.
+		// Redis 6 said what is below; Redis 7.4 says "AUTH <password> called
+		// without any password configured for the default user. Are you sure
+		// your configuration is correct?" — measured, not assumed. The Go SDK
+		// classifies this condition by the prefix "Client sent AUTH, but no
+		// password is set" (pkg/client/errors.go), so changing it would break
+		// the diagnostic it exists to produce. ISSUE-0020 records the choice
+		// and docs/protocol.md lists the divergence.
+		return protocol.Errorf("Client sent AUTH, but no password is set. " +
+			"Did you mean AUTH <username> <password>?")
 
 	default:
 		// The address and the outcome, never the token — not at debug, not
@@ -488,18 +514,41 @@ func (s *session) command(protocol.Command) protocol.Reply {
 // redis-py all read as "this server speaks RESP2" and fall back on silently.
 // Omitting HELLO entirely would answer -ERR unknown command instead, which some
 // clients treat as a hard failure (ADR-0028). RESP3 itself is FEAT-0048, in P6.
+//
+// The three checks run in Redis's order, which is what decides the awkward
+// cases (ISSUE-0020):
+//
+//  1. the protocol version, so an unsupported one is -NOPROTO even from an
+//     unauthenticated client;
+//  2. the options, so `HELLO 2 AUTH default <token>` authenticates;
+//  3. authentication, so a HELLO that carried no credentials and has none
+//     discloses nothing.
+//
+// Order 1 before 3 is not a guess. Against redis:7-alpine an unauthenticated
+// `HELLO 4` answers -NOPROTO while an unauthenticated `HELLO 3` — a version it
+// does speak — answers -NOAUTH. RESP3 is to AtlasCache what RESP4 is to Redis,
+// so -NOPROTO is the faithful answer to `HELLO 3` here, and it is also the more
+// useful one: a client probing for RESP3 needs the reply it knows how to fall
+// back from, and it may well be probing before it authenticates.
 func (s *session) hello(cmd protocol.Command) protocol.Reply {
-	if len(cmd.Args) == 0 {
-		return helloProperties()
+	if len(cmd.Args) > 0 {
+		version, err := strconv.Atoi(string(cmd.Args[0]))
+		if err != nil || version != respVersion {
+			return errNoProto()
+		}
+
+		if reply, ok := s.helloOptions(cmd.Args[1:]); !ok {
+			return reply
+		}
 	}
 
-	version, err := strconv.Atoi(string(cmd.Args[0]))
-	if err != nil || version != respVersion {
-		return errNoProto()
-	}
-
-	if reply, ok := s.helloOptions(cmd.Args[1:]); !ok {
-		return reply
+	// A bare HELLO from a connection that has not authenticated is refused.
+	// The properties map names the server, its version, its mode and its role,
+	// and none of that is owed to a client that has presented no credential.
+	// `HELLO <n> AUTH <user> <pass>` reaches this line authenticated, which is
+	// why HELLO is on the pre-auth allowlist at all.
+	if s.authRequired() {
+		return errNoAuthHello()
 	}
 
 	// Redis answers HELLO 2 with the same properties map as a bare HELLO, not a
@@ -529,8 +578,9 @@ func (s *session) helloOptions(args [][]byte) (protocol.Reply, bool) {
 		}
 
 		// SETNAME arrives with FEAT-0024. Naming the option that was refused is
-		// what tells a client which of them it was.
-		return protocol.Errorf("syntax error in HELLO option '%s'", args[i]), false
+		// what tells a client which of them it was. Capital S, because that is
+		// the byte Redis sends (ISSUE-0020).
+		return protocol.Errorf("Syntax error in HELLO option '%s'", args[i]), false
 	}
 	return nil, true
 }
@@ -953,15 +1003,36 @@ func scanFailure(err error) protocol.Reply {
 // errNoAuth is what every gated command answers on an unauthenticated
 // connection. Clients switch on the NOAUTH prefix to know they must send AUTH,
 // as opposed to having sent something wrong.
+//
+// The trailing full stop is Redis's, verified against redis:7-alpine rather
+// than copied from a document (ISSUE-0020). It is load-bearing in the sense
+// that byte-for-byte compatibility is the premise of speaking RESP at all
+// (ADR-0006): a log line or a test that compares the whole string is entitled
+// to expect the same bytes Redis sends.
 func errNoAuth() protocol.Reply {
-	return protocol.Error{Kind: "NOAUTH", Message: "Authentication required"}
+	return protocol.Error{Kind: "NOAUTH", Message: "Authentication required."}
+}
+
+// errNoAuthHello is HELLO's own refusal, and it is a different sentence from
+// the one above in Redis too: it tells the client the combined form exists,
+// which is the thing it needs to know, since HELLO is reachable before
+// authenticating precisely so that form can be used.
+func errNoAuthHello() protocol.Reply {
+	return protocol.Error{Kind: "NOAUTH", Message: "HELLO must be called with the client already " +
+		"authenticated, otherwise the HELLO <proto> AUTH <user> <pass> option can be used to " +
+		"authenticate the client and select the RESP protocol version at the same time"}
 }
 
 // errWrongPass is the single answer to a bad token and to an unknown username.
 // It does not distinguish between them, because saying which half was wrong
 // would turn one guess into two.
+//
+// "or user is disabled" is Redis's wording and stays even though AtlasCache has
+// no users to disable (ADR-0020): the string is what clients and operators
+// recognize, and inventing a shorter one buys nothing and costs a diff against
+// every Redis runbook.
 func errWrongPass() protocol.Reply {
-	return protocol.Error{Kind: "WRONGPASS", Message: "invalid username-password pair"}
+	return protocol.Error{Kind: "WRONGPASS", Message: "invalid username-password pair or user is disabled."}
 }
 
 // errNoProto is the documented fallback signal for a protocol version this

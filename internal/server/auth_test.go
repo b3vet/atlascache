@@ -19,10 +19,19 @@ import (
 // for it without matching something else by accident.
 const testToken = "s3cr3t-token-3f9a2b7c-do-not-log-me"
 
+// The replies below are Redis's, byte for byte, read off redis:7-alpine rather
+// than copied from a document (ISSUE-0020). TestAuthErrorsMatchRealRedis in
+// redis_test.go is what keeps them that way.
 const (
-	replyNoAuth    = "-NOAUTH Authentication required\r\n"
-	replyWrongPass = "-WRONGPASS invalid username-password pair\r\n"
+	replyNoAuth    = "-NOAUTH Authentication required.\r\n"
+	replyWrongPass = "-WRONGPASS invalid username-password pair or user is disabled.\r\n"
 	replyOK        = "+OK\r\n"
+
+	// HELLO's refusal is its own sentence in Redis, because the thing a client
+	// needs to be told here is that the combined form exists.
+	replyNoAuthHello = "-NOAUTH HELLO must be called with the client already authenticated, " +
+		"otherwise the HELLO <proto> AUTH <user> <pass> option can be used to authenticate " +
+		"the client and select the RESP protocol version at the same time\r\n"
 )
 
 // newAuthServer starts a server that requires authentication, and returns it
@@ -154,6 +163,15 @@ func TestAuthRequiredForEveryCommandOutsideTheAllowlist(t *testing.T) {
 			reply := exchange(t, srv, args...)
 
 			if noAuthCommands[name] {
+				// HELLO is on the allowlist for the credential-carrying form
+				// only. A bare one is refused with HELLO's own NOAUTH, so
+				// asserting merely "not the generic NOAUTH" would pass for the
+				// wrong reason (ISSUE-0020).
+				if name == cmdHello {
+					assert.Equal(t, replyNoAuthHello, reply,
+						"a HELLO carrying no credentials must not disclose the properties map")
+					return
+				}
 				assert.NotEqual(t, replyNoAuth, reply, "%s is on the pre-auth allowlist", name)
 				return
 			}
@@ -267,7 +285,11 @@ func TestAuthAgainstPasswordlessServer(t *testing.T) {
 	srv, serveErr := newTestServer(t)
 	defer shutdownServer(t, srv, serveErr)
 
-	want := "-ERR Client sent AUTH, but no password is set\r\n"
+	// Deliberately Redis 6's wording rather than Redis 7.4's: the Go SDK
+	// classifies this condition by the prefix, and ISSUE-0020 records why the
+	// prefix is pinned. redis_test.go asserts the difference explicitly so it
+	// stays a decision rather than a drift.
+	want := "-ERR Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?\r\n"
 	assert.Equal(t, want, exchange(t, srv, "AUTH", "anything"))
 	assert.Equal(t, want, exchange(t, srv, "AUTH", DefaultUser, "anything"))
 
@@ -360,8 +382,22 @@ func TestHelloAuthenticates(t *testing.T) {
 		assert.Equal(t, replyNoAuth, readReply(t, conn, reader))
 	})
 
-	t.Run("a bare HELLO is still allowed before authenticating", func(t *testing.T) {
-		assert.Equal(t, "*12\r\n", exchange(t, srv, "HELLO"))
+	t.Run("a bare HELLO discloses nothing before authenticating", func(t *testing.T) {
+		// It used to answer with the properties map, which names the server,
+		// its version, its mode and its role. Redis answers -NOAUTH, and so
+		// does this now (ISSUE-0020). The credential-carrying form above is
+		// what HELLO is on the allowlist for.
+		assert.Equal(t, replyNoAuthHello, exchange(t, srv, "HELLO"))
+		assert.Equal(t, replyNoAuthHello, exchange(t, srv, "HELLO", "2"))
+	})
+
+	t.Run("a bare HELLO answers normally once the connection has authenticated", func(t *testing.T) {
+		conn, reader := dial(t, srv)
+		send(t, conn, "*2\r\n$4\r\nAUTH\r\n$"+strconv.Itoa(len(testToken))+"\r\n"+testToken+"\r\n")
+		require.Equal(t, replyOK, readReply(t, conn, reader))
+
+		send(t, conn, "*1\r\n$5\r\nHELLO\r\n")
+		assert.Equal(t, "*12\r\n", readReply(t, conn, reader))
 	})
 
 	t.Run("HELLO 3 AUTH is still NOPROTO", func(t *testing.T) {

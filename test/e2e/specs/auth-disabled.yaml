@@ -13,15 +13,15 @@ description: >
 
 steps:
   - cmd: AUTH some-password
-    expect_error: ERR Client sent AUTH, but no password is set
+    expect_error: ERR Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?
 
   - cmd: AUTH default some-password
-    expect_error: ERR Client sent AUTH, but no password is set
+    expect_error: ERR Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?
 
   # HELLO's AUTH option goes through the same handler, so it answers the same
   # thing rather than a syntax error.
   - cmd: HELLO 2 AUTH default some-password
-    expect_error: ERR Client sent AUTH, but no password is set
+    expect_error: ERR Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?
 
   # The connection is unharmed by any of it, and nothing is gated.
   - cmd: SET open:key v

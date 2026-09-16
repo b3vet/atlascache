@@ -501,14 +501,24 @@ func tlsMissingCertificateFailsFast(c *runner.Ctx) error {
 var gatedCommands = []string{
 	"GET k", "SET k v", "SETNX k v", "DEL k", "EXISTS k", "KEYS *", "SCAN 0",
 	"TTL k", "EXPIRE k 10", "STATS", "INFO", "DBSIZE", "ECHO hi", "COMMAND",
+	"CONFIG GET maxmemory",
 }
 
-// allowedBeforeAuth is the allowlist FEAT-0022 names.
-var allowedBeforeAuth = []string{"PING", "HELLO", "AUTH wrong-token", "HELLO 2"}
+// allowedBeforeAuth is the allowlist FEAT-0022 names, minus HELLO.
+//
+// HELLO is on the allowlist for `HELLO <n> AUTH <user> <pass>` only: a HELLO
+// carrying no credentials is refused with its own NOAUTH, because the
+// properties map names the server, its version, its mode and its role
+// (ISSUE-0020). helloDisclosesNothingBeforeAuth below is that half, and it is
+// checked separately because "not the generic NOAUTH" would pass for a server
+// that disclosed everything.
+var allowedBeforeAuth = []string{ping, "AUTH wrong-token"}
 
 // authGatesEveryCommand drives the gate from outside the process.
 func authGatesEveryCommand(c *runner.Ctx) error {
-	const noAuth = "NOAUTH Authentication required"
+	// Redis's exact text, full stop included, measured against redis:7-alpine
+	// (ISSUE-0020) rather than copied from a document.
+	const noAuth = "NOAUTH Authentication required."
 
 	for _, cmd := range gatedCommands {
 		reply, err := c.Send(cmd)
@@ -546,6 +556,34 @@ func authGatesEveryCommand(c *runner.Ctx) error {
 		}
 	}
 	c.Logf("the pre-auth allowlist still answers")
+
+	return helloDisclosesNothingBeforeAuth(c)
+}
+
+// helloDisclosesNothingBeforeAuth is the other half of HELLO's allowlist entry.
+//
+// A bare HELLO used to answer with the properties map — server name, version,
+// mode and role — to anyone who could open a socket. Redis answers -NOAUTH,
+// with a sentence naming the combined form, and so does this now (ISSUE-0020).
+func helloDisclosesNothingBeforeAuth(c *runner.Ctx) error {
+	const helloNoAuth = "NOAUTH HELLO must be called with the client already authenticated, " +
+		"otherwise the HELLO <proto> AUTH <user> <pass> option can be used to authenticate " +
+		"the client and select the RESP protocol version at the same time"
+
+	for _, cmd := range []string{"HELLO", "HELLO 2"} {
+		reply, err := c.Send(cmd)
+		if err != nil {
+			return fmt.Errorf("%s: %w", cmd, err)
+		}
+		if reply.Kind != runner.KindError {
+			return fmt.Errorf("%s answered %s %q before authentication; it must disclose nothing",
+				cmd, reply.Kind, reply.String())
+		}
+		if reply.Text != helloNoAuth {
+			return fmt.Errorf("%s answered %q, want %q", cmd, reply.Text, helloNoAuth)
+		}
+	}
+	c.Logf("a credential-less HELLO discloses nothing")
 	return nil
 }
 

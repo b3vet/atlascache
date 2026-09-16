@@ -623,9 +623,9 @@ func TestHello(t *testing.T) {
 		// SETNAME arrives with FEAT-0024; until it does, naming the option is
 		// what tells a client which of them was refused. AUTH is no longer one
 		// of these — FEAT-0022 implements it, and TestHelloAuth covers it.
-		assert.Equal(t, "-ERR syntax error in HELLO option 'SETNAME'\r\n",
+		assert.Equal(t, "-ERR Syntax error in HELLO option 'SETNAME'\r\n",
 			exchange(t, srv, "HELLO", "2", "SETNAME", "client"))
-		assert.Equal(t, "-ERR syntax error in HELLO option 'AUTH'\r\n",
+		assert.Equal(t, "-ERR Syntax error in HELLO option 'AUTH'\r\n",
 			exchange(t, srv, "HELLO", "2", "AUTH", "default"),
 			"AUTH without both of its arguments is still a syntax error")
 	})
@@ -634,7 +634,7 @@ func TestHello(t *testing.T) {
 		// Not a syntax error: the option is understood, there is simply no
 		// password set. A client sending credentials it was configured with
 		// needs to be told that, or it will hunt for a mistyped secret.
-		assert.Equal(t, "-ERR Client sent AUTH, but no password is set\r\n",
+		assert.Equal(t, "-ERR Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?\r\n",
 			exchange(t, srv, "HELLO", "2", "AUTH", "default", "secret"))
 	})
 

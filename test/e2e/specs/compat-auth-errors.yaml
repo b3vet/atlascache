@@ -1,0 +1,111 @@
+version: 1
+name: compat-auth-errors
+tier: full
+feature: FEAT-0022
+issue: ISSUE-0020
+description: >
+  The authentication path answers with Redis's bytes, and a HELLO that carries
+  no credentials discloses nothing.
+
+  Both halves are the same premise. ADR-0006 makes byte-for-byte compatibility
+  the reason for speaking RESP at all, and three of these strings had quietly
+  drifted from Redis's while FEAT-0022 claimed they were "Redis's exact error" --
+  a full stop here, a clause there. They were measured against redis:7-alpine
+  rather than read off a document, and the differential run in
+  internal/server/redis_test.go is what keeps them measured.
+
+  The disclosure is the other half. A bare HELLO used to answer with the
+  properties map -- server name, version, mode and role -- to any client that
+  could open a socket. Redis refuses it, with a sentence that names the form
+  which does work, and that is what makes refusing it safe: `HELLO 2 AUTH
+  default <token>` is why HELLO is reachable before authentication at all.
+
+  One auth string is deliberately not Redis 7's, and it is not reachable from
+  here because it needs a server with no password: `AUTH` against a passwordless
+  server, covered by auth-disabled. Redis 6 sent what AtlasCache sends; Redis 7
+  replaced it with a sentence sharing no prefix, and the Go SDK classifies the
+  condition by the old prefix to produce a usable diagnostic. ISSUE-0020 records
+  the choice and docs/protocol.md lists it.
+
+config:
+  auth:
+    enabled: true
+    token: "e2e-compat-auth-1c4f77b0"
+
+steps:
+  # A gated command. The full stop is Redis's.
+  - cmd: GET compat:auth
+    expect_error: NOAUTH Authentication required.
+
+  # An unknown command is refused the same way rather than named, which is a
+  # deliberate divergence: Redis answers "unknown command" before it checks
+  # authentication, and the command table is a fingerprint. docs/protocol.md
+  # lists it.
+  - cmd: NOSUCHCOMMAND
+    expect_error: NOAUTH Authentication required.
+
+  # A wrong password. "or user is disabled." is Redis's, and stays even though
+  # there are no users to disable here: the string is what clients and runbooks
+  # recognize.
+  - cmd: AUTH not-the-token
+    expect_error: WRONGPASS invalid username-password pair or user is disabled.
+
+  - cmd: AUTH somebody e2e-compat-auth-1c4f77b0
+    expect_error: WRONGPASS invalid username-password pair or user is disabled.
+
+  # A bare HELLO discloses nothing, and says how to authenticate instead.
+  - cmd: HELLO
+    expect_error: >-
+      NOAUTH HELLO must be called with the client already authenticated,
+      otherwise the HELLO <proto> AUTH <user> <pass> option can be used to
+      authenticate the client and select the RESP protocol version at the same
+      time
+
+  - cmd: HELLO 2
+    expect_error: >-
+      NOAUTH HELLO must be called with the client already authenticated,
+      otherwise the HELLO <proto> AUTH <user> <pass> option can be used to
+      authenticate the client and select the RESP protocol version at the same
+      time
+
+  # The version is settled before the credentials are, which is Redis's own
+  # order: against redis:7-alpine an unauthenticated `HELLO 4` answers -NOPROTO
+  # while `HELLO 3` -- a version it speaks -- answers -NOAUTH. RESP3 is to
+  # AtlasCache what RESP4 is to Redis, so -NOPROTO is the faithful answer here,
+  # and it is the one a client probing for RESP3 knows how to fall back from.
+  - cmd: HELLO 3
+    expect_error: NOPROTO unsupported protocol version
+
+  - cmd: HELLO 3 AUTH default e2e-compat-auth-1c4f77b0
+    expect_error: NOPROTO unsupported protocol version
+
+  # A wrong credential inside HELLO is WRONGPASS, not a syntax error.
+  - cmd: HELLO 2 AUTH default wrong-token
+    expect_error: WRONGPASS invalid username-password pair or user is disabled.
+
+  # An unknown HELLO option names itself, with Redis's capital S.
+  - cmd: HELLO 2 SETNAME client
+    expect_error: ERR Syntax error in HELLO option 'SETNAME'
+
+  # The form HELLO is on the allowlist for. It negotiates and authenticates in
+  # one round trip, and the reply is the properties map -- which this connection
+  # has now earned.
+  - cmd: HELLO 2 AUTH default e2e-compat-auth-1c4f77b0
+    expect_field:
+      server: atlascache
+      proto: 2
+      mode: standalone
+      role: master
+
+  # And a bare HELLO on an authenticated connection answers normally: the
+  # refusal above was about credentials, not about HELLO.
+  - cmd: HELLO
+    expect_field:
+      server: atlascache
+      proto: 2
+
+  - cmd: SET compat:auth v
+    expect: OK
+
+  - cmd: GET compat:auth
+    expect: v

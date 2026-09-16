@@ -24,27 +24,32 @@ steps:
   - cmd: PING
     expect: PONG
 
-  # HELLO too, because a client negotiates before it authenticates.
+  # HELLO is on the allowlist for the form that carries credentials, and only
+  # that form. A bare one discloses the server name, version, mode and role, so
+  # it is refused -- with the sentence Redis sends, which names the combined
+  # form (ISSUE-0020). auth-forms covers the form that works.
   - cmd: HELLO
-    expect_field:
-      server: atlascache
-      proto: 2
+    expect_error: >-
+      NOAUTH HELLO must be called with the client already authenticated,
+      otherwise the HELLO <proto> AUTH <user> <pass> option can be used to
+      authenticate the client and select the RESP protocol version at the same
+      time
 
   - scenario: auth_gates_every_command
 
   - cmd: GET auth:key
-    expect_error: NOAUTH Authentication required
+    expect_error: NOAUTH Authentication required.
 
   - cmd: SET auth:key v
-    expect_error: NOAUTH Authentication required
+    expect_error: NOAUTH Authentication required.
 
   # A wrong token is WRONGPASS, and leaves the connection usable: a client that
   # mistyped a password has not lost the right to try again.
   - cmd: AUTH not-the-token
-    expect_error: WRONGPASS invalid username-password pair
+    expect_error: WRONGPASS invalid username-password pair or user is disabled.
 
   - cmd: GET auth:key
-    expect_error: NOAUTH Authentication required
+    expect_error: NOAUTH Authentication required.
 
   - cmd: AUTH e2e-auth-required-9d41c7a2
     expect: OK
@@ -75,4 +80,4 @@ steps:
     expect: OK
 
   - cmd: GET auth:key
-    expect_error: NOAUTH Authentication required
+    expect_error: NOAUTH Authentication required.

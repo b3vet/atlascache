@@ -15,7 +15,7 @@ lands in P6 (FEAT-0048, ADR-0028).
 |---------|-------|
 | `PING [message]` | `+PONG`, or the message as a bulk string |
 | `QUIT` | `+OK`, then the connection closes |
-| `HELLO [2] [AUTH user pass]` | Server properties; any other version is `-NOPROTO` |
+| `HELLO [2] [AUTH user pass]` | Server properties; any other version is `-NOPROTO`. With auth on, a `HELLO` carrying no credentials is `-NOAUTH` |
 | `AUTH [username] password` | `+OK`, or `-WRONGPASS`; `-ERR` when no password is set |
 | `SET key value [EX s \| PX ms]` | `+OK` |
 | `SETNX key value` | `:1` if stored, `:0` if a live key was in the way |
@@ -31,6 +31,7 @@ lands in P6 (FEAT-0048, ADR-0028).
 | `STATS` | AtlasCache's own statistics as a map |
 | `ECHO message` | The message, unchanged and binary-safe |
 | `COMMAND [...]` | An empty array (see below) |
+| `CONFIG GET pattern [pattern ...]` | Name/value pairs for the parameters matched (see below) |
 
 A miss is never an error. `GET` on an absent or expired key answers with the
 null bulk string, because clients read null as "not cached" and an error as
@@ -51,16 +52,34 @@ With `auth.enabled` set, one shared token guards the connection (ADR-0020):
 |-----------|-------|
 | `AUTH <token>` | `+OK` |
 | `AUTH default <token>` | `+OK`; `default` is the only username there is |
-| `AUTH <other> <token>` | `-WRONGPASS invalid username-password pair` |
+| `AUTH <other> <token>` | `-WRONGPASS invalid username-password pair or user is disabled.` |
 | `HELLO 2 AUTH default <token>` | Server properties, and the connection is authenticated |
-| Any other command first | `-NOAUTH Authentication required` |
-| `AUTH` with no password set | `-ERR Client sent AUTH, but no password is set` |
+| `HELLO` with no credentials | `-NOAUTH HELLO must be called with the client already authenticated, …` |
+| `HELLO 3`, authenticated or not | `-NOPROTO unsupported protocol version` |
+| Any other command first | `-NOAUTH Authentication required.` |
+| `AUTH` with no password set | `-ERR Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?` |
+
+Those strings are Redis's, byte for byte, measured against `redis:7-alpine`
+rather than copied from its documentation — with one deliberate exception, the
+last row, listed under **Known divergences** below.
 
 `AUTH`, `HELLO`, `PING` and `QUIT` are the only commands served before
-authenticating. Authentication is per-connection and ends with the connection.
-A wrong token is answered and not hung up on, and an unknown command from an
-unauthenticated client is answered `-NOAUTH` rather than with the name of a
-command that does not exist.
+authenticating, and `HELLO` only in the form that carries credentials:
+`HELLO 2 AUTH default <token>` negotiates and authenticates in one round trip,
+which is the reason `HELLO` is reachable at all, while a `HELLO` with no
+credentials is refused rather than answered with the properties map — that map
+names the server, its version, its mode and its role, and none of it is owed to
+a client that has presented nothing.
+
+The protocol version is settled before the credentials are, which is Redis's
+own order: `HELLO 3` is `-NOPROTO` whether or not the connection has
+authenticated, because a client probing for RESP3 needs the reply it knows how
+to fall back from.
+
+Authentication is per-connection and ends with the connection. A wrong token is
+answered and not hung up on, and an unknown command from an unauthenticated
+client is answered `-NOAUTH` rather than with the name of a command that does
+not exist — a deliberate divergence, listed below.
 
 Rotating `auth.token` in the config file takes effect without a restart, for
 authentications made after it; connections that have already authenticated are
@@ -95,9 +114,10 @@ than once.**
 
 ### Glob patterns
 
-`KEYS` and `SCAN MATCH` use Redis's matcher — a direct port of `stringmatchlen`,
-differentially tested against `redis:7-alpine` — not Go's `filepath.Match`. The
-supported syntax:
+`KEYS`, `SCAN MATCH` and `CONFIG GET` use Redis's matcher — a direct port of
+`stringmatchlen`, differentially tested against `redis:7-alpine` — not Go's
+`filepath.Match`. One port, shared by all three, so they cannot disagree about a
+pattern. The supported syntax:
 
 | Construct | Meaning |
 |-----------|---------|
@@ -209,10 +229,93 @@ Returning a fabricated command table would be worse than returning nothing:
 clients use it for client-side arity validation, and a table that disagreed with
 the server would make them reject commands the server accepts.
 
+### `CONFIG` is read-only
+
+`CONFIG GET` answers with the parameters AtlasCache actually has, as a flat
+array of name/value pairs — the shape Redis sends a RESP2 client. Glob patterns
+work, names are matched case-insensitively, several may be asked for at once,
+and an exact name is echoed back in the spelling the client used, all as Redis
+does.
+
+| Parameter | Value |
+|-----------|-------|
+| `maxmemory` | `storage.max_memory` in bytes, as a decimal string; `0` is unlimited |
+| `maxclients` | `server.max_connections` |
+| `timeout` | `server.client_idle_timeout` in seconds |
+| `save` | Empty |
+| `appendonly` | Empty |
+
+`save` and `appendonly` are there because `redis-benchmark` asks for them before
+it runs anything and prints `WARNING: Could not fetch server CONFIG` when the
+probe comes back with fewer than two elements. They are **empty rather than
+invented**: there is no persistence in v0.1.0, and `appendonly:no` would be a
+durability claim with no implementation behind it. Every other Redis parameter
+is absent, and `CONFIG GET` on an absent parameter is an empty reply rather than
+an error — which is also what Redis answers for a name it does not know.
+
+**There is no `CONFIG SET`.** Configuration is a file, re-read when it changes
+and on `SIGHUP` (see [configuration.md](configuration.md)), and a second
+mutation path would let the two disagree: the next reload would silently undo
+whatever `CONFIG SET` had done. The error says so rather than answering "unknown
+subcommand", because an operator reaching for it needs to be told where the knob
+is. `CONFIG RESETSTAT` and `CONFIG REWRITE` are not implemented either and
+answer Redis's unknown-subcommand error; `CONFIG HELP` is answered.
+
+## Not implemented
+
+AtlasCache speaks RESP and answers 19 commands. Everything else a Redis client
+might send is answered `-ERR unknown command`, and it is better to read that
+here than to find it at runtime. The one exception is `CONFIG SET`, which
+answers with what to do instead:
+
+```
+ERR CONFIG SET is not supported; AtlasCache reads its configuration from the
+config file and reloads it when the file changes or on SIGHUP
+```
+
+**What is missing is most of Redis.** AtlasCache is a cache with string values
+and expiry, not a Redis reimplementation. If your workload needs any of the
+following, it needs Redis:
+
+| Not implemented | Includes |
+|---|---|
+| **Every data structure but strings** | Lists, sets, hashes, sorted sets, streams, bitmaps, HyperLogLog, geo — `LPUSH`, `SADD`, `HSET`, `ZADD`, `XADD` and their families |
+| **Numeric operations** | `INCR`, `DECR`, `INCRBY`, `INCRBYFLOAT` |
+| **Multi-key string operations** | `MGET`, `MSET`, `MSETNX`, `GETSET`, `APPEND`, `STRLEN`, `SETRANGE`, `GETRANGE` |
+| **Transactions** | `MULTI`, `EXEC`, `DISCARD`, `WATCH` |
+| **Pub/sub** | `SUBSCRIBE`, `PUBLISH`, `PSUBSCRIBE` and the rest |
+| **Scripting** | `EVAL`, `EVALSHA`, `FUNCTION` |
+| **Databases** | `SELECT`, `SWAPDB`, `MOVE`. There is one keyspace |
+| **Keyspace administration** | `FLUSHDB`, `FLUSHALL`, `RENAME`, `RANDOMKEY`, `TYPE`, `TOUCH`, `UNLINK`, `DUMP`, `RESTORE` |
+| **Further expiry control** | `PERSIST`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `PTTL`, `EXPIRETIME` |
+| **Persistence** | `SAVE`, `BGSAVE`, `BGREWRITEAOF`, `LASTSAVE` — there is nothing to save |
+| **Replication and cluster** | `REPLICAOF`, `WAIT`, `FAILOVER`, `CLUSTER` |
+| **Client and server administration** | `CLIENT`, `DEBUG`, `MEMORY`, `SLOWLOG`, `ACL`, `MONITOR`, `SHUTDOWN`; and of the `CONFIG` subcommands, `SET`, `RESETSTAT` and `REWRITE` |
+
+Some of these are planned — see [ROADMAP.md](ROADMAP.md) — and some are not.
+Nothing above is stubbed, faked, or answered with a plausible lie: a command
+that is not implemented says so.
+
+**Pipelining works**, and is unrelated to `MULTI`: a client may write many
+commands without waiting, and they are executed in order and answered in one
+flush. What pipelining does not give you is atomicity across those commands.
+
 ## Known divergences from Redis
+
+Every row here is a decision, not an oversight. The ones marked **deliberate**
+would be changed only with a reason; the rest are v0.1.0 scope and close as
+later phases land.
 
 | Behaviour | Redis | AtlasCache |
 |-----------|-------|------------|
+| `PING` before `AUTH` | `-NOAUTH` | **Deliberate:** served, so health checks and connection pools work before a credential is presented |
+| An unknown command before `AUTH` | `-ERR unknown command '<name>'` | **Deliberate:** `-NOAUTH`, so the command table — version, build, modules — is not readable by an unauthenticated client |
+| `AUTH` with no password set | Redis 7: "AUTH `<password>` called without any password configured for the default user…" | **Deliberate:** Redis 6's wording, which the Go SDK classifies by prefix to produce a usable diagnostic (ISSUE-0020) |
+| Unknown command, authenticated | `-ERR unknown command '<name>', with args beginning with: ` | `-ERR unknown command '<name>'`; the arguments are not echoed back |
+| `HELLO <non-integer>` | `-ERR Protocol version is not an integer or out of range` | `-NOPROTO unsupported protocol version` |
+| `HELLO 3` | RESP3 | `-NOPROTO`; RESP2 only until P6 (ADR-0028) |
+| `CONFIG GET` | Several hundred parameters | Five (see above); `save` and `appendonly` empty rather than fabricated |
+| `CONFIG SET` | Applies the change | Refused, naming the config file and `SIGHUP` as the path (ADR-0009) |
 | `SCAN` cursor lifetime | Stateless; any cursor is always valid | Server-side, connection-scoped, expires (see above) |
 | `SCAN` on a huge shard | Always works | May return `ERR scan snapshot memory limit reached` |
 | `SCAN` guarantee | Tolerates concurrent resizing | Snapshot-based; keys created mid-scan may be missed |
@@ -220,12 +323,18 @@ the server would make them reject commands the server accepts.
 | `INFO` `redis_version` | Present | Absent; `atlascache_version` instead |
 | Arguments in one request | 1,048,576 | 131,072, and lower when `server.max_request_size` is (ISSUE-0018) |
 | Total size of one request | Unbounded beyond the per-field limits | `server.max_request_size`, charged while the request arrives |
-| Idle connections | Kept, unless `timeout` is set | Closed after `server.client_idle_timeout`, 30s by default |
+| Idle connections | Kept, unless `timeout` is set | Closed after `server.client_idle_timeout`, 30s by default — readable back with `CONFIG GET timeout` |
 | Output buffering | `client-output-buffer-limit`, unlimited for normal clients | `server.max_output_buffer`, 64MB, disconnect on breach |
 | Command set | Several hundred | The table above |
-| `PING` before `AUTH` | `-NOAUTH` | Served, so health checks and pools work |
-| `AUTH` error text | Ends "or user is disabled." / "Did you mean...?" | The shorter forms in the table above |
 | TLS versions | 1.2 and 1.3, configurable | 1.3 only, not configurable |
+
+Everything else on the authentication path is Redis's bytes exactly — including
+the full stop in `NOAUTH Authentication required.`, the "or user is disabled."
+in `WRONGPASS`, the sentence a credential-less `HELLO` is refused with, and the
+capital S in `Syntax error in HELLO option '…'`. They are asserted against a
+real `redis:7-alpine` by the differential run in `internal/server`, because a
+string copied from a document is not a measurement: three of them had drifted
+before anyone asked a real server (ISSUE-0020).
 
 Empty keys are **not** a divergence. `SET "" v` works, and the empty key behaves
 like any other (ISSUE-0013).

@@ -452,6 +452,14 @@ func newAuthStub(t *testing.T, token string, replies func(cmd string) runner.Rep
 
 func (s *authStub) Logs() string { return s.logs }
 
+// The refusals a correct server sends, byte for byte as Redis sends them.
+const (
+	noAuthText      = "NOAUTH Authentication required."
+	helloNoAuthText = "NOAUTH HELLO must be called with the client already authenticated, " +
+		"otherwise the HELLO <proto> AUTH <user> <pass> option can be used to authenticate " +
+		"the client and select the RESP protocol version at the same time"
+)
+
 // gated answers everything with NOAUTH except the pre-auth allowlist, which is
 // what a correct server does to an unauthenticated connection.
 func gated(cmd string) runner.Reply {
@@ -460,13 +468,16 @@ func gated(cmd string) runner.Reply {
 	case "PING":
 		return runner.StatusReply("PONG")
 	case "HELLO":
-		return runner.ArrayReply(runner.BulkReply("proto"), runner.IntegerReply(2))
+		// A bare HELLO is refused too, with HELLO's own sentence: the
+		// allowlist entry covers `HELLO <n> AUTH <user> <pass>` only
+		// (ISSUE-0020).
+		return runner.ErrorReply(helloNoAuthText)
 	case "AUTH":
-		return runner.ErrorReply("WRONGPASS invalid username-password pair")
+		return runner.ErrorReply("WRONGPASS invalid username-password pair or user is disabled.")
 	case "QUIT":
 		return runner.StatusReply("OK")
 	default:
-		return runner.ErrorReply("NOAUTH Authentication required")
+		return runner.ErrorReply(noAuthText)
 	}
 }
 
@@ -505,11 +516,23 @@ func TestAuthGatesEveryCommand(t *testing.T) {
 		// send it first; gating it breaks both.
 		harness := newAuthStub(t, "tok", func(cmd string) runner.Reply {
 			if strings.HasPrefix(cmd, "PING") {
-				return runner.ErrorReply("NOAUTH Authentication required")
+				return runner.ErrorReply(noAuthText)
 			}
 			return gated(cmd)
 		})
 		requireFailure(t, runScenario(t, "auth_gates_every_command", harness), "pre-auth allowlist")
+	})
+
+	t.Run("a bare HELLO disclosing the properties map is caught", func(t *testing.T) {
+		// The defect ISSUE-0020 found: server name, version, mode and role
+		// handed to anyone who can open a socket.
+		harness := newAuthStub(t, "tok", func(cmd string) runner.Reply {
+			if strings.HasPrefix(cmd, "HELLO") {
+				return runner.ArrayReply(runner.BulkReply("proto"), runner.IntegerReply(2))
+			}
+			return gated(cmd)
+		})
+		requireFailure(t, runScenario(t, "auth_gates_every_command", harness), "disclose nothing")
 	})
 
 	t.Run("the wrong error text is caught", func(t *testing.T) {
@@ -519,7 +542,7 @@ func TestAuthGatesEveryCommand(t *testing.T) {
 			}
 			return gated(cmd)
 		})
-		requireFailure(t, runScenario(t, "auth_gates_every_command", harness), "NOAUTH Authentication required")
+		requireFailure(t, runScenario(t, "auth_gates_every_command", harness), noAuthText)
 	})
 }
 

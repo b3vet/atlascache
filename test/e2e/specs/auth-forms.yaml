@@ -43,13 +43,13 @@ steps:
   # Accepting it would imply a user model that does not exist; refusing it
   # explicitly is what tells an operator there is none.
   - cmd: AUTH admin e2e-auth-forms-4b8e12f6
-    expect_error: WRONGPASS invalid username-password pair
+    expect_error: WRONGPASS invalid username-password pair or user is disabled.
 
   - cmd: AUTH default wrong-token
-    expect_error: WRONGPASS invalid username-password pair
+    expect_error: WRONGPASS invalid username-password pair or user is disabled.
 
   - cmd: GET forms:one
-    expect_error: NOAUTH Authentication required
+    expect_error: NOAUTH Authentication required.
 
   # HELLO 2 AUTH: negotiate and authenticate in one round trip. The reply is
   # the properties map, as Redis answers HELLO 2, not a status.
@@ -67,10 +67,10 @@ steps:
   # A wrong token in HELLO is the same WRONGPASS, and leaves the connection
   # gated rather than negotiated.
   - cmd: HELLO 2 AUTH default wrong-token
-    expect_error: WRONGPASS invalid username-password pair
+    expect_error: WRONGPASS invalid username-password pair or user is disabled.
 
   - cmd: GET forms:one
-    expect_error: NOAUTH Authentication required
+    expect_error: NOAUTH Authentication required.
 
   # RESP3 is still refused before the credentials are even looked at: a client
   # probing for RESP3 needs the reply it knows how to fall back from.
