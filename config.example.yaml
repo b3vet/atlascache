@@ -1,5 +1,12 @@
 # AtlasCache Configuration
 # Copy this file to config.yaml and modify as needed
+#
+# Every key the server understands appears below. A key that does not is
+# refused at startup, naming the key, its line and the near match -- a
+# misspelled `auth.enbaled` used to be dropped in silence and leave the server
+# running with authentication off (ISSUE-0024). A key with an unknown name in a
+# config the server is asked to reload is rejected the same way, but there the
+# running configuration is kept and the node keeps serving.
 
 # Node configuration
 node:

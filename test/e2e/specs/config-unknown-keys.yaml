@@ -1,0 +1,39 @@
+version: 1
+name: config-unknown-keys
+tier: full
+feature: FEAT-0010
+issue: ISSUE-0024
+description: >
+  A key the schema does not define refuses the start, naming the key, its
+  section, its line and the near match — `server.port` was silently dropped and
+  the server came up on the default port, and `auth.enbaled: true` was silently
+  dropped and the server came up with authentication off. A valid config still
+  starts. A SIGHUP reload carrying the same typo is rejected while the server
+  stays up, keeps its running configuration, and keeps serving: strict decoding
+  must not hand anyone a way to take a live node down by saving a file.
+
+config:
+  # Read back through /config after the rejected reload, to show the running
+  # configuration survived it. The broken file sets a different policy.
+  eviction:
+    policy: lru
+    sample_size: 5
+  admin:
+    token: "e2e-config-unknown-keys-9f31c7d4"
+
+steps:
+  # The positive control: this server was given a config with no unknown keys
+  # and is serving, so the refusals below are about the keys and not about the
+  # binary being unable to start at all.
+  - cmd: PING
+    expect: PONG
+
+  - scenario: unknown_config_key_refuses_startup
+
+  - scenario: reload_keeps_running_config_on_unknown_key
+
+  # Rejecting a reload out of band left the running server untouched.
+  - cmd: SET config-unknown-keys:alive yes
+    expect: OK
+  - cmd: GET config-unknown-keys:alive
+    expect: yes

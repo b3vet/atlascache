@@ -91,7 +91,6 @@ server:
   bind_addr: "127.0.0.1"
   client_port: $port
 admin:
-  enabled: true
   bind_addr: "127.0.0.1"
   port: $admin
 logging:

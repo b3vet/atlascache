@@ -233,11 +233,19 @@ func (w *Watcher) reloadFiles() {
 	}
 }
 
-// reload attempts to reload the configuration
+// reload attempts to reload the configuration.
+//
+// A reload that fails changes nothing: the running configuration stays, the
+// callbacks are not called, and the process keeps serving. That contract is
+// what lets startup be strict about a configuration it cannot honor
+// (ISSUE-0024) without handing an operator a way to kill a running server by
+// saving a typo — a reload is triggered by a file write and by SIGHUP, neither
+// of which anybody expects to be able to take a node down.
 func (w *Watcher) reload() {
 	cfg, err := w.loader.LoadFromFile(w.path)
 	if err != nil {
-		w.log.Error().Err(err).Msg("failed to reload config")
+		w.log.Error().Err(err).Str("path", w.path).
+			Msg("config reload rejected; keeping the running configuration")
 		return
 	}
 

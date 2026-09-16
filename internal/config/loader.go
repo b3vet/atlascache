@@ -62,6 +62,14 @@ func (l *Loader) LoadFromFile(path string) (*Config, error) {
 	// Set defaults first
 	l.setDefaults()
 
+	// Strict decoding runs before viper reads anything, so a rejected file
+	// never reaches the loader's state at all (ISSUE-0024). That is what makes
+	// a rejected hot reload harmless: the loader is reused across reloads, and
+	// the configuration it holds is the one still running.
+	if err := checkFile(path); err != nil {
+		return nil, err
+	}
+
 	// Try to read the config file
 	if err := l.v.ReadInConfig(); err != nil {
 		// Check if file doesn't exist - that's okay, we'll use defaults
@@ -72,6 +80,23 @@ func (l *Loader) LoadFromFile(path string) (*Config, error) {
 	}
 
 	return l.buildConfig()
+}
+
+// checkFile rejects a configuration file carrying keys the schema does not
+// define.
+//
+// A file that cannot be read is not reported here: it is either absent, which
+// means defaults, or unreadable, which viper reports with the reason.
+func checkFile(path string) error {
+	if path == "" {
+		return nil
+	}
+	// The path is the one the operator asked for, by flag or by search order.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	return CheckUnknownKeys(path, data)
 }
 
 // Load loads configuration from the default search paths
@@ -89,6 +114,14 @@ func (l *Loader) Load() (*Config, error) {
 	}
 
 	l.path = l.v.ConfigFileUsed()
+
+	// The file is only known once viper has found it, so the strict check runs
+	// after the read here rather than before it. Nothing reads what viper
+	// holds until buildConfig below, which this returns ahead of.
+	if err := checkFile(l.path); err != nil {
+		return nil, err
+	}
+
 	return l.buildConfig()
 }
 
