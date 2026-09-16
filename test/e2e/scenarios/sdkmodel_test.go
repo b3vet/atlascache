@@ -69,6 +69,14 @@ type sdkDefects struct {
 	hangUpEachTime bool
 	// wrongValues answers every read with something else entirely.
 	wrongValues bool
+	// scanIgnoresCount answers every scan with the whole keyspace, so a walk
+	// never has a second page — and a client that buffers the first one cannot
+	// notice the connection going away underneath it.
+	scanIgnoresCount bool
+	// authDisabledLooksWrong refuses AUTH with WRONGPASS on a server that has
+	// no password set, which sends an operator to rotate a credential that was
+	// never the problem (ISSUE-0023).
+	authDisabledLooksWrong bool
 }
 
 // sdkModel is the model server: RESP over TCP, optionally over TLS, with a
@@ -187,16 +195,33 @@ func (m *sdkModel) accept(listener net.Listener) {
 	}
 }
 
+// modelSession is what one connection owns. Scan cursors live here rather than
+// on the model because that is where the real server keeps them (ADR-0017): a
+// cursor issued to one connection is not valid on another, and a model that let
+// any connection present any cursor would make a walk that wandered across a
+// pool look correct.
+type modelSession struct {
+	authenticated bool
+	scans         map[string]*modelScan
+	nextScan      int
+}
+
+// modelScan is one snapshot, taken when a scan began.
+type modelScan struct {
+	keys   []string
+	offset int
+}
+
 func (m *sdkModel) session(conn net.Conn) {
 	reader := bufio.NewReader(conn)
-	authenticated := false
+	sess := &modelSession{scans: map[string]*modelScan{}}
 
 	for {
 		args, err := readRESPCommand(reader)
 		if err != nil {
 			return
 		}
-		reply, closes := m.dispatch(args, &authenticated)
+		reply, closes := m.dispatch(args, sess)
 		if _, err := conn.Write([]byte(reply)); err != nil {
 			return
 		}
@@ -256,7 +281,7 @@ func (m *sdkModel) hangUp() {
 // sdkPreAuth is the allowlist the real server has.
 var sdkPreAuth = map[string]bool{"PING": true, "HELLO": true, "AUTH": true, "QUIT": true}
 
-func (m *sdkModel) dispatch(args []string, authenticated *bool) (reply string, closes bool) {
+func (m *sdkModel) dispatch(args []string, sess *modelSession) (reply string, closes bool) {
 	command := strings.ToUpper(args[0])
 
 	switch command {
@@ -264,25 +289,31 @@ func (m *sdkModel) dispatch(args []string, authenticated *bool) (reply string, c
 		// What a v0.1.0 server answers HELLO 3 with (ADR-0028).
 		return sdkErr("NOPROTO unsupported protocol version"), false
 	case "AUTH":
-		return m.auth(args, authenticated), false
+		return m.auth(args, sess), false
 	case "QUIT":
 		return sdkStatus("OK"), true
 	case "PING":
 		return sdkStatus("PONG"), false
 	}
 
-	if m.defects.token != "" && !*authenticated && !sdkPreAuth[command] {
+	if m.defects.token != "" && !sess.authenticated && !sdkPreAuth[command] {
 		return sdkErr("NOAUTH Authentication required"), false
 	}
-	return m.keyspaceCommand(command, args), false
+	return m.keyspaceCommand(command, args, sess), false
 }
 
-func (m *sdkModel) auth(args []string, authenticated *bool) string {
+func (m *sdkModel) auth(args []string, sess *modelSession) string {
 	if m.defects.token == "" {
-		return sdkErr("ERR Client sent AUTH, but no password is set")
+		if m.defects.authDisabledLooksWrong {
+			// The refusal a server gives for a bad credential, from one that
+			// has no credential to check: the shape of the misdiagnosis
+			// ISSUE-0023 recorded.
+			return sdkErr("WRONGPASS invalid username-password pair")
+		}
+		return sdkErr("ERR Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?")
 	}
 	if m.defects.acceptsAnyToken || args[len(args)-1] == m.defects.token {
-		*authenticated = true
+		sess.authenticated = true
 		return sdkStatus("OK")
 	}
 	if m.defects.genericAuthError {
@@ -291,7 +322,7 @@ func (m *sdkModel) auth(args []string, authenticated *bool) string {
 	return sdkErr("WRONGPASS invalid username-password pair")
 }
 
-func (m *sdkModel) keyspaceCommand(command string, args []string) string {
+func (m *sdkModel) keyspaceCommand(command string, args []string, sess *modelSession) string {
 	switch command {
 	case "ECHO":
 		return bulkReply(args[1])
@@ -312,7 +343,7 @@ func (m *sdkModel) keyspaceCommand(command string, args []string) string {
 	case "KEYS":
 		return m.keys(args[1])
 	case "SCAN":
-		return m.scan(args)
+		return m.scan(args, sess)
 	case "DBSIZE":
 		m.mu.Lock()
 		defer m.mu.Unlock()
@@ -488,41 +519,63 @@ func (m *sdkModel) keys(pattern string) string {
 
 // scan pages the keyspace two keys at a time, so that a scan which stops at the
 // first page is visibly wrong rather than accidentally complete.
-func (m *sdkModel) scan(args []string) string {
-	cursor, err := strconv.Atoi(args[1])
-	if err != nil || cursor < 0 {
-		return sdkErr("ERR invalid cursor")
-	}
-
+//
+// The cursor is issued to this connection and refused on any other, which is
+// what the real server does (ADR-0017) and what makes a walk that does not hold
+// its connection fail here rather than pass by luck.
+func (m *sdkModel) scan(args []string, sess *modelSession) string {
 	pattern := ""
 	pageSize := 2
+	if m.defects.scanIgnoresCount {
+		pageSize = 0 // everything at once, whatever COUNT asked for
+	}
 	for i := 2; i+1 < len(args); i += 2 {
 		switch strings.ToUpper(args[i]) {
 		case "MATCH":
 			pattern = args[i+1]
 		case "COUNT":
-			if n, convErr := strconv.Atoi(args[i+1]); convErr == nil && n > 0 {
+			if n, convErr := strconv.Atoi(args[i+1]); convErr == nil && n > 0 && !m.defects.scanIgnoresCount {
 				pageSize = n
 			}
 		}
 	}
 
-	keys := m.matching(pattern)
-	if cursor > len(keys) {
+	cursor := args[1]
+	walk, known := sess.scans[cursor]
+	switch {
+	case cursor == "0":
+		walk = &modelScan{keys: m.matching(pattern)}
+	case !known:
 		return sdkErr("ERR invalid cursor")
 	}
-	end := min(cursor+pageSize, len(keys))
 
-	next := end
-	if end >= len(keys) || m.defects.scanStopsEarly {
-		next = 0
+	size := len(walk.keys)
+	if pageSize > 0 {
+		size = pageSize
+	}
+	end := min(walk.offset+size, len(walk.keys))
+	keys := walk.keys[walk.offset:end]
+	walk.offset = end
+
+	next := "0"
+	if walk.offset < len(walk.keys) && !m.defects.scanStopsEarly {
+		if cursor == "0" {
+			// Cursor ids start at one: zero means "the walk is over" and
+			// nothing else.
+			sess.nextScan++
+			cursor = strconv.Itoa(sess.nextScan)
+			sess.scans[cursor] = walk
+		}
+		next = cursor
+	} else {
+		delete(sess.scans, cursor)
 	}
 
-	page := make([]string, 0, end-cursor)
-	for _, key := range keys[cursor:end] {
+	page := make([]string, 0, len(keys))
+	for _, key := range keys {
 		page = append(page, bulkReply(key))
 	}
-	return sdkArray([]string{bulkReply(strconv.Itoa(next)), sdkArray(page)})
+	return sdkArray([]string{bulkReply(next), sdkArray(page)})
 }
 
 // matching returns the live keys matching a glob, sorted so that paging is

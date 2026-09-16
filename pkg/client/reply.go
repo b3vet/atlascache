@@ -4,9 +4,9 @@ import (
 	"strconv"
 )
 
-// opReply is the Op an error from a conversion helper carries. The failure did
-// not happen at a command or a socket, it happened while reading what one of
-// them returned.
+// opReply is the Op an error from a conversion helper carries when the reply
+// has no origin — one a test decoded by hand, or a zero [Reply]. A reply that
+// came off a connection carries the command that asked for it instead.
 const opReply = "reply"
 
 // ReplyType is the shape of a decoded reply.
@@ -127,6 +127,39 @@ type Reply struct {
 	// map frame and renders one as exactly that array, so a caller reading
 	// STATS sees the same thing from a RESP2 and a RESP3 server.
 	Arr []Reply
+
+	// op and addr are where this reply came from: the command that asked for
+	// it and the server that answered. They carry no payload and are not part
+	// of the reply — they are what a conversion failure needs to be readable,
+	// because "atlascache: reply: cannot read an array reply as bytes" names
+	// neither the call that produced it nor the server it came from
+	// (ISSUE-0023). They are unexported because they are diagnostics rather
+	// than data: a caller reads them off the [Error], not off the Reply.
+	op   string
+	addr string
+}
+
+// stampOrigin records which command on which server produced this reply, and
+// does the same for every reply nested inside it.
+//
+// Nested replies are stamped too because the conversions that fail most often
+// are the ones a caller reaches through an element — the cursor of a SCAN page,
+// one value of a STATS map — and an element that had lost its origin would give
+// exactly the unattributable error this exists to prevent.
+func (r *Reply) stampOrigin(op, addr string) {
+	r.op, r.addr = op, addr
+	for i := range r.Arr {
+		r.Arr[i].stampOrigin(op, addr)
+	}
+}
+
+// errorOp is the Op a failure reading this reply reports: the command that
+// asked for it, or [opReply] for a reply that never came off a connection.
+func (r Reply) errorOp() string {
+	if r.op == "" {
+		return opReply
+	}
+	return r.op
 }
 
 // IsNil reports whether the server answered with a null — a missing key, or an
@@ -159,7 +192,7 @@ func (r Reply) Bytes() ([]byte, error) {
 	case TypeBool:
 		return strconv.AppendInt(nil, r.Int, 10), nil
 	case TypeError:
-		return nil, replyError(opReply, "", r)
+		return nil, replyError(r.errorOp(), r.addr, r)
 	default:
 		return nil, r.mismatch("bytes")
 	}
@@ -183,11 +216,11 @@ func (r Reply) Int64() (int64, error) {
 	case TypeBulk, TypeStatus, TypeBigNumber:
 		n, err := strconv.ParseInt(string(r.Str), 10, 64)
 		if err != nil {
-			return 0, protocolError(opReply, "", "reply "+strconv.Quote(string(r.Str))+" is not an integer")
+			return 0, protocolError(r.errorOp(), r.addr, "reply "+strconv.Quote(string(r.Str))+" is not an integer")
 		}
 		return n, nil
 	case TypeError:
-		return 0, replyError(opReply, "", r)
+		return 0, replyError(r.errorOp(), r.addr, r)
 	default:
 		return 0, r.mismatch("integer")
 	}
@@ -204,7 +237,7 @@ func (r Reply) Bool() (bool, error) {
 	case TypeStatus:
 		return string(r.Str) == statusOK, nil
 	case TypeError:
-		return false, replyError(opReply, "", r)
+		return false, replyError(r.errorOp(), r.addr, r)
 	default:
 		return false, r.mismatch("boolean")
 	}
@@ -220,11 +253,11 @@ func (r Reply) Float64() (float64, error) {
 	case TypeBulk, TypeStatus:
 		f, err := strconv.ParseFloat(string(r.Str), 64)
 		if err != nil {
-			return 0, protocolError(opReply, "", "reply "+strconv.Quote(string(r.Str))+" is not a number")
+			return 0, protocolError(r.errorOp(), r.addr, "reply "+strconv.Quote(string(r.Str))+" is not a number")
 		}
 		return f, nil
 	case TypeError:
-		return 0, replyError(opReply, "", r)
+		return 0, replyError(r.errorOp(), r.addr, r)
 	default:
 		return 0, r.mismatch("number")
 	}
@@ -240,7 +273,7 @@ func (r Reply) Slice() ([]Reply, error) {
 	case TypeNil:
 		return nil, nil
 	case TypeError:
-		return nil, replyError(opReply, "", r)
+		return nil, replyError(r.errorOp(), r.addr, r)
 	default:
 		return nil, r.mismatch("array")
 	}
@@ -291,7 +324,7 @@ func (r Reply) Map() (map[string]Reply, error) {
 		return nil, err
 	}
 	if len(items)%2 != 0 {
-		return nil, protocolError(opReply, "", "map has "+strconv.Itoa(len(items))+" elements, which is not an even number of pairs")
+		return nil, protocolError(r.errorOp(), r.addr, "map has "+strconv.Itoa(len(items))+" elements, which is not an even number of pairs")
 	}
 
 	out := make(map[string]Reply, len(items)/2)
@@ -310,5 +343,5 @@ func (r Reply) Map() (map[string]Reply, error) {
 // category for "the reply was not what this call can use", and naming both
 // shapes is what makes it debuggable.
 func (r Reply) mismatch(want string) *Error {
-	return protocolError(opReply, "", "cannot read a "+r.Type.String()+" reply as "+want)
+	return protocolError(r.errorOp(), r.addr, "cannot read a "+r.Type.String()+" reply as "+want)
 }

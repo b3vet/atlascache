@@ -1,0 +1,42 @@
+version: 1
+name: sdk-scan
+tier: full
+feature: FEAT-0027
+issue: ISSUE-0023
+description: >
+  Walking the keyspace through the SDK, on the pool a caller actually has.
+
+  A scan cursor names a snapshot the server is holding for the connection that
+  asked for it (ADR-0017), and a pool exists precisely to stop a caller from
+  knowing which connection they are on. Until ISSUE-0023 the SDK left that
+  contradiction to the caller, and every caller resolved it the same way — a
+  pool of one connection — which is a workaround that works right up until
+  somebody removes it, and then returns a fraction of the keyspace with no
+  error attached.
+
+  So the walk here runs on the default pool with four other callers using the
+  same client throughout. That alone is not deterministic: a pool hands back
+  the connection it was most recently given, so a walk that released one
+  between pages usually gets it back and looks correct. The second client in
+  the scenario retires every idle connection the moment it is returned, which
+  turns "usually correct" into "refused every run".
+
+  The interrupted walk is the other half. A connection taken away mid-scan must
+  surface as an error, not as a short answer: a caller handed some of the keys
+  and told nothing has no way to know, and that is a worse failure than the one
+  it replaced.
+
+steps:
+  # The suite's own client first, so that a failure below is the SDK's rather
+  # than a server that never came up.
+  - cmd: PING
+    expect: PONG
+
+  - scenario: sdk_scan_walks_a_shared_pool
+
+  # Written by the SDK, read back by the independent client: the walk above
+  # agreed with itself, and this says the keys it walked are really there.
+  - cmd: EXISTS sdk:scan:walk:000
+    expect: 1
+
+  - scenario: sdk_scan_reports_a_broken_walk

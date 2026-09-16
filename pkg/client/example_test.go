@@ -3,7 +3,6 @@ package client_test
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"fmt"
 	"os"
@@ -67,25 +66,38 @@ func ExampleWithAuth() {
 	}
 }
 
-// TLS is a tls.Config like any other. A private CA means loading the PEM into
-// a pool; a certificate from a public CA needs neither of those lines.
+// TLS is a tls.Config like any other. A certificate from a public CA needs
+// nothing but a minimum version; a private CA is [client.WithTLSCAFile] below.
 func ExampleWithTLS() {
-	pemBytes, err := os.ReadFile("/etc/atlascache/ca.crt")
+	c, err := client.New(
+		client.WithAddr("cache.example.com:6379"),
+		client.WithTLS(&tls.Config{MinVersion: tls.VersionTLS13}),
+		client.WithAuth(os.Getenv("ATLASCACHE_AUTH")),
+	)
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
-	roots := x509.NewCertPool()
-	if !roots.AppendCertsFromPEM(pemBytes) {
-		fmt.Println("no certificates in the CA file")
-		return
-	}
+	defer func() { _ = c.Close() }()
 
+	fmt.Println(c.Ping(context.Background()))
+}
+
+// A private certificate authority is a file path, not fifteen lines of x509.
+// The file is read by New, so a path that is wrong is a startup failure rather
+// than a handshake failure on the first call.
+func ExampleWithTLSCAFile() {
 	c, err := client.New(
 		client.WithAddr("cache.internal:6379"),
-		client.WithTLS(&tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS13}),
+		client.WithTLSCAFile("/etc/atlascache/ca.crt"),
 		client.WithAuth(os.Getenv("ATLASCACHE_AUTH")),
 	)
+	if errors.Is(err, client.ErrConfig) {
+		// The CA file is missing, unreadable, or holds no certificate. Nothing
+		// was dialed, and retrying will not help.
+		fmt.Println("misconfigured:", err)
+		return
+	}
 	if err != nil {
 		fmt.Println(err)
 		return
@@ -298,12 +310,74 @@ func ExampleClient_WithRetries() {
 
 // ---- Iterating ---------------------------------------------------------------
 
-// Scan pages through the keyspace. The scan is over when the cursor comes back
-// as ScanStart, and only then — an empty page says nothing.
+// ScanAll walks the whole keyspace and hands back the keys. It holds one
+// connection for the walk, because the server's cursor belongs to the
+// connection that issued it (ADR-0017) — which is the whole reason to prefer it
+// over a loop of your own.
+func ExampleClient_ScanAll() {
+	c, err := client.New(client.WithAddr("localhost:6379"))
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	keys, err := c.ScanAll(ctx, "session:*", 100)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	fmt.Println(len(keys))
+}
+
+// ScanIter is ScanAll for a keyspace too large to hold: one key at a time, one
+// page in memory. Close it if the loop is left early, and check Err afterwards
+// — a walk that failed and one that finished both stop the loop, and only Err
+// tells them apart.
+func ExampleClient_ScanIter() {
+	c, err := client.New(client.WithAddr("localhost:6379"))
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	it := c.ScanIter(ctx, "session:*", 500)
+	defer it.Close()
+
+	var expired int
+	for it.Next() {
+		// The walk is holding one of the pool's connections while this runs, so
+		// anything in here that calls the same client needs a pool of more than
+		// one. Collecting the keys with ScanAll first is the other way.
+		ttl, ttlErr := c.TTL(ctx, it.Key())
+		if ttlErr != nil {
+			fmt.Println(ttlErr)
+			return
+		}
+		if ttl == client.TTLNoExpiry {
+			expired++
+		}
+	}
+	if err := it.Err(); err != nil {
+		fmt.Println(err)
+		return
+	}
+	fmt.Println(expired)
+}
+
+// Scan is the single-page primitive under the two above. The scan is over when
+// the cursor comes back as ScanStart, and only then — an empty page says
+// nothing. A walk built this way is correct only on a client whose pool holds
+// one connection, since every page has to go over the connection that issued
+// the cursor.
 func ExampleClient_Scan() {
-	// A cursor belongs to the connection that issued it (ADR-0017), and the
-	// SDK does not yet pin one for the length of a walk, so a scanning client
-	// gets a pool of one until ISSUE-0023 lands.
 	c, err := client.New(client.WithAddr("localhost:6379"), client.WithPoolSize(1))
 	if err != nil {
 		fmt.Println(err)
@@ -421,6 +495,7 @@ func ExampleRetryable() {
 		client.ErrServer,
 		client.ErrAuth,
 		client.ErrClosed,
+		client.ErrConfig,
 	}
 
 	for _, category := range categories {
@@ -435,6 +510,45 @@ func ExampleRetryable() {
 	// server error           false
 	// authentication failed  false
 	// client is closed       false
+	// configuration error    false
+}
+
+// ErrConfig is what New returns for an option it will not accept. It is the
+// category a program acts on differently from every other: a bad address or an
+// unreadable CA file is a reason to stop, not to retry.
+func ExampleErrConfig() {
+	_, err := client.New(client.WithPoolSize(0))
+
+	fmt.Println(errors.Is(err, client.ErrConfig), client.Retryable(err))
+	fmt.Println(err)
+
+	// Output:
+	// true false
+	// atlascache: New: the pool size must be at least 1
+}
+
+// ErrAuthDisabled is the one authentication failure the caller's token did not
+// cause: the server has no password set, so it refuses every AUTH. Telling it
+// apart is what keeps an operator from rotating a credential that is fine.
+func ExampleErrAuthDisabled() {
+	// What such a server produces, built here so the example runs.
+	var err error = &client.Error{
+		Category: client.ErrAuth,
+		Op:       "AUTH",
+		Addr:     "cache.internal:6379",
+		Kind:     "ERR",
+		Message:  "this server has authentication disabled and refuses every AUTH",
+		Err:      client.ErrAuthDisabled,
+	}
+
+	if errors.Is(err, client.ErrAuthDisabled) {
+		fmt.Println("the server is not asking for a token; unset ATLASCACHE_AUTH or turn auth on")
+	}
+	fmt.Println(errors.Is(err, client.ErrAuth))
+
+	// Output:
+	// the server is not asking for a token; unset ATLASCACHE_AUTH or turn auth on
+	// true
 }
 
 // Error carries the detail the category leaves out: which command, which

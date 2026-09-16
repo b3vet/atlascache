@@ -2,7 +2,11 @@ package client
 
 import (
 	"crypto/tls"
+	"encoding/pem"
 	"errors"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -168,6 +172,19 @@ func TestOptionsAreValidated(t *testing.T) {
 			if !errors.As(err, &typed) || typed.Op != "New" {
 				t.Fatalf("New returned %#v, want an *Error from New", err)
 			}
+
+			// The category is what a caller classifies on. Without it they have
+			// to know that New's only possible failure is a bad option, which
+			// is a fact about today's implementation rather than an API
+			// (ISSUE-0023).
+			if !errors.Is(err, ErrConfig) {
+				t.Fatalf("New returned %v, which is not an ErrConfig", err)
+			}
+			for _, other := range []error{ErrNetwork, ErrTimeout, ErrProtocol, ErrServer, ErrAuth, ErrClosed} {
+				if errors.Is(err, other) {
+					t.Fatalf("a configuration error also matches %v; the categories are meant to be exclusive", other)
+				}
+			}
 		})
 	}
 }
@@ -182,4 +199,144 @@ func TestNewIgnoresNilOptions(t *testing.T) {
 			t.Fatalf("Close: %v", err)
 		}
 	}()
+}
+
+// An argument a command cannot be built from is the same category as a bad
+// option, and names the command rather than New: "atlascache: New: DEL needs at
+// least one key" points at the wrong call.
+func TestArgumentErrorsAreConfigErrors(t *testing.T) {
+	s := newFakeServer(t)
+	c := newTestClient(t, s)
+	ctx := t.Context()
+
+	cases := map[string]struct {
+		op   string
+		call func() error
+	}{
+		"DEL with no keys": {op: "DEL", call: func() error {
+			_, err := c.Del(ctx)
+			return err
+		}},
+		"EXISTS with no keys": {op: "EXISTS", call: func() error {
+			_, err := c.Exists(ctx)
+			return err
+		}},
+		"Do with no command": {op: "DO", call: func() error {
+			_, err := c.Do(ctx)
+			return err
+		}},
+		"Do with an argument it will not guess at": {op: "DO", call: func() error {
+			_, err := c.Do(ctx, "SET", "k", struct{ A int }{1})
+			return err
+		}},
+		"a negative TTL": {op: "SET", call: func() error {
+			return c.Set(ctx, "k", []byte("v"), -time.Second)
+		}},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := tc.call()
+			if !errors.Is(err, ErrConfig) {
+				t.Fatalf("got %v, want an ErrConfig", err)
+			}
+			var typed *Error
+			if !errors.As(err, &typed) || typed.Op != tc.op {
+				t.Fatalf("got %v with Op %q, want one naming %s", err, typed.Op, tc.op)
+			}
+		})
+	}
+}
+
+// WithTLSCAFile is the private-CA case without the x509 plumbing every caller
+// was writing identically (ISSUE-0023).
+func TestWithTLSCAFile(t *testing.T) {
+	cert, _ := selfSignedCert(t)
+	caFile := writePEM(t, "ca.crt", cert.Certificate[0])
+
+	t.Run("verifies a server signed by the named authority", func(t *testing.T) {
+		noLeaks(t)
+		s := newTLSFakeServer(t, cert)
+
+		c := newTestClient(t, s, WithTLSCAFile(caFile))
+		if err := c.Ping(t.Context()); err != nil {
+			t.Fatalf("Ping over TLS verified by a CA file: %v", err)
+		}
+	})
+
+	t.Run("still refuses a server it was given no authority for", func(t *testing.T) {
+		noLeaks(t)
+		s := newTLSFakeServer(t, cert)
+
+		other, _ := selfSignedCert(t)
+		c := newTestClient(t, s,
+			WithTLSCAFile(writePEM(t, "other.crt", other.Certificate[0])),
+			WithReconnectWindow(0),
+		)
+		if err := c.Ping(t.Context()); err == nil {
+			t.Fatal("a CA file naming another authority completed the handshake")
+		}
+	})
+
+	t.Run("keeps what an earlier WithTLS set", func(t *testing.T) {
+		o := resolve(t,
+			WithTLS(&tls.Config{MinVersion: tls.VersionTLS13, ServerName: "cache.example"}),
+			WithTLSCAFile(caFile),
+		)
+		if o.tlsConfig.MinVersion != tls.VersionTLS13 || o.tlsConfig.ServerName != "cache.example" {
+			t.Fatalf("the earlier configuration was discarded: %+v", o.tlsConfig)
+		}
+		if o.tlsConfig.RootCAs == nil {
+			t.Fatal("the CA file was not loaded")
+		}
+	})
+
+	t.Run("on its own it sets a floor of TLS 1.2", func(t *testing.T) {
+		o := resolve(t, WithTLSCAFile(caFile))
+		if o.tlsConfig.MinVersion != tls.VersionTLS12 {
+			t.Fatalf("the minimum version is %#x, want TLS 1.2", o.tlsConfig.MinVersion)
+		}
+	})
+
+	// The two ways to get it wrong, both refused by New rather than by the
+	// first call: a process that cannot reach its cache should fail to start
+	// rather than start and then fail every request.
+	t.Run("a path that is not there", func(t *testing.T) {
+		_, err := New(WithTLSCAFile(filepath.Join(t.TempDir(), "absent.crt")))
+		if !errors.Is(err, ErrConfig) {
+			t.Fatalf("got %v, want an ErrConfig", err)
+		}
+	})
+
+	t.Run("a file holding no certificate", func(t *testing.T) {
+		notPEM := filepath.Join(t.TempDir(), "notes.txt")
+		if err := os.WriteFile(notPEM, []byte("this is not a certificate\n"), 0o600); err != nil {
+			t.Fatalf("writing the file: %v", err)
+		}
+		_, err := New(WithTLSCAFile(notPEM))
+		if !errors.Is(err, ErrConfig) {
+			t.Fatalf("got %v, want an ErrConfig", err)
+		}
+		if !strings.Contains(err.Error(), notPEM) {
+			t.Errorf("the error reads %q and does not name the file", err)
+		}
+	})
+
+	t.Run("an empty path", func(t *testing.T) {
+		if _, err := New(WithTLSCAFile("")); !errors.Is(err, ErrConfig) {
+			t.Fatalf("got %v, want an ErrConfig", err)
+		}
+	})
+}
+
+// writePEM writes one DER certificate out as the PEM file a CA option reads.
+func writePEM(t *testing.T, name string, der []byte) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), name)
+	encoded := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+		t.Fatalf("writing %s: %v", path, err)
+	}
+	return path
 }

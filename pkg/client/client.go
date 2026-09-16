@@ -66,8 +66,8 @@ const (
 // SetString, Exists, Expire, TTL, Keys, Ping, Echo, Info, DBSize and Stats — on
 // a network or timeout failure and on nothing else.
 //
-// SetNX, Del, Scan and [Client.Do] are never retried whatever WithRetries was
-// asked for, and each method below says why. Retryability is a property of the
+// SetNX, Del, the three scan methods and [Client.Do] are never retried whatever
+// WithRetries was asked for, and each method below says why. Retryability is a property of the
 // reply rather than of the effect: deleting twice is harmless, but the second
 // DEL answers 0 for a key the first one removed.
 type Client interface {
@@ -144,10 +144,40 @@ type Client interface {
 
 	// Keys returns every key matching a glob. It walks the whole keyspace and
 	// holds a connection for the length of the walk, blocking the server for
-	// the same period; Scan is what production code should use.
+	// the same period; ScanAll answers the same question a page at a time and
+	// is what production code should use.
 	Keys(ctx context.Context, pattern string) ([]string, error)
 
-	// Scan returns one page of the keyspace and the cursor for the next.
+	// ScanAll walks the whole keyspace and returns every key matching match,
+	// which is what most callers want from a scan. An empty match means every
+	// key; a count of zero leaves the page size to the server.
+	//
+	// It holds one connection for the length of the walk, because a scan
+	// cursor is scoped to the connection that issued it (ADR-0017). That is
+	// the constraint this method exists to carry: a walk assembled from
+	// [Client.Scan] calls over a pool larger than one connection is correct
+	// only by luck.
+	//
+	// Every matching key is held in memory at once. Use [Client.ScanIter] for
+	// a keyspace large enough for that to matter — the iterator hands back one
+	// key at a time and holds only the page it is reading.
+	ScanAll(ctx context.Context, match string, count int) ([]string, error)
+
+	// ScanIter returns an iterator over every key matching match, fetching one
+	// page at a time over a single pinned connection. An empty match means
+	// every key; a count of zero leaves the page size to the server.
+	//
+	// It is the streaming form of ScanAll, for a keyspace too large to
+	// materialize. The connection is pinned because the cursor belongs to it
+	// (ADR-0017), which has a consequence worth reading before use: see
+	// [ScanIterator] for what to do about the pool, and close the iterator if
+	// the loop is left early.
+	ScanIter(ctx context.Context, match string, count int) *ScanIterator
+
+	// Scan returns one page of the keyspace and the cursor for the next. It is
+	// the primitive the two methods above are built from, and they are what
+	// production code should reach for first.
+	//
 	// An empty match means every key; a count of zero leaves the page size to
 	// the server. Start at ScanStart and stop when [ScanResult.Done] is true:
 	// an empty page means nothing on its own, because count bounds the work a
@@ -156,12 +186,10 @@ type Client interface {
 	// Never retried, and the reason is also a constraint on the caller: a scan
 	// cursor is scoped to the connection that issued it (ADR-0017), so a page
 	// fetched over a different connection is answered with an invalid-cursor
-	// error. The SDK does not yet pin a connection for the length of a walk,
-	// so a multi-page scan over a pool larger than one connection is correct
-	// only by luck. ISSUE-0023 tracks the iterator that will carry the
-	// constraint for the caller; until it lands, walk the keyspace on a client
-	// built with WithPoolSize(1), or use Keys on a keyspace small enough to
-	// block on.
+	// error. Nothing here pins a connection across two calls — that is what
+	// ScanAll and ScanIter do — so a walk built out of this method is correct
+	// only on a client whose pool holds one connection, and is by luck on any
+	// other. Reach for it when a single page is genuinely what is wanted.
 	Scan(ctx context.Context, cursor, match string, count int) (ScanResult, error)
 
 	// Ping checks that the server is answering.
@@ -276,10 +304,10 @@ type client struct {
 // with no options at all the defaults apply: 127.0.0.1:6379, ten connections,
 // a five second dial timeout and three second read and write timeouts.
 //
-// An option that does not validate comes back as an [*Error] with Op "New" and
-// no Category, so errors.Is against the category sentinels does not match it.
-// That is a gap rather than a design: ISSUE-0023 tracks the ErrConfig sentinel
-// that will classify it.
+// An option that does not validate comes back as an [*Error] with Op "New" in
+// the [ErrConfig] category, so a caller classifies it with
+// errors.Is(err, client.ErrConfig) rather than by knowing that New's only
+// possible failure is a bad option.
 //
 // The returned client is safe for concurrent use, and one per server address
 // per process is the intended arrangement — it owns a connection pool, so a
@@ -354,7 +382,7 @@ func (c *client) SetNX(ctx context.Context, key string, value []byte) (bool, err
 // the attempt whose reply was lost (FEAT-0028).
 func (c *client) Del(ctx context.Context, keys ...string) (int64, error) {
 	if len(keys) == 0 {
-		return 0, configError("DEL needs at least one key")
+		return 0, configError(cmdDel, "DEL needs at least one key")
 	}
 	reply, err := c.call(ctx, unsafeToRetry, cmdDel, keyArgs(keys)...)
 	if err != nil {
@@ -365,7 +393,7 @@ func (c *client) Del(ctx context.Context, keys ...string) (int64, error) {
 
 func (c *client) Exists(ctx context.Context, keys ...string) (int64, error) {
 	if len(keys) == 0 {
-		return 0, configError("EXISTS needs at least one key")
+		return 0, configError(cmdExists, "EXISTS needs at least one key")
 	}
 	reply, err := c.call(ctx, idempotent, cmdExists, keyArgs(keys)...)
 	if err != nil {
@@ -420,40 +448,11 @@ func (c *client) Keys(ctx context.Context, pattern string) ([]string, error) {
 // would be told its cursor is invalid — an error that reads like a caller
 // mistake and is not.
 func (c *client) Scan(ctx context.Context, cursor, match string, count int) (ScanResult, error) {
-	if cursor == "" {
-		cursor = ScanStart
-	}
-	args := [][]byte{[]byte(cursor)}
-	if match != "" {
-		args = append(args, []byte("MATCH"), []byte(match))
-	}
-	if count > 0 {
-		args = append(args, []byte("COUNT"), []byte(strconv.Itoa(count)))
-	}
-
-	reply, err := c.call(ctx, unsafeToRetry, cmdScan, args...)
+	reply, err := c.call(ctx, unsafeToRetry, cmdScan, scanArgs(cursor, match, count)...)
 	if err != nil {
 		return ScanResult{}, err
 	}
-
-	page, err := reply.Slice()
-	if err != nil {
-		return ScanResult{}, err
-	}
-	if len(page) != 2 {
-		return ScanResult{}, protocolError(cmdScan, c.opts.addr,
-			"SCAN answered with "+strconv.Itoa(len(page))+" elements, want a cursor and a page")
-	}
-
-	next, err := page[0].Text()
-	if err != nil {
-		return ScanResult{}, err
-	}
-	keys, err := page[1].Strings()
-	if err != nil {
-		return ScanResult{}, err
-	}
-	return ScanResult{Cursor: next, Keys: keys}, nil
+	return c.scanResult(reply)
 }
 
 func (c *client) Ping(ctx context.Context) error {
@@ -509,14 +508,14 @@ func (c *client) Stats(ctx context.Context) (Stats, error) {
 
 func (c *client) Do(ctx context.Context, args ...any) (Reply, error) {
 	if len(args) == 0 {
-		return Reply{}, configError("Do needs at least a command name")
+		return Reply{}, configError(cmdDo, "Do needs at least a command name")
 	}
 
 	encoded := make([][]byte, 0, len(args))
 	for i, arg := range args {
 		value, err := encodeArg(arg)
 		if err != nil {
-			return Reply{}, configError("Do argument " + strconv.Itoa(i) + ": " + err.Error())
+			return Reply{}, configError(cmdDo, "Do argument "+strconv.Itoa(i)+": "+err.Error())
 		}
 		encoded = append(encoded, value)
 	}
@@ -594,13 +593,21 @@ func (c *client) attempt(ctx context.Context, op string, command [][]byte) (Repl
 		return Reply{}, err
 	}
 
-	reply, err := conn.exchange(ctx, op, command)
+	reply, err := c.exchange(ctx, conn, op, command)
 
 	// Returned before the reply is examined, and returned on every path: a
 	// connection held past the call that borrowed it is a leak, and a leaked
 	// connection in a fixed-size pool is an outage.
 	c.pool.put(conn)
 
+	return reply, err
+}
+
+// exchange is one round trip on a connection the caller owns, and does not
+// return it to the pool. Every call goes through here, whether the connection
+// came from the pool for this one command or is pinned for a whole scan.
+func (c *client) exchange(ctx context.Context, conn *conn, op string, command [][]byte) (Reply, error) {
+	reply, err := conn.exchange(ctx, op, command)
 	if err != nil {
 		return Reply{}, err
 	}
@@ -629,7 +636,7 @@ func expiryArgs(ttl time.Duration) ([][]byte, error) {
 	case ttl == 0:
 		return nil, nil
 	case ttl < 0:
-		return nil, configError("the TTL must not be negative")
+		return nil, configError(cmdSet, "the TTL must not be negative")
 	case ttl%time.Second == 0:
 		return [][]byte{[]byte("EX"), []byte(strconv.FormatInt(int64(ttl/time.Second), 10))}, nil
 	default:

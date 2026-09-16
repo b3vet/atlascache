@@ -1,0 +1,46 @@
+version: 1
+name: sdk-options
+tier: full
+feature: FEAT-0027
+issue: ISSUE-0023
+description: >
+  How a client is configured, and what it is told when the configuration is
+  wrong.
+
+  Nothing here is about what the SDK does — it is about what it says, which is
+  why each one was found by building a CLI on it rather than by testing it.
+  An option error with no category forces every consumer to classify by where
+  the error came from. A private certificate authority that takes a dozen lines
+  of x509 gets those dozen lines copied, and then copied wrong. And a token
+  offered to a server that has authentication switched off is reported as
+  "authentication failed", which sends an operator to rotate a credential that
+  was never the problem.
+
+  The TLS assertions carry a negative case each, because an option that "loads
+  a CA" by trusting anything passes every positive test and protects nobody.
+
+  The last one is checked against the real server deliberately: the SDK
+  recognizes a passwordless server by the beginning of what it says, so this is
+  what notices if that wording moves.
+
+config:
+  tls:
+    # cert_file and key_file are the harness's, like the ports.
+    enabled: true
+  # No auth block: this server has no password, which is what the last
+  # scenario needs and what ADR-0009 makes the default.
+
+steps:
+  - cmd: PING
+    expect: PONG
+
+  - scenario: sdk_config_errors_are_classified
+
+  - scenario: sdk_tls_ca_file_verifies_the_server
+
+  # Written by an SDK client that verified the server from a CA file alone,
+  # read back by the suite's own client.
+  - cmd: GET sdk:ca
+    expect: v
+
+  - scenario: sdk_auth_against_a_passwordless_server

@@ -45,9 +45,9 @@ name — which is how `run.sh` drives them, and how you run one by hand.
 | [`errors`](errors) | One failure of every error category, each classified with `errors.Is`. |
 | [`retries`](retries) | What `WithRetries` retries, what it refuses to, and what it costs. |
 | [`pool`](pool) | Pool size against throughput, the ceiling holding, exhaustion as a deadline. |
-| [`scan`](scan) | A complete multi-page keyspace walk, checked for exactly-once delivery. |
+| [`scan`](scan) | A complete multi-page keyspace walk over a default-sized pool, checked for exactly-once delivery. |
 | [`do`](do) | Reaching a command the SDK does not wrap, argument rendering, reply conversion. |
-| [`tls`](tls) | Verifying a private CA, authenticating from the environment. |
+| [`tls`](tls) | Verifying a private CA from a file, authenticating from the environment. |
 | [`atlasctl/tour.sh`](atlasctl/tour.sh) | Every `atlasctl` exit code and `--json` field in `docs/atlasctl.md`. |
 
 Two of them take more than `-addr`:

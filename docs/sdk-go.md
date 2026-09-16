@@ -89,6 +89,7 @@ Every option, and what it defaults to:
 | `WithAuth(token)` | none | `AUTH <token>` on every connection |
 | `WithUserAuth(user, token)` | none | the two-argument form |
 | `WithTLS(*tls.Config)` | off | see [TLS](#tls) |
+| `WithTLSCAFile(path)` | off | TLS verified against a PEM file of authorities |
 | `WithPoolSize(n)` | `10` | see [the connection pool](#the-connection-pool) |
 | `WithMaxIdleTime(d)` | `5m` | close a connection that has sat unused this long |
 | `WithDialTimeout(d)` | `5s` | one connection attempt, TLS and AUTH included |
@@ -156,8 +157,8 @@ the server does and what a caller written against Redis expects.
 
 ## Errors
 
-Every failure wraps exactly one of six category sentinels, so you classify with
-`errors.Is` and never by matching strings:
+Every failure wraps exactly one of seven category sentinels, so you classify
+with `errors.Is` and never by matching strings:
 
 | Category | Retryable | What it means |
 |---|---|---|
@@ -167,9 +168,16 @@ Every failure wraps exactly one of six category sentinels, so you classify with
 | `client.ErrServer` | no | The server received the command and refused it. |
 | `client.ErrAuth` | no | `-NOAUTH`, `-WRONGPASS` or `-NOPERM`. Fixed by configuration, not by waiting. |
 | `client.ErrClosed` | no | A call on a client whose `Close` has run. A lifecycle bug, never transient. |
+| `client.ErrConfig` | no | An option `New` refused, or an argument a command cannot be built from. Nothing was dialed. |
 
 A call canceled by its own caller belongs to **no** category and wraps
 `context.Canceled` instead, because the caller already knows what happened.
+
+One failure carries a second, narrower sentinel: `client.ErrAuthDisabled`, under
+`ErrAuth`, for a server that has authentication switched off and therefore
+refuses every `AUTH`. It is not a category — `errors.Is(err, client.ErrAuth)` is
+still true — it exists so that the one authentication failure your token did not
+cause can be recognized in code. See [Authentication](#authentication).
 
 `client.Retryable(err)` is the middle column in one function. Use it rather than
 rebuilding the table, and treat "retryable" as a statement about the *failure* —
@@ -201,7 +209,7 @@ whose **reply** survives being asked for twice:
 
 | Retried when asked | Never retried |
 |---|---|
-| `Get`, `GetString`, `Set`, `SetString`, `Exists`, `Expire`, `TTL`, `Keys`, `Ping`, `Echo`, `Info`, `DBSize`, `Stats` | `SetNX`, `Del`, `Scan`, `Do` |
+| `Get`, `GetString`, `Set`, `SetString`, `Exists`, `Expire`, `TTL`, `Keys`, `Ping`, `Echo`, `Info`, `DBSize`, `Stats` | `SetNX`, `Del`, `Scan`, `ScanAll`, `ScanIter`, `Do` |
 
 The split is about replies, not effects:
 
@@ -211,9 +219,12 @@ The split is about replies, not effects:
 - **`SetNX`** — a retry that answers `0` cannot be told from a key that was
   already there, so the caller that won the race is told it lost. That is the
   one answer `SETNX` exists to give.
-- **`Scan`** — a scan cursor is scoped to the connection that issued it
-  (ADR-0017), so a retry landing on another pooled connection is told its cursor
-  is invalid: an error that reads like the caller's mistake and is not.
+- **The scan methods** — a scan cursor is scoped to the connection that issued
+  it (ADR-0017), so a retry landing on another pooled connection is told its
+  cursor is invalid: an error that reads like the caller's mistake and is not.
+  `ScanAll` and `ScanIter` hold one connection for a whole walk, which is a
+  stronger statement of the same constraint — see
+  [Walking the keyspace](#walking-the-keyspace).
 - **`Do`** — the SDK does not know what command it is carrying. `INCRBY` and
   `GET` look alike from here, and a silently repeated write is worse than a
   surfaced error. **`Do` is never retried whatever `WithRetries` was asked
@@ -269,9 +280,14 @@ an IP, unless the certificate has an IP SAN.
 
 - **A certificate from a public CA**: `&tls.Config{MinVersion: tls.VersionTLS13}`
   and nothing else. The host's trust store does the rest.
-- **A private CA**: read the PEM, put it in an `x509.CertPool`, set `RootCAs`.
-  That is the fifteen lines every caller writes identically; see
-  [Known gaps](#known-gaps).
+- **A private CA**: `client.WithTLSCAFile(path)` — the file is read and parsed
+  by `New`, so a path that is wrong stops the process starting rather than
+  failing every call, and it is refused as `ErrConfig` naming the path. It sets
+  a floor of TLS 1.2 (the server's own floor is 1.3, so nothing older is
+  negotiated) and touches nothing else, so a caller who wants a client
+  certificate or a pinned `ServerName` passes `WithTLS` first and
+  `WithTLSCAFile` after it — in that order, because a `WithTLS` applied
+  afterwards replaces the whole configuration, CA included.
 
 A certificate that does not verify fails as `ErrNetwork`, because the connection
 never came up. It reads at first like the server being down, and the wrapped
@@ -284,8 +300,8 @@ belongs in a test and nowhere else.
 The server's protocol floor is TLS 1.3 and is deliberately not configurable
 there, because an adjustable floor is one somebody lowers.
 
-> Example: `WithTLS`. Program: `examples/tls`, run in CI against a real TLS
-> server with a certificate generated for the run.
+> Examples: `WithTLS`, `WithTLSCAFile`. Program: `examples/tls`, run in CI
+> against a real TLS server with a certificate generated for the run.
 
 ## Authentication
 
@@ -304,7 +320,15 @@ unsuppressibly — whenever the flag is used.
 A bad token is `ErrAuth`, which is not retryable: the same token will fail the
 same way, and every attempt is another failure in the server's log.
 
-> Example: `WithAuth`. Program: `examples/tls`.
+**A server with authentication *disabled* also refuses `AUTH`** — it has no
+password to check — and that failure is an `ErrAuth` your token did not cause.
+It wraps `client.ErrAuthDisabled`, and its message names the server's
+configuration rather than your credential — it says the server has
+authentication disabled, quotes what the server actually answered, and leaves
+`Kind` as the server's own `ERR`. The fix it points at is the right one: drop
+the token, or turn auth on over there.
+
+> Examples: `WithAuth`, `ErrAuthDisabled`. Program: `examples/tls`.
 
 ## The connection pool
 
@@ -333,9 +357,12 @@ Two consequences worth designing around:
    path making one cache call at a time needs far fewer connections than it has
    workers.
 
-A pool of one serializes every call through a single connection. That is what
-`atlasctl` uses — a CLI runs one command — and what a multi-page `Scan`
-currently needs.
+A pool of one serializes every call through a single connection. It is what the
+single-page `Scan` needs for a multi-page walk, and the one size a walk through
+`ScanAll` or `ScanIter` is actively wrong on: those hold a connection for the
+length of the walk, so a pool of one has nothing left for anything else while
+one is running. `atlasctl` leaves the pool at the default and opens one
+connection anyway, because a CLI makes one call at a time.
 
 > Example: `WithPoolSize`. Program: `examples/pool`, which shows the ceiling
 > holding against the server's own connection counter.
@@ -346,22 +373,54 @@ currently needs.
 connection — and the server — for the length of the walk. It is a debugging
 tool.
 
-`Scan` is the production one. Start at `client.ScanStart`, pass each result's
-`Cursor` to the next call, and stop when `result.Done()` is true — **and at no
-other time**. An empty page is not the end: `count` bounds the work the server
-does for one page, not the keys that page finds, so an empty page in a sparse
-keyspace is ordinary.
+`ScanAll(ctx, match, count)` is the one to reach for. It walks the whole
+keyspace and returns every matching key. `count` bounds the work one page does,
+and `0` leaves that to the server.
+
+`ScanIter(ctx, match, count)` is the same walk for a keyspace too large to hold
+in memory: it returns an iterator with `Next`, `Key`, `Err` and `Close`, one key
+at a time and one page buffered.
+
+**Check `Err()` after the loop.** A walk that finished and one that failed both
+stop `Next`, and the difference between them is the difference between "these
+are all the keys" and "these are some of them".
 
 The guarantee is that every key present when the scan began is returned exactly
 once, unless it is deleted mid-scan. Keys created after the scan began may or
 may not appear (ADR-0017).
 
-Every page of one walk must go over the same connection, because the cursor is
-scoped to it. Until the SDK carries that constraint for you, give a scanning
-client `WithPoolSize(1)` — see [Known gaps](#known-gaps).
+### What the pinned connection means for you
 
-> Examples: `Client.Scan`, `ScanResult.Done`. Program: `examples/scan`, which
-> walks 500 keys and checks every one came back exactly once.
+Every page of one walk goes over the same connection, because the server's
+cursor is scoped to it (ADR-0017). `ScanAll` and `ScanIter` hold one for the
+length of the walk, so you no longer need `WithPoolSize(1)` to make a multi-page
+scan correct. Three consequences:
+
+- **A walk occupies one of your pool's connections.** On the default ten that is
+  unremarkable. On a pool of one, a call made *from inside* the loop body has
+  nothing to run on and waits out its own deadline — a scan-and-delete loop
+  deadlocks immediately. Size the pool above one, or collect with `ScanAll` and
+  act on the keys afterwards.
+- **Close an iterator you abandon.** A walk that runs to completion, or fails,
+  releases its connection by itself; one you `break` out of holds it until the
+  context you passed to `ScanIter` is done. `defer it.Close()` costs nothing and
+  removes the question.
+- **A walk cannot survive its connection.** If the connection dies mid-scan the
+  walk ends with an error saying so, rather than resuming on another connection
+  (which the server answers `invalid cursor`) or stopping quietly (which would
+  hand you a truncated keyspace with no sign of it). Start the walk again.
+
+`Scan(ctx, cursor, match, count)` is still there as the single-page primitive:
+start at `client.ScanStart`, pass each result's `Cursor` to the next call, and
+stop when `result.Done()` is true — **and at no other time**, since `count`
+bounds the work the server does for one page rather than the keys that page
+finds. Nothing pins a connection across two calls of it, so a walk assembled
+this way is correct only on a client whose pool holds one connection. Reach for
+it when a single page is genuinely what you want.
+
+> Examples: `Client.ScanAll`, `Client.ScanIter`, `Client.Scan`,
+> `ScanResult.Done`. Program: `examples/scan`, which walks 500 keys over a
+> default-sized pool and checks every one came back exactly once.
 
 ## Commands the SDK does not wrap
 
@@ -451,17 +510,21 @@ today (ADR-0022).
 
 ## Known gaps
 
-These are scheduled fixes, tracked in `dev/issues/ISSUE-0023.md`, not settled
-design. They are listed here because working around a gap you do not know about
-is worse than working around one you do.
+None outstanding for v0.1.0. The five this section used to list — no `ErrConfig`
+sentinel, a `Scan` that left the connection constraint to the caller, no
+`WithTLSCAFile`, conversion errors that named neither the command nor the
+server, and an authentication failure that blamed your token for the server's
+configuration — were fixed under `dev/issues/ISSUE-0023.md` before the SDK
+became a public import path, which is the last moment any of them was cheap.
 
-| Gap | What it means for you today |
-|---|---|
-| **No `ErrConfig` sentinel.** A bad option comes back from `New` as an `*Error` with `Op: "New"` and no `Category`, so `errors.Is` against the six sentinels matches nothing. | Treat any error from `New` as a configuration error; there is nothing else it can be. |
-| **`Scan` does not pin a connection.** Cursors are connection-scoped, but nothing holds one connection for the length of a walk. | Build a scanning client with `WithPoolSize(1)`. A `ScanAll`/iterator that carries the constraint is the fix. |
-| **No `WithTLSCAFile`.** Loading a private CA is fifteen lines of `x509` plumbing every caller writes identically. | Copy them from `examples/tls`. |
-| **Conversion errors lose context.** An error from `Reply.Bytes()` carries `Op: "reply"` and an empty `Addr`, so it prints without naming the server or the command. | Add the context yourself when wrapping it. |
-| **Authenticating to a server with auth *disabled*** answers `ErrAuth` — correctly categorized, but the message points at your token rather than at the server's configuration. | If a token that works elsewhere is refused, check whether that server has auth enabled at all. |
+Two things that are design rather than gaps, since they are the ones people ask
+about:
+
+- **A scan holds a connection.** It has to; the cursor belongs to it (ADR-0017).
+  [Walking the keyspace](#walking-the-keyspace) says what to do about it.
+- **`Scan` pins nothing.** It is the single-page primitive, and a walk built out
+  of it is correct only on a pool of one connection. `ScanAll` and `ScanIter`
+  are the walk.
 
 ## The examples
 
@@ -485,9 +548,9 @@ rather than by package. `examples/README.md` says why.
 | `examples/errors` | One failure of every category, each classified with `errors.Is`. |
 | `examples/retries` | What `WithRetries` retries, what it refuses to, and what it costs. |
 | `examples/pool` | Pool size against throughput, the ceiling holding, exhaustion as a deadline. |
-| `examples/scan` | A complete multi-page walk, checked for exactly-once delivery. |
+| `examples/scan` | A complete multi-page walk over a default-sized pool, checked for exactly-once delivery. |
 | `examples/do` | Reaching an unwrapped command, argument rendering, reply conversion. |
-| `examples/tls` | Verifying a private CA, authenticating from the environment. |
+| `examples/tls` | Verifying a private CA from a file, authenticating from the environment. |
 | `examples/atlasctl/tour.sh` | Every `atlasctl` exit code and JSON field in `docs/atlasctl.md`. |
 
 ## See also

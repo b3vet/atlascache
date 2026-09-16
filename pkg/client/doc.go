@@ -50,9 +50,10 @@
 //
 // # Errors
 //
-// Every failure wraps one of six category sentinels — [ErrNetwork],
-// [ErrTimeout], [ErrProtocol], [ErrServer], [ErrAuth], [ErrClosed] — so a
-// caller decides what to do with errors.Is rather than by matching strings.
+// Every failure wraps one of seven category sentinels — [ErrNetwork],
+// [ErrTimeout], [ErrProtocol], [ErrServer], [ErrAuth], [ErrClosed],
+// [ErrConfig] — so a caller decides what to do with errors.Is rather than by
+// matching strings.
 // [Retryable] is the network/timeout half of that table in one call, and
 // [Error] carries the detail — which command, which server, which error kind
 // the server used — for errors.As. A call canceled by its caller belongs to no
@@ -69,12 +70,24 @@
 //	value, found, err := c.WithRetries(2).Get(ctx, "greeting")
 //
 // Get, GetString, Set, SetString, Exists, Expire, TTL, Keys, Ping, Echo, Info,
-// DBSize and Stats may be retried. SetNX, Del, Scan and [Client.Do] never are —
-// a retried DEL answers 0 for a key it deleted on the attempt whose reply was
-// lost, a retried SETNX reports losing a race it won, a scan cursor belongs to
-// the connection that issued it, and Do carries a command the SDK cannot
-// classify at all. What makes a command unsafe to retry is its reply, not its
-// effect.
+// DBSize and Stats may be retried. SetNX, Del, the scan methods and
+// [Client.Do] never are — a retried DEL answers 0 for a key it deleted on the
+// attempt whose reply was lost, a retried SETNX reports losing a race it won,
+// a scan cursor belongs to the connection that issued it, and Do carries a
+// command the SDK cannot classify at all. What makes a command unsafe to retry
+// is its reply, not its effect.
+//
+// # Walking the keyspace
+//
+// [Client.ScanAll] returns every matching key and [Client.ScanIter] hands them
+// back one at a time; both hold a single connection for the length of the walk,
+// because the server's scan cursor is scoped to the connection that issued it
+// (ADR-0017). [Client.Scan] is the single-page primitive underneath them, and a
+// walk assembled from it is correct only on a pool of one connection.
+//
+// An iterator left early should be closed. A walk that runs to completion
+// releases its connection on its own; one that is abandoned holds it until the
+// context passed to ScanIter is done.
 //
 // # Connections
 //

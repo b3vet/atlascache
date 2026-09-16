@@ -162,10 +162,11 @@ func (c *conn) handshake(ctx context.Context) error {
 	}
 	if reply.Type == TypeError {
 		// Every failure here is an authentication failure, whatever kind the
-		// server put on it. A server with no password set answers a plain -ERR
-		// to AUTH, and a caller who configured a token against the wrong server
-		// needs to hear "authentication", not "server error".
-		return &Error{Category: ErrAuth, Op: opAuth, Addr: c.opts.addr, Kind: reply.Kind, Message: string(reply.Str)}
+		// server put on it: a caller who configured a token against the wrong
+		// server needs to hear "authentication", not "server error".
+		// authFailure also tells apart the one refusal the token did not cause,
+		// a server that has authentication disabled.
+		return authFailure(c.opts.addr, reply)
 	}
 	return nil
 }
@@ -206,6 +207,11 @@ func (c *conn) exchange(ctx context.Context, op string, args [][]byte) (Reply, e
 	}
 
 	c.usedAt = time.Now()
+
+	// Where the reply came from, so that a conversion failing later names the
+	// command and the server rather than leaving a reader to guess which of
+	// their calls produced "cannot read an array reply as bytes" (ISSUE-0023).
+	reply.stampOrigin(op, c.opts.addr)
 	return reply, nil
 }
 
@@ -390,6 +396,7 @@ const (
 	opHello = "HELLO"
 	opAuth  = "AUTH"
 	opPool  = "pool"
+	opNew   = "New"
 )
 
 // bytesArgs is the string-literal shorthand the handshake uses. Commands built

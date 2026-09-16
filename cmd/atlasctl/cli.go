@@ -248,7 +248,9 @@ func (g *globals) context() (context.Context, context.CancelFunc) {
 //
 // Every option failure is a usage error: the only way to reach one is to have
 // typed something the SDK rejects, and reporting that as a command failure
-// would tell a script to retry a command line that will never work.
+// would tell a script to retry a command line that will never work. The SDK
+// says so itself now — its option errors carry ErrConfig — so this no longer
+// has to assume it from where the error came from.
 func (g *globals) newClient(token string) (client.Client, error) {
 	if g.timeout < 0 {
 		return nil, usageErrorf("--timeout must not be negative, got %s", g.timeout)
@@ -256,10 +258,11 @@ func (g *globals) newClient(token string) (client.Client, error) {
 
 	opts := []client.Option{
 		client.WithAddr(g.addr),
-		// One connection, because a CLI runs one command. It also keeps a
-		// SCAN's cursor on the connection that issued it (ADR-0017), which a
-		// larger pool would not guarantee across the pages of one iteration.
-		client.WithPoolSize(1),
+		// The pool is left at the SDK's default. A CLI makes one call at a time
+		// and so opens one connection whatever the ceiling is, and the reason
+		// this used to pin the pool to a single connection — keeping a SCAN's
+		// cursor on the connection that issued it (ADR-0017) — is now the SDK's
+		// job: ScanAll holds one connection for the walk (ISSUE-0023).
 		client.WithDialTimeout(g.timeout),
 		client.WithReadTimeout(g.timeout),
 		client.WithWriteTimeout(g.timeout),
@@ -273,17 +276,14 @@ func (g *globals) newClient(token string) (client.Client, error) {
 		opts = append(opts, client.WithAuth(token))
 	}
 
-	tlsConfig, err := g.tlsConfig()
-	if err != nil {
-		return nil, err
-	}
-	if tlsConfig != nil {
-		opts = append(opts, client.WithTLS(tlsConfig))
-	}
+	opts = append(opts, g.tlsOptions()...)
 
 	c, err := client.New(opts...)
 	if err != nil {
-		return nil, usageErrorf("%v", err)
+		// Returned as it came: every failure from New is an ErrConfig, and
+		// classify turns that into the same exit 2 this used to hard-code —
+		// while keeping the SDK's message, which names the option.
+		return nil, err
 	}
 	return c, nil
 }

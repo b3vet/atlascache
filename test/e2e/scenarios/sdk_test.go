@@ -56,6 +56,11 @@ func TestSDKScenariosAreRegistered(t *testing.T) {
 		"sdk_pool_discards_after_a_protocol_error",
 		"sdk_survives_a_server_restart",
 		"sdk_pool_churn_leaks_nothing",
+		"sdk_scan_walks_a_shared_pool",
+		"sdk_scan_reports_a_broken_walk",
+		"sdk_config_errors_are_classified",
+		"sdk_tls_ca_file_verifies_the_server",
+		"sdk_auth_against_a_passwordless_server",
 	} {
 		if _, ok := runner.LookupScenario(name); !ok {
 			t.Errorf("%s did not register itself", name)
@@ -269,5 +274,78 @@ func TestSDKPoolChurnLeaksNothing(t *testing.T) {
 		// of this scenario — that a closed client leaves nothing open — is
 		// proven directly in the proxy's own test.
 		sdkCatches(t, scenario, sdkDefects{hangUpEachTime: true}, "round 0")
+	})
+}
+
+func TestSDKScanWalksASharedPool(t *testing.T) {
+	t.Parallel()
+
+	const scenario = "sdk_scan_walks_a_shared_pool"
+
+	t.Run("passes against a server that pages properly", func(t *testing.T) {
+		t.Parallel()
+		sdkPasses(t, scenario, sdkDefects{})
+	})
+
+	// The model's cursors are scoped to the connection that issued them, as the
+	// real server's are, so this half also fails for a client that lets a walk
+	// wander across a pool — which is what the scenario is really about.
+	t.Run("catches a scan that claims to be finished", func(t *testing.T) {
+		t.Parallel()
+		sdkCatches(t, scenario, sdkDefects{scanStopsEarly: true}, "the walk saw")
+	})
+}
+
+func TestSDKScanReportsABrokenWalk(t *testing.T) {
+	t.Parallel()
+
+	const scenario = "sdk_scan_reports_a_broken_walk"
+
+	t.Run("passes against a server that pages properly", func(t *testing.T) {
+		t.Parallel()
+		sdkPasses(t, scenario, sdkDefects{})
+	})
+
+	// A server that answers every scan with the whole keyspace leaves the
+	// client nothing to notice a lost connection with: the walk finishes out of
+	// the page it already holds and reports success. The scenario exists to
+	// refuse that.
+	t.Run("catches a walk that cannot be interrupted", func(t *testing.T) {
+		t.Parallel()
+		sdkCatches(t, scenario, sdkDefects{scanIgnoresCount: true}, "reported no error at all")
+	})
+}
+
+// The option scenarios have no defective half: what they assert happens inside
+// the client, before or instead of anything the server says, so there is no
+// server behavior to model wrongly. They are run against a correct one to prove
+// they are wired up and that they pass.
+func TestSDKConfigErrorsAreClassified(t *testing.T) {
+	t.Parallel()
+	sdkPasses(t, "sdk_config_errors_are_classified", sdkDefects{})
+}
+
+func TestSDKTLSCAFileVerifiesTheServer(t *testing.T) {
+	t.Parallel()
+	sdkPasses(t, "sdk_tls_ca_file_verifies_the_server", sdkDefects{serveTLS: true})
+}
+
+func TestSDKAuthAgainstAPasswordlessServer(t *testing.T) {
+	t.Parallel()
+
+	const scenario = "sdk_auth_against_a_passwordless_server"
+
+	t.Run("passes against a server that says so", func(t *testing.T) {
+		t.Parallel()
+		sdkPasses(t, scenario, sdkDefects{})
+	})
+
+	// The misdiagnosis itself: a server with no password refusing AUTH the way
+	// it would refuse a wrong one. A client that cannot tell them apart sends
+	// its operator to rotate a credential that was never the problem.
+	t.Run("catches a refusal that blames the token", func(t *testing.T) {
+		t.Parallel()
+		sdkCatches(t, scenario, sdkDefects{authDisabledLooksWrong: true},
+			"does not identify a server with authentication disabled")
 	})
 }

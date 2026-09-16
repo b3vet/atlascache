@@ -546,14 +546,7 @@ func TestTLS(t *testing.T) {
 	noLeaks(t)
 	cert, pool := selfSignedCert(t)
 
-	s := &fakeServer{
-		t:         t,
-		data:      make(map[string]fakeEntry),
-		conns:     make(map[net.Conn]struct{}),
-		tlsConfig: &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13},
-	}
-	s.start(t, "127.0.0.1:0")
-	t.Cleanup(s.stop)
+	s := newTLSFakeServer(t, cert)
 
 	c := newTestClient(t, s, WithTLS(&tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS13}))
 	if err := c.Set(t.Context(), "k", []byte("v"), 0); err != nil {
@@ -569,14 +562,7 @@ func TestTLSRejectsAnUntrustedCertificate(t *testing.T) {
 	noLeaks(t)
 	cert, _ := selfSignedCert(t)
 
-	s := &fakeServer{
-		t:         t,
-		data:      make(map[string]fakeEntry),
-		conns:     make(map[net.Conn]struct{}),
-		tlsConfig: &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13},
-	}
-	s.start(t, "127.0.0.1:0")
-	t.Cleanup(s.stop)
+	s := newTLSFakeServer(t, cert)
 
 	c := newTestClient(t, s, WithTLS(&tls.Config{MinVersion: tls.VersionTLS13}), WithReconnectWindow(0))
 	if err := c.Ping(t.Context()); err == nil {
@@ -755,4 +741,155 @@ func TestReadTimeout(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("the read timeout took %v to fire", elapsed)
 	}
+}
+
+// A conversion that fails names the command and the server, which are the two
+// things a reader of the log needs and the two things "atlascache: reply:
+// cannot read an array reply as bytes" does not carry (ISSUE-0023).
+func TestConversionErrorsNameTheCommandAndTheServer(t *testing.T) {
+	noLeaks(t)
+	s := newFakeServer(t)
+	c := newTestClient(t, s)
+	ctx := t.Context()
+
+	// A GET answered with an array. No real server does this; a proxy in front
+	// of one, or a port that is not AtlasCache at all, does.
+	s.setHook(func(w *bufio.Writer, _ net.Conn, name string, _ [][]byte) bool {
+		if name != "GET" {
+			return false
+		}
+		writeArrayHeader(w, 1)
+		writeBulk(w, []byte("surprise"))
+		return true
+	})
+
+	_, _, err := c.Get(ctx, "k")
+	assertNamesTheCall(t, err, "GET", s.address())
+
+	// The same reply through Do, where the conversion happens in the caller's
+	// code rather than in the SDK's: the reply carries where it came from, so
+	// the error does too.
+	reply, err := c.Do(ctx, "GET", "k")
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	_, err = reply.Bytes()
+	assertNamesTheCall(t, err, "GET", s.address())
+
+	// And an element of an aggregate reply, which is where a conversion is
+	// most often reached: the origin is stamped through the nesting.
+	s.setHook(func(w *bufio.Writer, _ net.Conn, name string, _ [][]byte) bool {
+		if name != "STATS" {
+			return false
+		}
+		writeArrayHeader(w, 2)
+		writeBulk(w, []byte("keys"))
+		writeBulk(w, []byte("not a number"))
+		return true
+	})
+	_, err = c.Stats(ctx)
+	assertNamesTheCall(t, err, "STATS", s.address())
+}
+
+// A reply nobody read off a connection has no command and no server to name, so
+// it falls back to the generic op rather than inventing one.
+func TestAConversionErrorOnAnUnattributedReplyStillReads(t *testing.T) {
+	_, err := Reply{Type: TypeArray}.Bytes()
+	var typed *Error
+	if !errors.As(err, &typed) {
+		t.Fatalf("got %v, want an *Error", err)
+	}
+	if typed.Op != "reply" || typed.Addr != "" {
+		t.Fatalf("got Op %q and Addr %q, want the generic op and no address", typed.Op, typed.Addr)
+	}
+}
+
+func assertNamesTheCall(t *testing.T, err error, op, addr string) {
+	t.Helper()
+
+	if !errors.Is(err, ErrProtocol) {
+		t.Fatalf("got %v, want an ErrProtocol", err)
+	}
+	var typed *Error
+	if !errors.As(err, &typed) {
+		t.Fatalf("got %v, want an *Error", err)
+	}
+	if typed.Op != op {
+		t.Errorf("the failure names the operation %q, want %q", typed.Op, op)
+	}
+	if typed.Addr != addr {
+		t.Errorf("the failure names the server %q, want %q", typed.Addr, addr)
+	}
+	if !strings.Contains(err.Error(), op) || !strings.Contains(err.Error(), addr) {
+		t.Errorf("the failure reads %q, which names neither the command nor the server", err)
+	}
+}
+
+// Authenticating against a server that has authentication switched off is an
+// ErrAuth that the token did not cause, and saying "authentication failed"
+// sends its reader to check a token that is fine (ISSUE-0023).
+func TestAuthAgainstAPasswordlessServer(t *testing.T) {
+	t.Run("says the server has auth disabled", func(t *testing.T) {
+		noLeaks(t)
+		s := newFakeServer(t) // no requireAuth: this server has no password
+		c := newTestClient(t, s, WithAuth("a-token-that-is-not-the-problem"))
+
+		err := c.Ping(t.Context())
+		if !errors.Is(err, ErrAuth) {
+			t.Fatalf("got %v, want an ErrAuth", err)
+		}
+		if !errors.Is(err, ErrAuthDisabled) {
+			t.Fatalf("got %v, which does not identify a server with authentication disabled", err)
+		}
+		if Retryable(err) {
+			t.Errorf("a server with auth disabled was reported as retryable: %v", err)
+		}
+
+		var typed *Error
+		if !errors.As(err, &typed) || typed.Kind != "ERR" {
+			t.Fatalf("got kind %q, want the server's own ERR", typed.Kind)
+		}
+		// The server's own words are kept, so a reader can see what was said.
+		if !strings.Contains(err.Error(), "no password is set") {
+			t.Errorf("the failure reads %q and loses what the server said", err)
+		}
+		if !strings.Contains(err.Error(), "disabled") {
+			t.Errorf("the failure reads %q and does not point at the server's configuration", err)
+		}
+	})
+
+	// The wording of the server's refusal is not frozen: Redis continues it
+	// with ". Did you mean AUTH <username> <password>?" and AtlasCache is
+	// converging on that (ISSUE-0020). Matching the prefix is what survives it.
+	t.Run("recognizes a longer wording of the same refusal", func(t *testing.T) {
+		noLeaks(t)
+		s := newFakeServer(t)
+		s.setHook(func(w *bufio.Writer, _ net.Conn, name string, _ [][]byte) bool {
+			if name != "AUTH" {
+				return false
+			}
+			writeError(w, "ERR Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?")
+			return true
+		})
+
+		c := newTestClient(t, s, WithAuth("token"), WithReconnectWindow(0))
+		if err := c.Ping(t.Context()); !errors.Is(err, ErrAuthDisabled) {
+			t.Fatalf("got %v, want an ErrAuthDisabled", err)
+		}
+	})
+
+	t.Run("a refused token is not mistaken for it", func(t *testing.T) {
+		noLeaks(t)
+		s := newFakeServer(t)
+		s.requireAuth("s3cret")
+
+		c := newTestClient(t, s, WithAuth("wrong"))
+		err := c.Ping(t.Context())
+		if !errors.Is(err, ErrAuth) {
+			t.Fatalf("got %v, want an ErrAuth", err)
+		}
+		if errors.Is(err, ErrAuthDisabled) {
+			t.Fatalf("a wrong token was reported as a server with authentication disabled: %v", err)
+		}
+	})
 }

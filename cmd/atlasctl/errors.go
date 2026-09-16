@@ -75,6 +75,8 @@ func notFoundError(key string) error {
 //   - A protocol error is a command failure. The bytes arrived; they were not
 //     something this client could read. A retry against whatever is listening
 //     on that port will produce the same thing.
+//   - A configuration error is a usage error. The SDK refused an option this
+//     program built out of a flag, so the flag is what has to change.
 func classify(err error) (code int, kind string) {
 	var cliErr *cliError
 	if errors.As(err, &cliErr) {
@@ -82,6 +84,11 @@ func classify(err error) (code int, kind string) {
 	}
 
 	switch {
+	case errors.Is(err, client.ErrConfig):
+		// An option the SDK refused: a bad address, an unreadable CA file.
+		// Nothing was dialed and nothing will be, so it is the same answer as a
+		// flag this program rejected itself.
+		return exitUsage, kindUsage
 	case errors.Is(err, client.ErrNetwork):
 		return exitConnection, kindConnection
 	case errors.Is(err, client.ErrTimeout):

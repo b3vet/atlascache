@@ -5,10 +5,12 @@ import (
 	"errors"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 )
 
-// The six error categories every failure belongs to (P3 §4.2).
+// The seven error categories every failure belongs to (P3 §4.2, plus
+// [ErrConfig]).
 //
 // They are sentinels rather than types so that `errors.Is` answers the question
 // a caller actually has — "may I retry this?" — without matching on strings or
@@ -43,14 +45,37 @@ var (
 	// ErrClosed is a call on a client whose Close has already run. Not
 	// retryable, and never transient: it is a bug in the caller's lifecycle.
 	ErrClosed = errors.New("client is closed")
+
+	// ErrConfig is a malformed option, or an argument a command cannot be built
+	// from — anything the SDK refused before it reached the wire. Not
+	// retryable: nothing about the server, the network or the passage of time
+	// changes the answer.
+	//
+	// It is the category of every error [New] returns, which is what lets a
+	// caller tell "I was configured wrong" from "the server is unhappy"
+	// without reaching into [Error] (ISSUE-0023).
+	ErrConfig = errors.New("configuration error")
 )
+
+// ErrAuthDisabled is the detail under an [ErrAuth] raised by a server that has
+// authentication turned off: it answers AUTH with an error because there is no
+// password to check, not because the token was wrong.
+//
+// It is not a seventh category — an error carrying it is an [ErrAuth], and
+// `errors.Is` matches both — because what a caller does about it is what they
+// do about any authentication failure. It exists so that the one case where the
+// caller's credential is *not* the problem can be recognized in code rather
+// than by reading the message, and so a program can point its operator at the
+// server's configuration instead of at their token.
+var ErrAuthDisabled = errors.New("the server has authentication disabled")
 
 // Error is the single concrete error type the SDK returns.
 //
-// One type rather than six means `errors.As` always yields the detail — the
+// One type rather than seven means `errors.As` always yields the detail — the
 // operation, the address, the server's error kind — while `errors.Is` against
-// the sentinel above answers the category question. Six types would have made
-// the category check a type switch, which is exactly the API ADR-0022 rejected.
+// the sentinels above answers the category question. Seven types would have
+// made the category check a type switch, which is exactly the API ADR-0022
+// rejected.
 //
 // Reach for it when the category is not enough — to log which server failed, or
 // to read the kind the server put on a rejection:
@@ -60,7 +85,7 @@ var (
 //		// the server is out of memory, not merely unhappy with the command
 //	}
 type Error struct {
-	// Category is one of the six sentinels above, or nil for a canceled call.
+	// Category is one of the seven sentinels above, or nil for a canceled call.
 	Category error
 
 	// Op is what was being attempted: a command name ("GET"), or a stage of
@@ -75,7 +100,11 @@ type Error struct {
 	Kind string
 
 	// Message is the human-readable detail. For a server reply it is the
-	// server's own text, kind included, verbatim.
+	// server's own text, kind included, verbatim — except where the SDK can
+	// say something the server's wording does not, in which case the server's
+	// text is quoted inside it and Kind still carries the kind it sent. The
+	// passwordless-server case under [ErrAuthDisabled] is the only one that
+	// does this today.
 	Message string
 
 	// Err is the underlying cause, when there is one: a net.Error, an
@@ -143,6 +172,7 @@ func (e *Error) Unwrap() []error {
 //	[ErrServer]    no           the command reached the server and was refused
 //	[ErrAuth]      no           the token is wrong, or the server wants one
 //	[ErrClosed]    no           Close has already run; a caller lifecycle bug
+//	[ErrConfig]    no           an option or an argument the SDK refused
 //	cancellation   no           the caller canceled it, so the caller decides
 //
 // It exists so that a caller never has to rebuild that table by matching on
@@ -206,11 +236,52 @@ func closedError(op string) *Error {
 	return newError(ErrClosed, op, "", "", nil)
 }
 
-// configError is a malformed option, caught by New before anything is dialed.
-// It carries no category: it is not a failure of the server, the network or the
-// protocol, and treating it as one would make it look retryable.
-func configError(message string) *Error {
-	return newError(nil, "New", "", message, nil)
+// configError is something the SDK refused before it reached the wire: a
+// malformed option caught by New, or a command that cannot be built from the
+// arguments it was given.
+//
+// op is what the caller was doing — "New" for an option, the command name for
+// an argument — because "atlascache: New: DEL needs at least one key" names the
+// wrong call, and the name of the call is the first thing a reader looks for.
+//
+// There is no address: nothing was dialed, and naming a server would suggest
+// the server had an opinion about it.
+func configError(op, message string) *Error {
+	return newError(ErrConfig, op, "", message, nil)
+}
+
+// authDisabledPrefix is how a server that has authentication turned off begins
+// its refusal of AUTH. It is matched as a prefix rather than in full because
+// the rest of the line is not load-bearing and does move: Redis's own wording
+// continues ". Did you mean AUTH <username> <password>?", and AtlasCache is
+// converging on it (ISSUE-0020). A prefix survives that; an equality check
+// would turn a message change into a silent loss of this diagnosis.
+const authDisabledPrefix = "Client sent AUTH, but no password is set"
+
+// authFailure classifies a server's refusal of AUTH.
+//
+// Every refusal is an [ErrAuth], whatever kind the server put on it — a caller
+// who pointed a token at the wrong server needs to hear "authentication", not
+// "server error". The one worth telling apart is a server with authentication
+// disabled: it refuses every AUTH because it has no password to check, so the
+// message has to point at the server's configuration rather than at a token
+// that is not the problem (ISSUE-0023).
+func authFailure(addr string, reply Reply) *Error {
+	err := &Error{
+		Category: ErrAuth,
+		Op:       opAuth,
+		Addr:     addr,
+		Kind:     reply.Kind,
+		Message:  string(reply.Str),
+	}
+
+	detail := strings.TrimSpace(strings.TrimPrefix(string(reply.Str), reply.Kind))
+	if strings.HasPrefix(detail, authDisabledPrefix) {
+		err.Err = ErrAuthDisabled
+		err.Message = "this server has authentication disabled and refuses every AUTH, so the token is not the problem: " +
+			"drop it, or enable auth on the server (the server said " + strconv.Quote(string(reply.Str)) + ")"
+	}
+	return err
 }
 
 // The server error kinds that mean "authentication", as opposed to "that

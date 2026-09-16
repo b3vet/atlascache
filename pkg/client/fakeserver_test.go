@@ -81,6 +81,22 @@ func newFakeServerAt(t *testing.T, addr string) *fakeServer {
 	return s
 }
 
+// newTLSFakeServer starts a server that serves TLS with the given certificate,
+// which is what the TLS options have to be tested against: a handshake is the
+// one thing a plaintext fake cannot fake.
+func newTLSFakeServer(t *testing.T, cert tls.Certificate) *fakeServer {
+	t.Helper()
+	s := &fakeServer{
+		t:         t,
+		data:      make(map[string]fakeEntry),
+		conns:     make(map[net.Conn]struct{}),
+		tlsConfig: &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13},
+	}
+	s.start(t, "127.0.0.1:0")
+	t.Cleanup(s.stop)
+	return s
+}
+
 func (s *fakeServer) start(t *testing.T, addr string) {
 	t.Helper()
 
@@ -204,7 +220,7 @@ func (s *fakeServer) serve(nc net.Conn) {
 
 	r := bufio.NewReader(nc)
 	w := bufio.NewWriter(nc)
-	authed := false
+	session := &fakeSession{scans: map[string]*fakeScan{}}
 
 	for {
 		args, err := readRequest(r)
@@ -227,7 +243,7 @@ func (s *fakeServer) serve(nc net.Conn) {
 			continue
 		}
 
-		closeAfter := s.dispatch(w, name, args[1:], &authed)
+		closeAfter := s.dispatch(w, name, args[1:], session)
 		if err := w.Flush(); err != nil {
 			return
 		}
@@ -237,25 +253,43 @@ func (s *fakeServer) serve(nc net.Conn) {
 	}
 }
 
+// fakeSession is the state one connection owns.
+//
+// Scan cursors live here rather than on the server because that is where the
+// real server keeps them (ADR-0017): a cursor issued to one connection is not
+// valid on another, and a fake that let any connection present any cursor would
+// make a client which walks the keyspace across a pool look correct.
+type fakeSession struct {
+	authed   bool
+	scans    map[string]*fakeScan
+	nextScan uint64
+}
+
+// fakeScan is one snapshot, taken when a scan began.
+type fakeScan struct {
+	keys   []string
+	offset int
+}
+
 // dispatch answers one command, reporting whether the connection should close.
-func (s *fakeServer) dispatch(w *bufio.Writer, name string, args [][]byte, authed *bool) bool {
+func (s *fakeServer) dispatch(w *bufio.Writer, name string, args [][]byte, session *fakeSession) bool {
 	if name == "QUIT" {
 		writeStatus(w, statusOK)
 		return true
 	}
-	if s.handshakeCommand(w, name, args, authed) {
+	if s.handshakeCommand(w, name, args, &session.authed) {
 		return false
 	}
 
 	s.mu.Lock()
-	needsAuth := s.token != "" && !*authed
+	needsAuth := s.token != "" && !session.authed
 	s.mu.Unlock()
 	if needsAuth {
 		writeError(w, "NOAUTH Authentication required")
 		return false
 	}
 
-	s.dataCommand(w, name, args)
+	s.dataCommand(w, name, args, session)
 	return false
 }
 
@@ -315,7 +349,7 @@ func (s *fakeServer) handshakeCommand(w *bufio.Writer, name string, args [][]byt
 }
 
 //nolint:gocyclo // a command switch is one decision per command; splitting it hides the surface
-func (s *fakeServer) dataCommand(w *bufio.Writer, name string, args [][]byte) {
+func (s *fakeServer) dataCommand(w *bufio.Writer, name string, args [][]byte, session *fakeSession) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -404,13 +438,7 @@ func (s *fakeServer) dataCommand(w *bufio.Writer, name string, args [][]byte) {
 		}
 
 	case "SCAN":
-		matches := s.matching(scanMatch(args[1:]))
-		writeArrayHeader(w, 2)
-		writeBulk(w, []byte(ScanStart))
-		writeArrayHeader(w, len(matches))
-		for _, key := range matches {
-			writeBulk(w, []byte(key))
-		}
+		s.scan(w, args, session)
 
 	case "DBSIZE":
 		writeInt(w, int64(len(s.data)))
@@ -435,6 +463,55 @@ func (s *fakeServer) dataCommand(w *bufio.Writer, name string, args [][]byte) {
 	}
 }
 
+// scan answers one page, from a snapshot this connection owns.
+//
+// COUNT bounds the page; without one the whole keyspace comes back at once,
+// which is what makes the single-page tests below single-page. A cursor this
+// connection did not issue is refused the way the real server refuses one,
+// because that refusal is the entire reason the SDK pins a connection for a
+// walk. The caller holds the lock.
+func (s *fakeServer) scan(w *bufio.Writer, args [][]byte, session *fakeSession) {
+	cursor := string(args[0])
+
+	walk, ok := session.scans[cursor]
+	switch {
+	case cursor == ScanStart:
+		walk = &fakeScan{keys: s.matching(scanMatch(args[1:]))}
+	case !ok:
+		writeError(w, "ERR invalid cursor")
+		return
+	}
+
+	size := len(walk.keys)
+	if count := scanCount(args[1:]); count > 0 {
+		size = count
+	}
+	end := min(walk.offset+size, len(walk.keys))
+	page := walk.keys[walk.offset:end]
+	walk.offset = end
+
+	next := ScanStart
+	if walk.offset < len(walk.keys) {
+		if cursor == ScanStart {
+			// Cursor ids start at one: zero is reserved for "the walk is over"
+			// and nothing else (ADR-0017).
+			session.nextScan++
+			cursor = strconv.FormatUint(session.nextScan, 10)
+			session.scans[cursor] = walk
+		}
+		next = cursor
+	} else {
+		delete(session.scans, cursor)
+	}
+
+	writeArrayHeader(w, 2)
+	writeBulk(w, []byte(next))
+	writeArrayHeader(w, len(page))
+	for _, key := range page {
+		writeBulk(w, []byte(key))
+	}
+}
+
 // live reads a key, honoring its expiry. The caller holds the lock.
 func (s *fakeServer) live(key string) (fakeEntry, bool) {
 	entry, ok := s.data[key]
@@ -449,6 +526,7 @@ func (s *fakeServer) live(key string) (fakeEntry, bool) {
 }
 
 // matching is glob enough for a test: everything, an exact name, or a prefix.
+// The caller holds the lock.
 func (s *fakeServer) matching(pattern string) []string {
 	keys := make([]string, 0, len(s.data))
 	for key := range s.data {
@@ -482,6 +560,19 @@ func scanMatch(args [][]byte) string {
 		}
 	}
 	return "*"
+}
+
+func scanCount(args [][]byte) int {
+	for i := 0; i+1 < len(args); i += 2 {
+		if strings.EqualFold(string(args[i]), "COUNT") {
+			count, err := strconv.Atoi(string(args[i+1]))
+			if err != nil {
+				return 0
+			}
+			return count
+		}
+	}
+	return 0
 }
 
 func parseExpiry(args [][]byte) (time.Time, bool) {

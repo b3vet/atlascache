@@ -3,7 +3,9 @@ package client
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"net"
+	"os"
 	"time"
 )
 
@@ -83,7 +85,7 @@ func defaultOptions() *options {
 func WithAddr(addr string) Option {
 	return func(o *options) error {
 		if addr == "" {
-			return configError("the address must not be empty")
+			return configError(opNew, "the address must not be empty")
 		}
 		o.addr = addr
 		return nil
@@ -102,13 +104,14 @@ func WithAddr(addr string) Option {
 // ATLASCACHE_AUTH to its own --auth flag.
 //
 // Authenticating against a server that has auth disabled fails with [ErrAuth]
-// even though the token is not the problem — the server answers "no password
-// is set" and the SDK classifies every AUTH failure the same way. ISSUE-0023
-// tracks telling those two apart.
+// even though the token is not the problem: the server has no password to check
+// and refuses every AUTH. That one is told apart from a refused token — it
+// wraps [ErrAuthDisabled], and its message names the server's configuration
+// rather than the caller's token.
 func WithAuth(token string) Option {
 	return func(o *options) error {
 		if token == "" {
-			return configError("the auth token must not be empty")
+			return configError(opNew, "the auth token must not be empty")
 		}
 		o.username = ""
 		o.token = token
@@ -125,10 +128,10 @@ func WithAuth(token string) Option {
 func WithUserAuth(username, token string) Option {
 	return func(o *options) error {
 		if username == "" {
-			return configError("the auth username must not be empty")
+			return configError(opNew, "the auth username must not be empty")
 		}
 		if token == "" {
-			return configError("the auth token must not be empty")
+			return configError(opNew, "the auth token must not be empty")
 		}
 		o.username = username
 		o.token = token
@@ -144,10 +147,9 @@ func WithUserAuth(username, token string) Option {
 // like a certificate problem and is not.
 //
 // A config of &tls.Config{MinVersion: tls.VersionTLS13} verifies the server
-// against the host's trust store, which is what a real certificate wants. A
-// private CA means loading the PEM into an x509.CertPool and setting RootCAs;
-// see the TLS example. That is fifteen lines every caller writes identically,
-// and ISSUE-0023 tracks the WithTLSCAFile that will replace them.
+// against the host's trust store, which is what a real certificate wants. For a
+// private CA, reach for [WithTLSCAFile] rather than assembling an x509.CertPool
+// here: it is the same thing, without the plumbing.
 //
 // InsecureSkipVerify turns the connection into encryption without
 // authentication — anything on the path can present its own certificate — so
@@ -155,9 +157,70 @@ func WithUserAuth(username, token string) Option {
 func WithTLS(config *tls.Config) Option {
 	return func(o *options) error {
 		if config == nil {
-			return configError("the TLS configuration must not be nil")
+			return configError(opNew, "the TLS configuration must not be nil")
 		}
 		o.tlsConfig = config.Clone()
+		return nil
+	}
+}
+
+// WithTLSCAFile makes every connection TLS, verifying the server against the
+// certificate authorities in a PEM file.
+//
+// It is the private-CA case, which is most of them: a cache is an internal
+// service, its certificate is usually issued by an internal authority, and
+// without this every caller writes the same dozen lines of os.ReadFile,
+// x509.NewCertPool and AppendCertsFromPEM (ISSUE-0023).
+//
+//	c, err := client.New(
+//		client.WithAddr("cache.internal:6379"),
+//		client.WithTLSCAFile("/etc/atlascache/ca.crt"),
+//	)
+//
+// The file is read once, here, so that an unreadable path or a file holding no
+// certificate is an error from [New] rather than a handshake failure on the
+// first call — the difference between a process that refuses to start and one
+// that starts and then cannot talk to anything.
+//
+// The floor is TLS 1.2 rather than the server's own 1.3, so that this client
+// keeps working against a server that later chooses to accept 1.2 without ever
+// being the reason an older version is negotiated. A caller who wants a
+// different floor, a client certificate, or a pinned ServerName composes the
+// two options — this one keeps whatever an earlier [WithTLS] set and replaces
+// only RootCAs:
+//
+//	client.WithTLS(&tls.Config{MinVersion: tls.VersionTLS13}),
+//	client.WithTLSCAFile("/etc/atlascache/ca.crt"),
+//
+// Order matters there, and only in that direction: a [WithTLS] applied after
+// this one replaces the configuration outright, CA included.
+func WithTLSCAFile(path string) Option {
+	return func(o *options) error {
+		if path == "" {
+			return configError(opNew, "the TLS CA file path must not be empty")
+		}
+
+		pem, err := os.ReadFile(path)
+		if err != nil {
+			return configError(opNew, "reading the TLS CA file: "+err.Error())
+		}
+
+		roots := x509.NewCertPool()
+		if !roots.AppendCertsFromPEM(pem) {
+			// AppendCertsFromPEM reports nothing but "none of it parsed", which
+			// is almost always one of these two mistakes.
+			return configError(opNew, "the TLS CA file "+path+
+				" holds no PEM certificate; a DER .crt or a private key would look like this")
+		}
+
+		config := o.tlsConfig
+		if config == nil {
+			config = &tls.Config{MinVersion: tls.VersionTLS12}
+		} else {
+			config = config.Clone()
+		}
+		config.RootCAs = roots
+		o.tlsConfig = config
 		return nil
 	}
 }
@@ -185,12 +248,15 @@ func WithTLS(config *tls.Config) Option {
 // workers, because each connection is held only for one round trip.
 //
 // A pool of one serializes every call through a single connection, which is
-// what atlasctl uses — a CLI runs one command — and what a multi-page [Client.Scan]
-// currently needs, since a cursor belongs to the connection that issued it.
+// what a CLI running one command wants and what a busy service does not. It is
+// no longer what a multi-page scan needs: [Client.ScanIter] pins a connection
+// for the length of a walk itself (ISSUE-0023). Note the other side of that —
+// a walk in progress is holding one of these connections, so a pool of one has
+// nothing left for a call made from inside the loop.
 func WithPoolSize(size int) Option {
 	return func(o *options) error {
 		if size < 1 {
-			return configError("the pool size must be at least 1")
+			return configError(opNew, "the pool size must be at least 1")
 		}
 		o.poolSize = size
 		return nil
@@ -208,7 +274,7 @@ func WithPoolSize(size int) Option {
 func WithMaxIdleTime(d time.Duration) Option {
 	return func(o *options) error {
 		if d < 0 {
-			return configError("the maximum idle time must not be negative")
+			return configError(opNew, "the maximum idle time must not be negative")
 		}
 		o.maxIdleTime = d
 		return nil
@@ -220,7 +286,7 @@ func WithMaxIdleTime(d time.Duration) Option {
 func WithDialTimeout(d time.Duration) Option {
 	return func(o *options) error {
 		if d < 0 {
-			return configError("the dial timeout must not be negative")
+			return configError(opNew, "the dial timeout must not be negative")
 		}
 		o.dialTimeout = d
 		return nil
@@ -232,7 +298,7 @@ func WithDialTimeout(d time.Duration) Option {
 func WithReadTimeout(d time.Duration) Option {
 	return func(o *options) error {
 		if d < 0 {
-			return configError("the read timeout must not be negative")
+			return configError(opNew, "the read timeout must not be negative")
 		}
 		o.readTimeout = d
 		return nil
@@ -244,7 +310,7 @@ func WithReadTimeout(d time.Duration) Option {
 func WithWriteTimeout(d time.Duration) Option {
 	return func(o *options) error {
 		if d < 0 {
-			return configError("the write timeout must not be negative")
+			return configError(opNew, "the write timeout must not be negative")
 		}
 		o.writeTimeout = d
 		return nil
@@ -265,7 +331,7 @@ func WithWriteTimeout(d time.Duration) Option {
 func WithReconnectWindow(d time.Duration) Option {
 	return func(o *options) error {
 		if d < 0 {
-			return configError("the reconnect window must not be negative")
+			return configError(opNew, "the reconnect window must not be negative")
 		}
 		o.reconnectWindow = d
 		return nil
@@ -281,10 +347,10 @@ func WithReconnectWindow(d time.Duration) Option {
 func WithBackoff(base, maximum time.Duration) Option {
 	return func(o *options) error {
 		if base < 0 || maximum < 0 {
-			return configError("the backoff durations must not be negative")
+			return configError(opNew, "the backoff durations must not be negative")
 		}
 		if maximum > 0 && base > maximum {
-			return configError("the backoff base must not exceed the maximum")
+			return configError(opNew, "the backoff base must not exceed the maximum")
 		}
 		o.backoffBase = base
 		o.backoffMax = maximum

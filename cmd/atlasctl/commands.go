@@ -355,25 +355,20 @@ func scanCommand() command {
 					return result{}, usageErrorf("--count must not be negative, got %d", *count)
 				}
 
-				var keys []string
-				cursor := client.ScanStart
-				for {
-					page, err := c.Scan(ctx, cursor, *match, *count)
-					if err != nil {
-						return result{}, err
-					}
-					keys = append(keys, page.Keys...)
-					cursor = page.Cursor
-					if page.Done() {
-						break
-					}
+				// ScanAll runs the whole walk on one connection, which is what
+				// the server's cursors require (ADR-0017). This used to be a
+				// loop here over a client pinned to a single connection; the
+				// SDK carries the constraint now (ISSUE-0023).
+				keys, err := c.ScanAll(ctx, *match, *count)
+				if err != nil {
+					return result{}, err
 				}
 				encoded, encoding := encodeKeys(keys)
 
 				return result{
 					data: scanData{
 						Match: *match, Keys: encoded, Count: len(keys),
-						Cursor: cursor, Complete: true, Encoding: encoding,
+						Cursor: client.ScanStart, Complete: true, Encoding: encoding,
 					},
 					text: func(o *output) error { return o.write(indentedLines(keys)) },
 				}, nil

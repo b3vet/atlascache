@@ -26,6 +26,11 @@
 // finds. And a cursor belongs to the connection that issued it (ADR-0017), so
 // every page of one walk must go over the same connection.
 //
+// The second one is the SDK's job now: ScanIter and ScanAll hold one connection
+// for the length of a walk, so this runs on an ordinary pool. It used to need a
+// client pinned to a single connection (ISSUE-0023), which worked and hid the
+// constraint in every caller's setup code.
+//
 // It exits 0 when the walk returned every key exactly once and 1 otherwise.
 package main
 
@@ -55,12 +60,9 @@ func main() {
 }
 
 func run(addr string, keyCount, pageSize int) error {
-	// A pool of one, because the SDK does not yet pin a connection for the
-	// length of a walk and a cursor is only valid on the connection that
-	// issued it. ISSUE-0023 tracks the iterator that will make this
-	// unnecessary; until it lands, this is the setting that makes a multi-page
-	// scan correct rather than lucky.
-	c, err := client.New(client.WithAddr(addr), client.WithPoolSize(1))
+	// The default pool, deliberately: a walk that needed a pool of one would be
+	// a walk whose correctness depended on the caller's configuration.
+	c, err := client.New(client.WithAddr(addr))
 	if err != nil {
 		return fmt.Errorf("configuring the client: %w", err)
 	}
@@ -75,7 +77,17 @@ func run(addr string, keyCount, pageSize int) error {
 	}
 	defer cleanUp(c, written)
 
-	seen, pages, empties, err := walk(ctx, c, pageSize)
+	// The by-hand page loop gets a client of its own, pinned to one connection.
+	// That is not a formality: it carries the cursor between calls itself, and
+	// a page that reached a different connection would be answered "invalid
+	// cursor". The iterator below is the same walk without that requirement.
+	paged, err := client.New(client.WithAddr(addr), client.WithPoolSize(1))
+	if err != nil {
+		return fmt.Errorf("configuring the paging client: %w", err)
+	}
+	defer func() { _ = paged.Close() }()
+
+	seen, pages, empties, err := walk(ctx, paged, pageSize)
 	if err != nil {
 		return err
 	}
@@ -91,7 +103,84 @@ func run(addr string, keyCount, pageSize int) error {
 	}
 	fmt.Printf("every one of the %d keys came back exactly once\n", len(written))
 
+	if err := walkWithIterator(ctx, c, written, pageSize); err != nil {
+		return err
+	}
+	if err := walkWithScanAll(ctx, c, written, pageSize); err != nil {
+		return err
+	}
+	if err := abandonAWalk(ctx, c, pageSize); err != nil {
+		return err
+	}
+
 	return compareWithKeys(ctx, c, len(written))
+}
+
+// walkWithIterator is the same walk on the default pool, which is the point:
+// the iterator holds one connection for the length of it, so nothing about the
+// client's configuration has to be arranged for a scan to be correct.
+func walkWithIterator(ctx context.Context, c client.Client, written []string, pageSize int) error {
+	it := c.ScanIter(ctx, prefix+"*", pageSize)
+	// Free when the walk finishes on its own, and the whole of the cleanup when
+	// it does not.
+	defer it.Close()
+
+	seen := make(map[string]int, len(written))
+	for it.Next() {
+		seen[it.Key()]++
+	}
+	// Checked after the loop, always: a walk that failed and one that finished
+	// both stop it, and only this tells them apart.
+	if err := it.Err(); err != nil {
+		return fmt.Errorf("the walk: %w", err)
+	}
+	if err := checkComplete(written, seen); err != nil {
+		return fmt.Errorf("ScanIter: %w", err)
+	}
+	fmt.Printf("ScanIter walked the same %d keys on an ordinary pool\n", len(seen))
+	return nil
+}
+
+// walkWithScanAll is the one-line version of everything above, for a keyspace
+// small enough to hold in memory — which is most of them.
+func walkWithScanAll(ctx context.Context, c client.Client, written []string, pageSize int) error {
+	keys, err := c.ScanAll(ctx, prefix+"*", pageSize)
+	if err != nil {
+		return fmt.Errorf("ScanAll: %w", err)
+	}
+
+	seen := make(map[string]int, len(keys))
+	for _, key := range keys {
+		seen[key]++
+	}
+	if err := checkComplete(written, seen); err != nil {
+		return fmt.Errorf("ScanAll: %w", err)
+	}
+	fmt.Printf("ScanAll returned the same %d keys in one call\n", len(keys))
+	return nil
+}
+
+// abandonAWalk leaves an iterator half-finished, which is the case worth
+// showing: the connection it pinned has to come back, or a pool loses one
+// connection per abandoned walk until it has none.
+func abandonAWalk(ctx context.Context, c client.Client, pageSize int) error {
+	it := c.ScanIter(ctx, prefix+"*", pageSize)
+	// The whole cleanup, and the reason a break in this loop costs nothing.
+	defer it.Close()
+
+	if !it.Next() {
+		return fmt.Errorf("an iterator over a seeded keyspace produced no keys: %w", it.Err())
+	}
+	first := it.Key()
+	it.Close()
+
+	// The client is immediately usable, which is what says the connection came
+	// back rather than being held by an iterator nobody finished.
+	if _, _, err := c.Get(ctx, first); err != nil {
+		return fmt.Errorf("a call after an abandoned walk: %w", err)
+	}
+	fmt.Printf("abandoned a walk after %s and the connection went back to the pool\n", first)
+	return nil
 }
 
 // seed writes the keys this program then walks.
@@ -108,9 +197,14 @@ func seed(ctx context.Context, c client.Client, n int) ([]string, error) {
 	return written, nil
 }
 
-// walk is the whole of the SCAN contract: start at ScanStart, stop on Done,
-// carry the cursor forward, and treat an empty page as nothing more than a page
-// that found nothing.
+// walk is the whole of the SCAN contract, done by hand with the single-page
+// primitive: start at ScanStart, stop on Done, carry the cursor forward, and
+// treat an empty page as nothing more than a page that found nothing.
+//
+// Written out here because it is what ScanAll and ScanIter do for you, and
+// because the page API is still the right tool when one page is what is wanted.
+// It runs on a client pinned to one connection; on any other, nothing but luck
+// keeps consecutive pages on the connection that owns the cursor.
 func walk(ctx context.Context, c client.Client, pageSize int) (seen map[string]int, pages, empties int, err error) {
 	seen = make(map[string]int)
 

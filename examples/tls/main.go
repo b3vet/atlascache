@@ -20,11 +20,12 @@
 //	ATLASCACHE_AUTH=… go run ./examples/tls/main.go \
 //	    -addr localhost:6380 -ca certs/server.crt
 //
-// Two habits are worth copying from this program. The CA goes into an
-// x509.CertPool and then into RootCAs, which is what verifies a server holding
-// a private certificate; and the token is read from the environment rather than
-// from a flag, because an argument list is visible in `ps` to every other user
-// on the host.
+// Two habits are worth copying from this program. A private certificate
+// authority is named by file with WithTLSCAFile, which reads and parses it
+// inside New — so a path that is wrong stops the process starting instead of
+// failing the first call; and the token is read from the environment rather
+// than from a flag, because an argument list is visible in `ps` to every other
+// user on the host.
 //
 // It exits 0 when the connection verified, authenticated and round-tripped a
 // value, and 1 otherwise.
@@ -33,7 +34,6 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
@@ -60,18 +60,12 @@ func main() {
 }
 
 func run(addr, caFile, token string) error {
-	config, err := tlsConfig(caFile)
-	if err != nil {
-		return err
-	}
-
 	opts := []client.Option{
 		client.WithAddr(addr),
-		// The configuration is cloned, so the caller may keep using its own
-		// copy. With no ServerName set, the host from addr is used — which is
-		// why this connects to "localhost" and not to "127.0.0.1" unless the
+		// With no ServerName set, the host from addr is used — which is why
+		// this connects to "localhost" and not to "127.0.0.1" unless the
 		// certificate names the address.
-		client.WithTLS(config),
+		tlsOption(caFile),
 	}
 	if token != "" {
 		// Sent on every connection the pool opens, including replacements for
@@ -82,6 +76,12 @@ func run(addr, caFile, token string) error {
 	}
 
 	c, err := client.New(opts...)
+	if errors.Is(err, client.ErrConfig) {
+		// A CA file that is missing, unreadable, or holds no certificate. It is
+		// a configuration error rather than a network one, and no connection
+		// was attempted — so this is a reason to exit, not to retry.
+		return fmt.Errorf("the client is misconfigured: %w", err)
+	}
 	if err != nil {
 		return fmt.Errorf("configuring the client: %w", err)
 	}
@@ -91,7 +91,13 @@ func run(addr, caFile, token string) error {
 	defer cancel()
 
 	if err := c.Ping(ctx); err != nil {
-		if errors.Is(err, client.ErrAuth) {
+		switch {
+		case errors.Is(err, client.ErrAuthDisabled):
+			// The one authentication failure the token did not cause: this
+			// server has no password set, so it refuses every AUTH. Blaming
+			// the token here would send its owner to rotate a working secret.
+			return fmt.Errorf("%s is set, but this server has authentication disabled: %w", envAuth, err)
+		case errors.Is(err, client.ErrAuth):
 			return fmt.Errorf("the server refused the token in %s: %w", envAuth, err)
 		}
 		return fmt.Errorf("connecting to %s over TLS: %w", addr, err)
@@ -104,27 +110,20 @@ func run(addr, caFile, token string) error {
 	return verificationIsNotOptional(ctx, addr)
 }
 
-// tlsConfig builds the configuration. With no CA file the host's trust store
-// is used, which is what a server holding a certificate from a public CA
+// tlsOption picks how the server is verified. With no CA file the host's trust
+// store is used, which is what a server holding a certificate from a public CA
 // wants; with one, only that authority is trusted.
-func tlsConfig(caFile string) (*tls.Config, error) {
-	// TLS 1.3 is the server's floor and is not configurable there, so naming
-	// it here costs nothing and documents the expectation.
-	config := &tls.Config{MinVersion: tls.VersionTLS13}
+//
+// Neither branch reads a file or builds a certificate pool. WithTLSCAFile does
+// both, inside New, which is a dozen lines of x509 this program does not carry
+// and cannot get subtly wrong.
+func tlsOption(caFile string) client.Option {
 	if caFile == "" {
-		return config, nil
+		// TLS 1.3 is the server's floor and is not configurable there, so
+		// naming it here costs nothing and documents the expectation.
+		return client.WithTLS(&tls.Config{MinVersion: tls.VersionTLS13})
 	}
-
-	pemBytes, err := os.ReadFile(caFile)
-	if err != nil {
-		return nil, fmt.Errorf("reading the CA file: %w", err)
-	}
-	roots := x509.NewCertPool()
-	if !roots.AppendCertsFromPEM(pemBytes) {
-		return nil, fmt.Errorf("%s holds no PEM certificate", caFile)
-	}
-	config.RootCAs = roots
-	return config, nil
+	return client.WithTLSCAFile(caFile)
 }
 
 // roundTrip proves the connection carries commands, not just a handshake.

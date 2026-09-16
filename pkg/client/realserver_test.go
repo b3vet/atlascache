@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -595,4 +596,83 @@ func writeCertificate(t *testing.T, dir string) (certFile, keyFile string, pool 
 	}
 
 	return certFile, keyFile, pool
+}
+
+// A multi-page walk over a pool of more than one connection, against the server
+// whose cursors are the reason any of this is delicate (ADR-0017).
+//
+// The fake server models connection-scoped cursors; this is the one place that
+// model is checked against the real thing. The second client makes the check
+// deterministic: an idle timeout that retires every connection the moment it is
+// returned means a walk that gave its connection up between pages is answered
+// "invalid cursor" every run rather than one in ten.
+func TestRealServerScanWalksAPoolItDoesNotOwn(t *testing.T) {
+	noLeaks(t)
+	s := startRealServer(t, realServerConfig{})
+	ctx := t.Context()
+
+	c := newRealClient(t, s.addr, WithPoolSize(5))
+	want := map[string]bool{}
+	for i := range 50 {
+		key := "walk:" + strconv.Itoa(i)
+		if err := c.Set(ctx, key, []byte("v"), 0); err != nil {
+			t.Fatalf("seeding %s: %v", key, err)
+		}
+		want[key] = true
+	}
+
+	keys, err := c.ScanAll(ctx, "walk:*", 4)
+	if err != nil {
+		t.Fatalf("ScanAll: %v", err)
+	}
+	seen := map[string]int{}
+	for _, key := range keys {
+		seen[key]++
+	}
+	if len(seen) != len(want) || len(keys) != len(want) {
+		t.Fatalf("the walk returned %d keys, %d of them distinct, want %d of each", len(keys), len(seen), len(want))
+	}
+	for key := range want {
+		if seen[key] != 1 {
+			t.Fatalf("the walk returned %q %d times", key, seen[key])
+		}
+	}
+
+	churning := newRealClient(t, s.addr, WithPoolSize(5), WithMaxIdleTime(time.Nanosecond))
+	it := churning.ScanIter(ctx, "walk:*", 4)
+	defer it.Close()
+	pinned := 0
+	for it.Next() {
+		pinned++
+	}
+	if err := it.Err(); err != nil {
+		t.Fatalf("a walk on a client that retires idle connections: %v", err)
+	}
+	if pinned != len(want) {
+		t.Fatalf("that walk saw %d keys, want %d", pinned, len(want))
+	}
+}
+
+// The server with authentication disabled, which is the one AUTH failure the
+// caller's token did not cause.
+//
+// It runs against the real server on purpose: the diagnosis is made by matching
+// the beginning of what the server says, so this is what notices if that wording
+// ever changes out from under the match (ISSUE-0023).
+func TestRealServerAuthAgainstAPasswordlessServer(t *testing.T) {
+	noLeaks(t)
+	s := startRealServer(t, realServerConfig{})
+
+	c := newRealClient(t, s.addr, WithAuth("a-token-the-server-never-asked-for"))
+	err := c.Ping(t.Context())
+	if !errors.Is(err, ErrAuth) {
+		t.Fatalf("got %v, want an ErrAuth", err)
+	}
+	if !errors.Is(err, ErrAuthDisabled) {
+		t.Fatalf("got %v; the SDK no longer recognizes a server with authentication disabled, "+
+			"which usually means the server's wording changed and authDisabledPrefix has to follow it", err)
+	}
+	if !strings.Contains(err.Error(), "disabled") {
+		t.Errorf("the failure reads %q and does not point at the server's configuration", err)
+	}
 }
