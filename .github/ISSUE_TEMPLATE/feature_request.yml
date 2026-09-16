@@ -1,0 +1,48 @@
+name: Feature request
+description: Suggest something AtlasCache should do
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before writing: [docs/ROADMAP.md](https://github.com/b3vet/atlascache/blob/main/docs/ROADMAP.md)
+        lists what is already planned and roughly in what order. If your idea is
+        on it, saying that you want it sooner is still useful — that is real
+        information about priority.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you hitting?
+      description: |
+        Describe the situation rather than the solution. The underlying problem
+        often has a better answer than the feature that first comes to mind, and
+        we cannot find it if we only see the feature.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like it to do?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What are you doing instead today?
+      description: A workaround, another tool, or nothing — all are useful to know.
+    validations:
+      required: false
+  - type: dropdown
+    id: redis
+    attributes:
+      label: Does Redis do this?
+      description: |
+        AtlasCache aims for wire compatibility, so "Redis does it this way" is a
+        strong argument for a particular shape.
+      options:
+        - "Yes — and it should behave identically"
+        - "Yes — but AtlasCache should differ, and I will explain why"
+        - "No"
+        - "I don't know"
+    validations:
+      required: true

@@ -1,0 +1,29 @@
+# Dependency updates.
+#
+# Weekly rather than daily: this is a single-maintainer project, and a queue of
+# pull requests nobody reads is worse than none at all.
+version: 2
+updates:
+  # The three Go modules are updated independently. pkg/client is listed even
+  # though it must stay dependency-free — if an update ever appears for it, that
+  # is the signal that something got added which should not have been.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: gomod
+    directory: /pkg/client
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: gomod
+    directory: /test/e2e
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

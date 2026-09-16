@@ -1,0 +1,11 @@
+# Blank issues stay enabled: questions and observations that fit neither
+# template are still worth having, and a form that turns someone away is worse
+# than a loosely-shaped issue.
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/b3vet/atlascache/security/advisories/new
+    about: Report privately. Please do not open a public issue.
+  - name: Documentation
+    url: https://github.com/b3vet/atlascache#documentation
+    about: Getting started, configuration, the protocol, the Go SDK, and the CLI.

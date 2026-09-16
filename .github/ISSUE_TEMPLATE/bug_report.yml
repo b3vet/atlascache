@@ -1,0 +1,69 @@
+name: Bug report
+description: Something behaves differently from what is documented
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. AtlasCache is pre-alpha, so bug reports are
+        genuinely useful right now — more useful than pull requests, which
+        are not open yet.
+
+        **If this is a security vulnerability, stop and read
+        [SECURITY.md](https://github.com/b3vet/atlascache/blob/main/SECURITY.md)
+        instead.** Do not describe it here.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The output of `atlascache --version`. If you built from source, the commit.
+      placeholder: "v0.1.0 (commit abc1234)"
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: OS, architecture, and how you are running it.
+      placeholder: "Linux amd64, Docker image atlascache:0.1.0"
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and what happened instead
+      description: |
+        Both halves matter. "It didn't work" leaves us guessing at which of the
+        two we disagree about.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: |
+        Exact commands, ideally from a fresh server. `redis-cli` transcripts are
+        perfect.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration
+      description: |
+        Your config file, **with tokens, passwords and certificates removed**.
+        Say "defaults" if you changed nothing.
+      render: yaml
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Server logs
+      description: |
+        Anything the server printed around the failure. The startup line is
+        useful on its own — it reports every effective setting.
+      render: shell
+    validations:
+      required: false

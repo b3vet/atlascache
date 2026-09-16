@@ -1,0 +1,24 @@
+# Secret scanning configuration.
+#
+# The point of an allowlist here is to keep the scan's signal worth reading. A
+# scan that always reports the same two findings trains everyone to ignore it,
+# and the next finding — the real one — gets ignored with them.
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+[rules.allowlist]
+description = """
+A 32-character hex literal named `key`, used as a cache key rather than a
+credential. Both sites build an oversized DEL request to prove the per-field
+limits leave a gap (ISSUE-0018); the literal is a key *name* sent to the server,
+which is what AtlasCache stores for a living. Matched by the generic rule
+because the identifier is `key` and the value looks like entropy.
+"""
+regexes = ['''0123456789abcdef0123456789abcdef''']
+paths = [
+  '''internal/server/conn_test\.go''',
+  '''test/e2e/scenarios/connection\.go''',
+]

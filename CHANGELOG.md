@@ -56,6 +56,76 @@ of the command set arrives in the next phase.
 - Panic isolation per connection. A handler that panics closes that connection,
   logs the stack, and leaves every other client served.
 
+- The rest of the command set: `SETNX`, `EXISTS`, `KEYS`, `SCAN`, `DBSIZE`,
+  `ECHO`, `STATS`, `COMMAND`, `HELLO` and `AUTH`. Replies match Redis, including
+  the details that catch people out — `EXISTS k k k` counts duplicates
+  separately, and `KEYS` matches Redis's glob rather than Go's, so a wildcard
+  crosses `/`, which cache keys are full of.
+- Per-key TTL with both lazy and active expiration, the latter through a
+  four-level time wheel whose entries are hints rather than truth: an expiry
+  that moves does not have to be found and rewritten, because the wheel is
+  allowed to be wrong in the one direction that is safe.
+- Eviction under a memory limit — `lru`, `lfu`, `fifo` and `none` — sampled
+  rather than globally ordered, as Redis does it.
+- TLS, with a TLS 1.3 floor that is deliberately not configurable, and
+  certificates re-read on change so a renewal needs no restart. A replacement
+  that does not parse is refused and the running certificate keeps serving.
+- Token authentication, compared in constant time, rotatable without
+  disconnecting clients that have already authenticated.
+- **A Go SDK**, `pkg/client`, as its own module with **no dependencies** — so
+  importing it does not pull the server's dependency tree into your build. It
+  pools connections, reconnects with jittered backoff, honours `context` at
+  every blocking point, and retries only what is safe to retry, opt-in.
+- **`atlasctl`**, a command-line client built on that SDK rather than on a
+  second protocol implementation, so the two cannot drift. Exit codes
+  distinguish a missing key from an unreachable server, because a script has to
+  respond differently to each.
+- An admin HTTP API on a separate, loopback-bound port: `/health`,
+  `/health/live` and `/health/ready` without a credential, because a Kubernetes
+  probe cannot present one; `/stats`, `/stats/memory` and `/config` with one.
+  The admin token is deliberately not the data token.
+- Read-only `CONFIG GET`, so `redis-benchmark` and monitoring agents stop
+  reporting a server they cannot interrogate. `save` and `appendonly` answer
+  empty rather than inventing values for persistence that does not exist yet.
+- A container image on distroless, running as non-root, with a `docker-compose.yml`
+  that comes up usable.
+- A release pipeline producing signed, checksummed binaries for six platforms
+  with SBOMs, and a dry run that must pass before any tag is pushed.
+- Documentation: getting started, configuration with a hardening section, the
+  protocol and its guarantees, the SDK, the CLI, and deployment. Its examples
+  are executed against a live server by CI, and the quick start is parsed and
+  run by the test suite, so the documentation cannot quietly stop being true.
+
+### Changed
+
+- **A mistyped configuration key now refuses startup** instead of being silently
+  ignored. It names the key, its line, and the key you probably meant, and
+  reports every mistake at once rather than one per restart. The version that
+  matters is not a typo'd port: it is `enbaled: true` under `auth`, which used
+  to give you a server with authentication off, reachable by anyone who could
+  open a socket, reporting itself perfectly healthy. A `SIGHUP` reload carrying
+  an unknown key is rejected and the running configuration keeps serving, so
+  this cannot take a live server down.
+- An unrecognised `ATLAS_` environment variable warns rather than refusing to
+  start — the opposite of the file, and deliberately. Kubernetes and Docker
+  inject a block of variables for every linked service, so a Service named
+  `atlas` puts `ATLAS_PORT` and `ATLAS_SERVICE_HOST` into the container before
+  the process starts. Refusing to boot on those would make the check an outage
+  in the deployment it exists to protect.
+- A credential-less `HELLO` from an unauthenticated client is now refused rather
+  than answered with the server's name, version, mode and role.
+  `HELLO <n> AUTH user pass` still works, which is the reason `HELLO` is
+  reachable before authentication at all.
+- Three authentication errors now match Redis byte for byte.
+- `Get` in the SDK returns `(value, found, err)`. A cache miss is not an error
+  and an empty value is legal; any two-value shape conflates one of them.
+- The SDK gained `ScanAll` and `ScanIter`, which hold one connection for the
+  length of a walk. `SCAN` cursors belong to the connection that created them,
+  and before this every caller had to discover that — `atlasctl` was pinning its
+  pool to a single connection to work around it.
+- `WithTLSCAFile` replaces the fifteen lines of `crypto/x509` plumbing every
+  caller was writing to trust a private CA.
+
 ### Fixed
 
 - The repository now builds from a clean clone. `go.sum` was never committed
@@ -79,5 +149,10 @@ of the command set arrives in the next phase.
   `storage.max_value_size` unless `server.max_request_size` sets it — is charged
   while the request is arriving, and the element count is derived from it, so
   the same flood now moves the resident set by nothing.
+- The E2E harness killed only the process it started, not the process group, so
+  a binary that forked left the harness waiting on a pipe nobody would close —
+  a hang rather than a failure, which in CI means a timeout with no signal.
+- A spec that replaced a configuration block with a scalar silently lost every
+  sibling key under it. It is now an error naming the path.
 
 [Unreleased]: https://github.com/b3vet/atlascache/commits/main

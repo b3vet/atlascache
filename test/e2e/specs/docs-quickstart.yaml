@@ -1,0 +1,19 @@
+version: 1
+name: docs-quickstart
+tier: full
+feature: FEAT-0034
+description: >
+  Every command in docs/getting-started.md runs against a real server, so
+  documentation drift becomes a gate failure rather than a user's first
+  impression of the project.
+
+  The scenario parses the guide rather than restating its commands. A spec that
+  copied them would drift from the document it exists to protect: the guide
+  changes, the copy does not, and the gate goes green over a broken quick start.
+
+  Where the guide shows what a command prints, that is compared too — but only
+  where the comparison is sound, which excludes the shell pipeline whose
+  documented output carries a version string that changes at release.
+
+steps:
+  - scenario: docs_quickstart_executes
