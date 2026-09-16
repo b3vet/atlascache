@@ -1,0 +1,35 @@
+version: 1
+name: docker-run
+tier: full
+feature: FEAT-0032
+description: >
+  The container image starts, serves the RESP protocol, holds data, and reports
+  the build that was stamped into it.
+
+  It skips with a message rather than failing when Docker is unavailable. The
+  E2E suite is this project's gate, and a gate that cannot be run on a machine
+  without Docker is one people stop running.
+
+  Nothing here trusts a port. The container is published on a port the kernel
+  chose, and the connection is confirmed with `INFO server` before anything
+  else is believed -- a PING to the wrong Redis answers +PONG exactly like the
+  right one, and most machines that run this suite have one.
+
+steps:
+  # The harness's own server is the control: whatever the container does, the
+  # suite's normal path must still work.
+  - cmd: PING
+    expect: PONG
+
+  # Start the image, PING it, write and read a key, and check that `--version`
+  # inside the container reports the same build INFO does.
+  - scenario: docker_image_serves
+
+  # The image the release publishes is built from Dockerfile.release, which
+  # takes a prebuilt binary instead of compiling one, so that the binary inside
+  # the published image is the one the checksums and the signature cover. Two
+  # recipes for one image drift; this is what stops them.
+  - scenario: docker_release_dockerfile_matches
+
+  - cmd: PING
+    expect: PONG

@@ -1,0 +1,117 @@
+# A single AtlasCache node, ready to use.
+#
+#   docker compose up -d
+#   redis-cli -p 6379 PING            # -> PONG
+#   curl -s localhost:8080/health     # -> {"status":"ok"}
+#
+# It builds from this tree by default. To run a published image instead, comment
+# out `build:` and uncomment the `image:` line below.
+#
+# Ports are published through variables so the file works on a machine that
+# already has something on 6379 -- which, for a Redis-compatible server, is more
+# often than not:
+#
+#   ATLASCACHE_CLIENT_PORT=6380 docker compose up -d
+#
+# Only the *host* side moves; inside the container the ports are always 6379 and
+# 8080, so nothing in the mounted configuration changes with them.
+
+services:
+  atlascache:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+      args:
+        # Stamped into the binary, so `--version` and `INFO server` inside the
+        # container report something better than "dev" if you set them:
+        #   VERSION=$(cat VERSION) COMMIT=$(git rev-parse --short HEAD) docker compose build
+        VERSION: ${VERSION:-dev}
+        COMMIT: ${COMMIT:-none}
+        DATE: ${DATE:-unknown}
+
+    # image: ghcr.io/b3vet/atlascache:0.1.0
+    # The :debug tag is the same binary on a base that has a shell, for when you
+    # need to `docker compose exec atlascache sh`. It is not what production
+    # should run.
+    # image: ghcr.io/b3vet/atlascache:0.1.0-debug
+
+    # Names the image compose builds. There is deliberately no
+    # `container_name:` -- a fixed one would stop a second stack (`docker
+    # compose -p other up`) from starting, and `docker compose exec atlascache`
+    # works without it.
+    image: atlascache:local
+    restart: unless-stopped
+
+    ports:
+      # The RESP client port. Published on every interface, which is what makes
+      # it usable from a laptop -- and, with auth off by default (ADR-0009),
+      # also what makes it reachable by anything else on your network. Bind it
+      # to 127.0.0.1 here as well if that matters.
+      - "${ATLASCACHE_CLIENT_PORT:-6379}:6379"
+
+      # The admin API, published on loopback only.
+      #
+      # The mounted configuration binds the admin API to 0.0.0.0 *inside* the
+      # container, because 127.0.0.1 there is unreachable from any probe outside
+      # it (ADR-0023, and see docker/atlascache.yaml for the full tradeoff).
+      # That widens exposure inside the container's network; publishing it on
+      # 127.0.0.1 on the host narrows it again, so the admin API is reachable
+      # from this machine and from nowhere else.
+      - "127.0.0.1:${ATLASCACHE_ADMIN_PORT:-8080}:8080"
+
+    volumes:
+      # /etc/atlascache is one of the paths the server searches, so no --config
+      # flag is needed. Read-only: the server re-reads this file when it
+      # changes, and nothing in the container should be able to write it.
+      - ./docker/atlascache.yaml:/etc/atlascache/config.yaml:ro
+
+    # Container hardening. None of it is required for the server to run; all of
+    # it is cheap.
+    #
+    # The image already runs as uid 65532 (ADR-0024). Stating it here means a
+    # `user:` override elsewhere cannot quietly drop it back to root.
+    #
+    # A related trap, since it is easy to get backwards: whether a non-root
+    # process may bind a port below 1024 depends on the runtime's
+    # net.ipv4.ip_unprivileged_port_start, which Docker commonly relaxes and a
+    # cluster does not -- so binding 443 *inside* the container may work here
+    # and fail in production. 6379 works under both. Map a privileged port on
+    # the host side of `ports:` above.
+    user: "65532:65532"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    # A ceiling, so a runaway workload is the container's problem and not the
+    # host's. storage.max_memory in the mounted config is set below this on
+    # purpose: the cache evicts before the kernel OOM-kills the process, which
+    # is a bounded cache rather than a restart loop.
+    mem_limit: 512m
+
+    # The image carries its own HEALTHCHECK -- `atlascache --health-check`,
+    # which probes readiness from inside the container, since the distroless
+    # base has neither a shell nor curl. It is restated here so `docker compose
+    # ps` reports health even when the image is overridden with one built
+    # elsewhere.
+    healthcheck:
+      test: ["CMD", "/atlascache", "--health-check"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+
+    stop_grace_period: 15s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# No volume for /var/lib/atlascache. v0.1.0 stores nothing on disk, so one would
+# be a mount that never fills -- and a Docker-created volume is owned by root,
+# which a container running as uid 65532 cannot write to. Persistence arrives in
+# v0.2.0, and the volume and its ownership arrive with it.

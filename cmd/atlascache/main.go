@@ -40,11 +40,11 @@ func main() {
 func run() int {
 	configPath := flag.String("config", "", "path to the configuration file")
 	showVersion := flag.Bool("version", false, "print version and exit")
+	probe := flag.Bool("health-check", false, "probe the admin readiness endpoint and exit 0 if ready")
 	flag.Parse()
 
-	if *showVersion {
-		fmt.Printf("atlascache %s\ncommit: %s\nbuilt:  %s\n", version, commit, date)
-		return 0
+	if code, handled := answerAndExit(*showVersion, *probe, *configPath); handled {
+		return code
 	}
 
 	cfg, configFile, err := loadConfig(*configPath)
@@ -56,6 +56,8 @@ func run() int {
 
 	logging.Configure(logging.Config{Level: cfg.Logging.Level, Format: cfg.Logging.Format})
 	log := logging.WithComponent("atlascache")
+
+	logEnvWarnings(log)
 
 	// HELLO and INFO report the version, and the build stamp lives here rather
 	// than in internal/server — which is why the two have to be joined
@@ -186,6 +188,36 @@ func run() int {
 
 	log.Info().Msg("atlascache stopped")
 	return exitCode
+}
+
+// logEnvWarnings reports ATLAS_ variables that set nothing.
+//
+// An unknown key in the config file refuses the start; an environment override
+// that matches nothing only warns, and config.EnvWarnings carries the reasoning
+// for the asymmetry. It is logged here rather than in the loader because
+// logging is configured by the very configuration it would be reporting on.
+func logEnvWarnings(log zerolog.Logger) {
+	for _, warning := range config.EnvWarnings() {
+		log.Warn().Msg(warning)
+	}
+}
+
+// answerAndExit handles the flags that answer a question and stop, rather than
+// starting a server. It reports whether it handled one, and with what exit code.
+//
+// --health-check is here because the container image's HEALTHCHECK runs it: the
+// distroless base has no shell and no curl, so the binary is the only thing in
+// the image that can probe the admin API (FEAT-0032, ADR-0024).
+func answerAndExit(showVersion, probe bool, configPath string) (code int, handled bool) {
+	switch {
+	case showVersion:
+		fmt.Printf("atlascache %s\ncommit: %s\nbuilt:  %s\n", version, commit, date)
+		return 0, true
+	case probe:
+		return healthCheck(configPath), true
+	default:
+		return 0, false
+	}
 }
 
 // connLimits turns the server section of the configuration into the bounds the

@@ -206,3 +206,109 @@ tools:
 clean:
 	rm -rf $(BUILD_DIR)
 	rm -f coverage.out coverage.html coverage-sdk.out coverage-sdk.html cpu.out mem.out
+
+# ---------------------------------------------------------------------------
+# Release engineering (FEAT-0032, FEAT-0033)
+# ---------------------------------------------------------------------------
+.PHONY: docker-build docker-build-debug docker-buildx release-check release-dry-run changelog-draft
+
+IMAGE       ?= atlascache
+IMAGE_TAG   ?= $(VERSION)
+# Under 20MB is the target ADR-0024 sets; the distroless static base is ~2MB and
+# the stripped static binary is most of the rest.
+IMAGE_MAX_BYTES ?= 20000000
+PLATFORMS   ?= linux/amd64,linux/arm64
+
+## docker-build: build the container image and check it against the size target
+docker-build:
+	docker build \
+		--target runtime \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg COMMIT=$(COMMIT) \
+		--build-arg DATE=$(DATE) \
+		-t $(IMAGE):$(IMAGE_TAG) .
+	@size=$$(docker image inspect $(IMAGE):$(IMAGE_TAG) --format '{{.Size}}'); \
+	printf '%s:%s is %d bytes (%.1fMB)\n' "$(IMAGE)" "$(IMAGE_TAG)" "$$size" "$$(echo "$$size/1000000" | bc -l)"; \
+	test "$$size" -le "$(IMAGE_MAX_BYTES)" || { \
+		echo "image is over the $(IMAGE_MAX_BYTES)-byte target (ADR-0024)"; exit 1; }
+
+## docker-build-debug: build the :debug variant, same binary on a base with a shell
+docker-build-debug:
+	docker build \
+		--target debug \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg COMMIT=$(COMMIT) \
+		--build-arg DATE=$(DATE) \
+		-t $(IMAGE):$(IMAGE_TAG)-debug .
+
+## docker-buildx: build the multi-arch manifest without pushing it anywhere
+# A multi-platform build cannot be loaded into the local image store, so this
+# writes an OCI archive instead. It exists to prove both architectures build
+# before a tag does it for real; the release pipeline pushes the same manifest.
+#
+# It creates a builder of its own and removes it again. Docker's default builder
+# uses the `docker` driver, which can build neither a multi-platform image nor
+# an OCI archive -- and leaving a builder behind, or switching the one somebody
+# was using, is not this target's business.
+BUILDX_BUILDER := atlascache-buildx
+docker-buildx:
+	@mkdir -p $(BUILD_DIR)
+	@docker buildx inspect $(BUILDX_BUILDER) >/dev/null 2>&1 \
+		|| docker buildx create --name $(BUILDX_BUILDER) --driver docker-container >/dev/null
+	docker buildx build --builder $(BUILDX_BUILDER) \
+		--platform $(PLATFORMS) \
+		--target runtime \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg COMMIT=$(COMMIT) \
+		--build-arg DATE=$(DATE) \
+		-t $(IMAGE):$(IMAGE_TAG) \
+		--output type=oci,dest=$(BUILD_DIR)/$(IMAGE)-$(IMAGE_TAG).oci.tar . \
+		; status=$$?; docker buildx rm $(BUILDX_BUILDER) >/dev/null 2>&1; exit $$status
+	@echo "wrote $(BUILD_DIR)/$(IMAGE)-$(IMAGE_TAG).oci.tar"
+
+## release-check: fail unless the release tag matches VERSION (TAG=v0.1.0)
+# The release pipeline runs this first, before anything is built. Tagging v0.1.0
+# while VERSION says 0.1.0-dev produces binaries that report the wrong version
+# forever: the artifacts are immutable and the tag cannot be moved once anyone
+# has fetched it.
+#
+# TAG defaults to the tag on HEAD, so `make release-check` on a tagged commit
+# needs no argument.
+release-check:
+	@tag="$(TAG)"; \
+	if [ -z "$$tag" ]; then \
+		tag=$$(git describe --tags --exact-match --match 'v*' 2>/dev/null); \
+	fi; \
+	if [ -z "$$tag" ]; then \
+		echo "no release tag: pass TAG=vX.Y.Z or run this on a tagged commit"; exit 2; \
+	fi; \
+	if [ "$$tag" != "v$(VERSION)" ]; then \
+		echo "tag $$tag does not match VERSION $(VERSION)"; \
+		echo "either bump VERSION to $${tag#v} or tag v$(VERSION); the artifacts are immutable"; \
+		exit 1; \
+	fi; \
+	echo "tag $$tag matches VERSION $(VERSION)"
+
+## release-dry-run: build every release artifact locally, publishing nothing
+# The release pipeline is the one piece of automation here with no undo, so this
+# is a first-class target rather than a flag somebody has to remember. It
+# produces the binaries for all six targets, the archives, checksums, SBOMs,
+# signatures and the container images into dist/, and pushes nothing.
+#
+# The signatures are made with a throwaway key (scripts/cosign-sign.sh): keyless
+# signing is CI's OIDC identity and cannot be exercised off CI. Everything else
+# is exactly what a real release produces.
+release-dry-run:
+	@command -v goreleaser >/dev/null 2>&1 || { \
+		echo "goreleaser is not installed: brew install goreleaser"; exit 1; }
+	goreleaser release --snapshot --clean --skip=publish,announce
+	@echo
+	@echo "dist/ holds everything a release would publish. Nothing was pushed."
+
+## changelog-draft: draft the unreleased changelog entries with git-cliff
+# The draft removes the grunt work; the edit is the point (ADR-0008). This
+# prints rather than writing, so the curation step stays deliberate.
+changelog-draft:
+	@command -v git-cliff >/dev/null 2>&1 || { \
+		echo "git-cliff is not installed: brew install git-cliff"; exit 1; }
+	git-cliff --tag v$(VERSION) --unreleased

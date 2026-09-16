@@ -1,0 +1,93 @@
+# The configuration docker-compose.yml mounts into the container.
+#
+# It is deliberately not config.example.yaml. That file documents every option
+# for someone running the server on a host; this one is the shortest
+# configuration that makes a container actually usable, and its two interesting
+# settings are both there because a container needs them and a host does not.
+#
+# Mounted read-only at /etc/atlascache/config.yaml, which the server searches by
+# default -- so the entrypoint takes no --config flag. Edit this file and
+# `docker compose restart` to change anything.
+
+server:
+  # Already the default, and stated anyway: binding loopback here would make
+  # the published port unreachable, which is the same trap the admin section
+  # below exists to explain.
+  bind_addr: "0.0.0.0"
+  client_port: 6379
+
+admin:
+  # ---------------------------------------------------------------------
+  # This is the setting that makes containers work, and it is an exposure
+  # decision rather than a formality.
+  #
+  # ADR-0023 defaults the admin API to 127.0.0.1 because it is strictly more
+  # powerful than the data port: /stats and /config disclose operational
+  # detail, and later releases add rebalancing and backup triggers. Inside a
+  # container, loopback means "this container only" -- not reachable from a
+  # Docker health check running on the host, from a Kubernetes probe, or from
+  # a sidecar. So a container that leaves the default in place has an admin
+  # API nothing outside it can probe.
+  #
+  # 0.0.0.0 fixes that by making the admin API reachable from every network
+  # the container is attached to. What you get in exchange for a working
+  # probe is a management interface exposed to that network, which is why the
+  # token below is not optional -- binding non-loopback without one is
+  # refused at startup, on purpose.
+  #
+  # The narrower alternative, if you do not need an external probe: leave
+  # bind_addr at 127.0.0.1 and rely on the image's HEALTHCHECK, which runs
+  # `atlascache --health-check` inside the container and therefore reaches
+  # loopback. `docker compose ps` still reports health. You lose external
+  # probes, /stats, and /config.
+  #
+  # On a real deployment, publish 8080 only where you want it reached. This
+  # compose file publishes it on 127.0.0.1 on the host for exactly that
+  # reason.
+  # ---------------------------------------------------------------------
+  bind_addr: "0.0.0.0"
+  port: 8080
+
+  # A development token, and it is in a file in a public repository, so treat
+  # it as public. Replace it before this is reachable by anything you care
+  # about. It must also differ from auth.token: a client holding a data token
+  # must not thereby gain administrative access, and the server refuses the
+  # two being equal.
+  token: "atlascache-local-admin-token"
+
+storage:
+  # A bound, so a runaway workload hits a cache eviction rather than the
+  # container's memory limit and an OOM kill. Kept in step with the compose
+  # file's `mem_limit`, with headroom for the Go runtime itself.
+  max_memory: "256MB"
+
+eviction:
+  policy: "lru"
+
+logging:
+  level: "info"
+  # json, because a container's stdout is read by a log collector far more
+  # often than by a person. `format: console` if you are the person.
+  format: "json"
+
+# TLS and auth are off, which is what ADR-0009 ships and what the server warns
+# about once per boot. That is fine on a laptop and wrong anywhere else: with
+# both off, anything that can open a TCP connection to port 6379 has full
+# access to the cache, in cleartext.
+#
+# To harden, add a certificate and a token, and publish the port only where you
+# want it reached:
+#
+#   tls:
+#     enabled: true
+#     cert_file: "/etc/atlascache/tls/server.crt"
+#     key_file: "/etc/atlascache/tls/server.key"
+#   auth:
+#     enabled: true
+#     token: "a-real-secret-not-this-one"
+#
+# mounting the certificate directory alongside this file in docker-compose.yml.
+tls:
+  enabled: false
+auth:
+  enabled: false

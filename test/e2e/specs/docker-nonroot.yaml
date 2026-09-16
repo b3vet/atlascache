@@ -1,0 +1,33 @@
+version: 1
+name: docker-nonroot
+tier: full
+feature: FEAT-0032
+description: >
+  The container runs as a non-root user.
+
+  The uid is read from the daemon's view of the process table rather than from
+  inside the container: the image has no shell to run `id` in, and an image's
+  own /etc/passwd is not evidence about what the kernel sees. Non-zero is the
+  security property; 65532 is the answer the distroless nonroot base gives, and
+  a change to it means the base changed.
+
+  What this spec deliberately does not assert is that the container cannot bind
+  a port below 1024. That was the original plan and measurement refuted it:
+  whether an unprivileged process can bind 443 depends on the runtime's
+  net.ipv4.ip_unprivileged_port_start, which Docker commonly ships as 0. A spec
+  asserting either outcome would report on the machine CI ran on rather than on
+  AtlasCache. The dependency is documented in docs/deployment.md instead, along
+  with the part that actually matters: 6379 works under every runtime, so a
+  privileged port belongs on the host side of the mapping.
+
+  Skips with a message when Docker is unavailable.
+
+steps:
+  - cmd: PING
+    expect: PONG
+
+  # USER in the image config, and uid 65532 in `docker top`.
+  - scenario: docker_runs_as_nonroot
+
+  - cmd: PING
+    expect: PONG

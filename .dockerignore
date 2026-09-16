@@ -1,0 +1,70 @@
+# What the Docker build context is allowed to contain.
+#
+# Two jobs. The first is speed: everything sent here is hashed and shipped to
+# the daemon on every build, and most of this tree has nothing to do with
+# compiling a server. The second matters more.
+#
+# dev/ is the private planning workspace -- the SOW, phase plans, issues,
+# decisions, worklogs. It is gitignored, so it never reaches a clone, but a
+# Docker build reads the working tree rather than the index: without this file
+# a `COPY . .` would bake all of it into a published image layer, where anyone
+# who pulls the image can read it with `docker save`. Deleting it from a later
+# layer would not help; layers are additive and the earlier one is still there.
+dev/
+
+# Local secrets and TLS material. `make dev-certs` writes into certs/, and a
+# config.yaml is where a real token ends up.
+certs/
+*.pem
+*.crt
+*.key
+config.yaml
+
+# Build output. The image builds its own binary from source; copying host
+# binaries in would make the image's contents depend on what happened to be in
+# bin/ at the time, which is the opposite of a reproducible build.
+bin/
+bin-*/
+dist/
+*.exe
+*.test
+*.out
+*.prof
+coverage.html
+coverage-sdk.html
+
+# Git metadata. Large, and the version stamp arrives through build arguments
+# rather than by running git inside the builder.
+.git/
+.gitignore
+.githooks/
+.github/
+
+# Nothing under here is compiled into the server.
+docs/
+examples/
+test/
+data/
+tmp/
+temp/
+*.md
+
+# The workspace file. The image builds the root module the way a consumer of
+# the published module would get it, so go.work must not be present: with it,
+# the build resolves pkg/client from the tree instead of from go.mod, and the
+# image would be built from a different module graph than the release binaries.
+go.work
+go.work.sum
+
+# Editor and OS noise.
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*~
+
+# Docker's own files. Changing a compose comment should not invalidate the
+# build cache.
+Dockerfile
+docker-compose.yml
+.dockerignore

@@ -1,0 +1,32 @@
+version: 1
+name: docker-compose
+tier: full
+feature: FEAT-0032
+description: >
+  The repository's own docker-compose.yml comes up and yields a usable cache.
+
+  It runs the real file, not a copy. The claim being tested is that someone who
+  clones this repository can run `docker compose up` and have a working cache,
+  and a copy with the awkward parts adjusted would not test that claim. The two
+  things the spec supplies are both about not colliding with the machine it runs
+  on: a compose project name of its own, and the host ports the compose file
+  already reads from the environment -- because a laptop running this suite very
+  often has something on 6379 already.
+
+  The admin API answering from the host is the part that matters beyond "it
+  started": it proves the mounted configuration was read, and that the
+  bind address it sets is what makes an external probe possible at all.
+
+  Skips with a message when Docker or docker compose is unavailable.
+
+steps:
+  - cmd: PING
+    expect: PONG
+
+  # compose config, compose up --wait (which waits for the image's own
+  # HEALTHCHECK to pass), SET/GET through the published client port, and
+  # /health through the published admin port. Torn down whatever happens.
+  - scenario: docker_compose_stack
+
+  - cmd: PING
+    expect: PONG

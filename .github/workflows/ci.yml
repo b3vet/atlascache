@@ -91,6 +91,23 @@ jobs:
       - name: Lint all three modules
         run: make lint
 
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      # Full history, not a shallow clone: a credential that was committed and
+      # later removed is still published, and still has to be treated as
+      # compromised. Scanning only the tip would miss exactly that case.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan history for secrets
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+
   e2e:
     name: E2E gate
     runs-on: ubuntu-latest
@@ -101,6 +118,15 @@ jobs:
         with:
           go-version: ${{ env.GO_FLOOR }}
           cache: true
+
+      # The docker-* specs run the container image, and building it inside a
+      # spec would put a cold `docker build` inside that spec's 60-second
+      # budget. Built here instead, once, under the tag the specs look for;
+      # they use an image that already exists and only build one themselves
+      # when there is none. Nothing else in the gate depends on Docker -- the
+      # container specs skip with a message where it is unavailable.
+      - name: Build the container image the docker-* specs run
+        run: make docker-build IMAGE_TAG=e2e
 
       # The regression gate. A previously-green run that fails here means a
       # regression was just introduced -- see ADR-0003.

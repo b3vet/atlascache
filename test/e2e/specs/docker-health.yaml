@@ -1,0 +1,39 @@
+version: 1
+name: docker-health
+tier: full
+feature: FEAT-0032
+description: >
+  The health endpoint is reachable from outside the container, and the default
+  that makes it unreachable is still the default.
+
+  This is the spec that catches the admin bind trap. ADR-0023 binds the admin
+  API to 127.0.0.1, which inside a container means "this container only" -- no
+  Kubernetes probe, no sidecar, and no `curl` from the host can reach it. A
+  container shipped that way has an admin API nothing can probe, and it reads
+  as a broken health endpoint rather than as a configuration choice.
+
+  So both halves are asserted. A container configured the way the documentation
+  says to configure one -- non-loopback bind and an admin token, since the
+  server refuses the first without the second -- answers probes from outside.
+  A container left at the defaults does not, and is healthy anyway, because
+  its health check runs inside it.
+
+  Skips with a message when Docker is unavailable.
+
+steps:
+  - cmd: PING
+    expect: PONG
+
+  # admin.bind_addr 0.0.0.0 plus admin.token: /health, /health/live and
+  # /health/ready answer unauthenticated from the host, /stats still needs the
+  # token, and Docker's own HEALTHCHECK -- `atlascache --health-check`, in an
+  # image with no shell and no curl -- reports healthy.
+  - scenario: docker_health_reachable
+
+  # And the shipped default is still loopback, unreachable from outside, and
+  # still healthy. If this ever stops failing to connect, the image has started
+  # exposing its admin API by default.
+  - scenario: docker_admin_loopback_default
+
+  - cmd: PING
+    expect: PONG

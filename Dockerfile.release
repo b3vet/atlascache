@@ -1,0 +1,46 @@
+# The runtime half of ./Dockerfile, for GoReleaser.
+#
+# The difference between the two is where the binary comes from, and nothing
+# else. ./Dockerfile compiles one from source — that is what `docker compose
+# up` and the E2E suite build. This one takes a binary GoReleaser has already
+# built, so the published image contains the same file the release checksums
+# cover, the SBOM describes and the cosign signature attests to. An image built
+# separately from source would be a second artifact that nothing in the release
+# vouches for.
+#
+# Two recipes for one image is exactly the sort of thing that drifts, so the
+# `docker-run` E2E spec asserts that the runtime stage of ./Dockerfile and this
+# file agree on base image, user, exposed ports, health check and entrypoint.
+# Change one, change the other, or the gate fails.
+#
+# ARG before FROM, which is the one place a Dockerfile allows it: the debug
+# variant is this same file with a different base.
+ARG BASE=gcr.io/distroless/static-debian12:nonroot
+FROM ${BASE}
+
+# GoReleaser lays the binaries it built out by platform in the build context,
+# and buildx fills TARGETOS and TARGETARCH in once per platform of the manifest.
+# So one COPY picks the right binary for each architecture of the multi-arch
+# image, with no per-architecture stage.
+ARG TARGETOS
+ARG TARGETARCH
+COPY ${TARGETOS}/${TARGETARCH}/atlascache /atlascache
+
+# 6379 is the RESP client port, 8080 the admin HTTP API. The admin API binds
+# 127.0.0.1 by default (ADR-0023), which inside a container is reachable only
+# from the container itself; an external probe needs `admin.bind_addr: 0.0.0.0`
+# and an `admin.token`, and binding non-loopback without a token is refused at
+# startup on purpose.
+EXPOSE 6379 8080
+
+# The base has no shell and no curl, so the binary probes itself. Readiness,
+# not liveness: a container that reports healthy before it can serve makes a
+# rolling update send traffic into a node with nothing to answer with.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+    CMD ["/atlascache", "--health-check"]
+
+# uid 65532. Whether a non-root process may bind a port below 1024 depends on
+# the runtime's net.ipv4.ip_unprivileged_port_start and is not something to rely
+# on either way; 6379 and 8080 work under every runtime. See docs/deployment.md.
+USER nonroot:nonroot
+ENTRYPOINT ["/atlascache"]

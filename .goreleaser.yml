@@ -1,0 +1,284 @@
+# GoReleaser — everything a release produces (FEAT-0033, ADR-0024).
+#
+# Run it end to end without publishing anything:
+#
+#   make release-dry-run
+#
+# That is not optional politeness. A release is the one piece of automation in
+# this repository with no undo: a tag, an image and a signature cannot be
+# quietly retracted once anyone has fetched them. The dry-run builds every
+# artifact into dist/ so they can be inspected before the tag exists.
+#
+# ---------------------------------------------------------------------------
+# Tagging, in a repository with three Go modules
+# ---------------------------------------------------------------------------
+# `github.com/b3vet/atlascache`             root: the server and atlasctl
+# `github.com/b3vet/atlascache/pkg/client`  the Go SDK (ADR-0015)
+# `github.com/b3vet/atlascache/test/e2e`    the E2E suite; never published
+#
+# Go versions a module in a subdirectory by a tag carrying that subdirectory as
+# a prefix. `v0.1.0` versions the root module and nothing else: with only that
+# tag, `go get github.com/b3vet/atlascache/pkg/client@v0.1.0` fails, because the
+# tag the resolver looks for is `pkg/client/v0.1.0`.
+#
+# So a release is two tags on the same commit:
+#
+#   pkg/client/v0.1.0   the SDK   -- pushed first, see the runbook
+#   v0.1.0              the root  -- this is what triggers the pipeline
+#
+# `git.ignore_tags` below keeps the SDK tag out of GoReleaser's view, so a
+# `pkg/client/v0.1.0` sitting on the release commit cannot be mistaken for the
+# version being released.
+version: 2
+
+project_name: atlascache
+
+# Tags for the other module in this repository are not versions of this one.
+git:
+  ignore_tags:
+    - "pkg/client/*"
+    - "test/e2e/*"
+
+before:
+  hooks:
+    # `-mod=readonly` rather than `go mod tidy`: a release must build what the
+    # committed go.mod says, and must fail rather than silently amend it.
+    - go mod download
+
+builds:
+  - id: atlascache
+    main: ./cmd/atlascache
+    binary: atlascache
+    env: &build_env
+      # Static binaries. The distroless static base carries no libc, and a
+      # dynamically linked binary would fail at exec with a message that says
+      # nothing about why.
+      - CGO_ENABLED=0
+      # The workspace resolves pkg/client from this tree. Off it, the root
+      # module builds exactly as go.mod describes -- which is what a consumer
+      # gets, and what the checksums and signatures below attest to.
+      - GOWORK=off
+    goos: &build_goos [linux, darwin, windows]
+    goarch: &build_goarch [amd64, arm64]
+    flags: &build_flags
+      # No build-machine paths in the binary. This is half of what makes a tag
+      # reproducible; without reproducibility a signature attests only that the
+      # pipeline ran, not what it built.
+      - -trimpath
+    # The other half. A build timestamp would make every rebuild of the same
+    # tag produce different bytes, so the commit's own timestamp is used.
+    mod_timestamp: &build_timestamp "{{ .CommitTimestamp }}"
+    ldflags: &build_ldflags
+      # Identical to the Makefile's and the Dockerfile's, so `--version`,
+      # `INFO server` and the container all report the same build.
+      # .CommitDate rather than the wall clock, for the same reason as above.
+      - -s -w
+      - -X main.version={{ .Version }}
+      - -X main.commit={{ .ShortCommit }}
+      - -X main.date={{ .CommitDate }}
+
+  - id: atlasctl
+    main: ./cmd/atlasctl
+    binary: atlasctl
+    env: *build_env
+    goos: *build_goos
+    goarch: *build_goarch
+    flags: *build_flags
+    mod_timestamp: *build_timestamp
+    ldflags: *build_ldflags
+
+archives:
+  # One archive per platform holding both binaries. Someone who downloads the
+  # server almost always wants the CLI that talks to it, and two separate
+  # downloads is two chances to end up with mismatched versions.
+  - id: atlascache
+    ids: [atlascache, atlasctl]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE
+      - README.md
+      - CHANGELOG.md
+      - config.example.yaml
+      - src: docs/*.md
+        dst: docs
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+# syft, one SBOM per archive. The archives are what people download, and an
+# SBOM that describes something other than the downloaded artifact is worse
+# than none: it invites a check that cannot fail.
+#
+# Images get their own SBOM through dockers_v2 below.
+sboms:
+  - id: archives
+    artifacts: archive
+
+# Cosign over the checksum file, which by transitivity covers every artifact
+# listed in it.
+#
+# In CI this is keyless: GitHub's OIDC identity signs, there is no private key
+# to manage, and the certificate records which workflow at which commit
+# produced the artifact. That is the whole point -- key management is the usual
+# reason signing is skipped or done badly.
+#
+# Locally the same script signs with a throwaway key so `make release-dry-run`
+# exercises the wiring end to end and produces the same files. It says loudly
+# that it did. See scripts/cosign-sign.sh; keyless itself cannot be exercised
+# off CI, because it *is* CI's identity.
+signs:
+  - id: checksum
+    cmd: ./scripts/cosign-sign.sh
+    args:
+      - "${artifact}"
+      - "${signature}"
+      - "${certificate}"
+    signature: "${artifact}.sig"
+    certificate: "${artifact}.pem"
+    artifacts: checksum
+    output: true
+
+# The multi-arch GHCR image.
+#
+# It is built here, from the binaries above, rather than from source in a
+# separate step -- so the binary inside the published image is the same file
+# the checksums cover, the SBOM describes and the signature attests to. An
+# image built separately from source would be a second artifact nothing in the
+# release vouches for.
+#
+# Dockerfile.release is the runtime half of the repository's Dockerfile; it
+# takes a prebuilt binary rather than compiling one. The E2E suite asserts the
+# two agree on base image, user, ports, health check and entrypoint, because
+# two recipes for the same image is exactly the sort of thing that drifts.
+dockers_v2:
+  - id: image
+    ids: [atlascache]
+    dockerfile: Dockerfile.release
+    platforms: [linux/amd64, linux/arm64]
+    images:
+      - ghcr.io/b3vet/atlascache
+    tags:
+      - "{{ .Version }}"
+      # No `latest` while the project is pre-1.0. A `latest` tag on an alpha is
+      # an invitation to run it in production by accident.
+    sbom: true
+    labels:
+      org.opencontainers.image.title: atlascache
+      org.opencontainers.image.description: A Redis-protocol-compatible in-memory key-value store
+      org.opencontainers.image.url: https://github.com/b3vet/atlascache
+      org.opencontainers.image.source: https://github.com/b3vet/atlascache
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+      org.opencontainers.image.created: "{{ .CommitDate }}"
+      org.opencontainers.image.licenses: MIT
+
+  - id: image-debug
+    ids: [atlascache]
+    dockerfile: Dockerfile.release
+    platforms: [linux/amd64, linux/arm64]
+    build_args:
+      # The only difference: a base image that has a shell. Published alongside
+      # every release so that "I cannot exec into this container" never becomes
+      # a reason to rebuild on Alpine and give up the security properties
+      # (ADR-0024).
+      BASE: gcr.io/distroless/static-debian12:debug-nonroot
+    images:
+      - ghcr.io/b3vet/atlascache
+    tags:
+      - "{{ .Version }}-debug"
+    sbom: true
+    labels:
+      org.opencontainers.image.title: atlascache
+      org.opencontainers.image.description: AtlasCache with a shell, for troubleshooting only
+      org.opencontainers.image.source: https://github.com/b3vet/atlascache
+      org.opencontainers.image.version: "{{ .Version }}-debug"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+      org.opencontainers.image.created: "{{ .CommitDate }}"
+      org.opencontainers.image.licenses: MIT
+
+# git-cliff drafts CHANGELOG.md and a human edits it before the tag is pushed
+# (ADR-0008), so GoReleaser must not also generate release notes from commit
+# subjects. The release body comes from the curated file.
+changelog:
+  disable: true
+
+release:
+  github:
+    owner: b3vet
+    name: atlascache
+
+  # Every v0.x release is a pre-release, whatever its tag says. The version
+  # number alone does not stop package tooling -- or a person in a hurry --
+  # from treating v0.1.0 as production-ready, and this does. Revisit at v1.0.0,
+  # where `auto` becomes the right setting.
+  prerelease: true
+
+  # A release is created as a draft so the notes can be read once more before
+  # anyone can fetch the artifacts. It is the last point at which a mistake is
+  # still free.
+  draft: true
+
+  name_template: "v{{ .Version }}"
+
+  header: |
+    ## AtlasCache v{{ .Version }}
+
+    **Pre-alpha.** Single node, no persistence, no clustering. See the
+    [roadmap](https://github.com/b3vet/atlascache/blob/main/docs/ROADMAP.md).
+
+  footer: |
+    ## Verifying what you downloaded
+
+    Every artifact is covered by `checksums.txt`, which is itself signed with
+    [cosign](https://docs.sigstore.dev/) keyless — there is no public key to
+    fetch, because the signature carries the identity of the GitHub workflow
+    that produced it.
+
+    ```sh
+    # 1. the checksum file is really from this repository's release workflow
+    cosign verify-blob checksums.txt \
+      --signature checksums.txt.sig \
+      --certificate checksums.txt.pem \
+      --certificate-identity-regexp '^https://github.com/b3vet/atlascache/\.github/workflows/release\.yml@refs/tags/v{{ .Version }}$' \
+      --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+    # 2. your download matches the checksum file
+    sha256sum --check --ignore-missing checksums.txt
+    ```
+
+    The container image is signed the same way:
+
+    ```sh
+    cosign verify ghcr.io/b3vet/atlascache:{{ .Version }} \
+      --certificate-identity-regexp '^https://github.com/b3vet/atlascache/\.github/workflows/release\.yml@refs/tags/v{{ .Version }}$' \
+      --certificate-oidc-issuer https://token.actions.githubusercontent.com
+    ```
+
+    An SBOM (`*.sbom.json`, syft) ships beside each archive and is attached to
+    each image.
+
+    ## Container
+
+    ```sh
+    docker run --rm -p 6379:6379 ghcr.io/b3vet/atlascache:{{ .Version }}
+    ```
+
+    The image runs as uid 65532 and has no shell. Two consequences worth
+    knowing before you hit them: it cannot bind a port below 1024, and the
+    admin API binds `127.0.0.1` by default, so an external probe needs
+    `admin.bind_addr: 0.0.0.0` **and** an `admin.token`. `ghcr.io/b3vet/atlascache:{{ .Version }}-debug`
+    is the same binary on a base with a shell.
+
+    ## Go SDK
+
+    The SDK is a separate module and carries its own tag:
+
+    ```sh
+    go get github.com/b3vet/atlascache/pkg/client@v{{ .Version }}
+    ```

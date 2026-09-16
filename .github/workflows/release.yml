@@ -1,0 +1,200 @@
+name: Release
+
+# The tag drives everything.
+#
+# `v*` matches the root module's tags and deliberately not `pkg/client/v*`: the
+# Go SDK is a separate module and Go versions a module in a subdirectory by a
+# tag carrying that subdirectory as a prefix, so a release is two tags on one
+# commit. Only the root tag releases. See .goreleaser.yml for the full
+# reasoning and docs/releasing.md for the order they go out in.
+#
+# workflow_dispatch is the dry run, and it is the point of this file having two
+# triggers. A release is the one piece of automation here with no undo -- a
+# pushed tag, a published image and a signature cannot be quietly retracted --
+# so the whole pipeline, keyless signing included, must be exercisable without
+# publishing. `make release-dry-run` covers everything that can be done off CI;
+# this covers the rest, because keyless signing *is* CI's identity and cannot be
+# tested anywhere else.
+on:
+  push:
+    tags:
+      - "v*"
+  # No inputs: running this by hand is always a dry run. An option that could
+  # publish is an option somebody clicks by accident.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GO_FLOOR: "1.24"
+  # Pinned: the signing script's flags are checked against this CLI. cosign 3
+  # changed sign-blob's output flags, and a release is the wrong moment to find
+  # that out.
+  COSIGN_VERSION: "v3.1.3"
+  SYFT_VERSION: "v1.51.1"
+
+jobs:
+  # Nothing is built until the tag agrees with VERSION and the suite is green.
+  # Both are cheap; a wrong version number baked into an immutable artifact is
+  # not, and neither is a published release that fails its own E2E gate.
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_FLOOR }}
+          cache: true
+
+      # The first thing, before anything is compiled. Tagging v0.1.0 while
+      # VERSION says 0.1.0-dev produces binaries that report the wrong version
+      # forever: the artifacts are immutable and the tag cannot be moved once
+      # anyone has fetched it.
+      - name: Tag matches VERSION
+        if: github.event_name == 'push'
+        run: make release-check TAG=${{ github.ref_name }}
+
+      - name: Unit tests, all three modules
+        run: make test
+
+      - name: Every binary builds for every released platform
+        run: make cross-check
+
+      - name: The full E2E tier
+        run: make e2e-full
+
+  release:
+    name: Release
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      # The GitHub release and its artifacts.
+      contents: write
+      # GHCR.
+      packages: write
+      # Cosign keyless. Without it there is no OIDC token, and
+      # scripts/cosign-sign.sh fails loudly rather than falling back to a
+      # throwaway key -- a published signature that attests to nothing is worse
+      # than an unsigned release.
+      id-token: write
+
+    steps:
+      # Full history: GoReleaser reads tags to work out the version, and a
+      # shallow clone makes it guess wrong.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_FLOOR }}
+          cache: true
+
+      # buildx with the docker-container driver, which is what a multi-platform
+      # manifest needs; the default driver cannot build one. No QEMU: the
+      # images take binaries GoReleaser has already cross-compiled, so nothing
+      # is ever emulated.
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: anchore/sbom-action/download-syft@v0
+        with:
+          syft-version: ${{ env.SYFT_VERSION }}
+
+      - uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The real thing. `release --clean` builds every artifact, signs the
+      # checksum file with GitHub's OIDC identity, pushes the multi-arch image
+      # to GHCR and creates the GitHub release -- as a draft pre-release, so
+      # there is one last look before anyone can fetch it.
+      - name: Release
+        if: github.event_name == 'push'
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # The dry run. Identical, minus publishing: --snapshot builds and signs
+      # everything into dist/ and pushes nothing, to no registry and no release.
+      # Signing is *not* skipped, because exercising keyless signing is the only
+      # thing this run can do that `make release-dry-run` cannot.
+      - name: Dry run
+        if: github.event_name == 'workflow_dispatch'
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --snapshot --clean --skip=publish,announce
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # What a dry run is for: looking at what came out. The artifacts are kept
+      # so the checksums, SBOMs and signatures can be inspected -- and verified
+      # -- without re-running anything.
+      - name: Keep the dry-run artifacts
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dry-run
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums.txt*
+            dist/*.sbom.json
+            dist/artifacts.json
+          retention-days: 7
+
+      # Proves the signature the run just produced verifies against this
+      # workflow's identity, rather than assuming it does. On a tag push this is
+      # the acceptance criterion `cosign verify` covers; on a dry run it is the
+      # only place keyless signing is exercised at all.
+      - name: Verify the signature we just made
+        run: |
+          set -euo pipefail
+          identity="^https://github.com/${{ github.repository }}/\.github/workflows/release\.yml@refs/"
+          cosign verify-blob dist/checksums.txt \
+            --signature dist/checksums.txt.sig \
+            --certificate dist/checksums.txt.pem \
+            --certificate-identity-regexp "$identity" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          echo "checksums.txt verifies against this workflow's identity"
+
+      # The release is created as a draft (see .goreleaser.yml) so the curated
+      # changelog can be read once more before anyone can fetch the artifacts.
+      # Publishing it, and pushing the SDK's own tag, stay manual on purpose --
+      # see docs/releasing.md.
+      - name: What is left to do by hand
+        if: github.event_name == 'push'
+        run: |
+          {
+            echo "### Released ${{ github.ref_name }}"
+            echo
+            echo "The GitHub release is a **draft pre-release**. Still to do, by hand:"
+            echo
+            echo '1. Read the release notes, then publish the draft.'
+            echo '2. Push the SDK tag so `go get .../pkg/client@${{ github.ref_name }}` resolves:'
+            echo
+            echo '   ```sh'
+            echo '   git tag pkg/client/${{ github.ref_name }} ${{ github.sha }}'
+            echo '   git push origin pkg/client/${{ github.ref_name }}'
+            echo '   ```'
+            echo
+            echo 'See docs/releasing.md.'
+          } >> "$GITHUB_STEP_SUMMARY"

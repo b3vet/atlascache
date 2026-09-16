@@ -1,5 +1,8 @@
 # Binaries
 bin/
+# Parallel builds use their own BUILD_DIR so concurrent work cannot race on the
+# shared binary. Those directories are build output like bin/ is.
+bin-*/
 *.exe
 *.exe~
 *.dll
@@ -68,3 +71,7 @@ temp/
 /devindex
 /atlas-e2e
 /atlasctl
+
+# GoReleaser output. Everything a release would publish, rebuilt from scratch
+# by `make release-dry-run` and never committed.
+dist/
