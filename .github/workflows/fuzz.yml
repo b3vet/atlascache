@@ -35,7 +35,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           # The floor declared in go.mod (ADR-0011). Fuzzing the version every
           # other gate builds is what makes a finding actionable.
