@@ -23,7 +23,7 @@ jobs:
       matrix:
         go: ["1.24", "stable"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v5
         with:
@@ -54,7 +54,7 @@ jobs:
       matrix:
         go: ["1.24", "stable"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v5
         with:
@@ -76,7 +76,7 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v5
         with:
@@ -98,7 +98,7 @@ jobs:
       # Full history, not a shallow clone: a credential that was committed and
       # later removed is still published, and still has to be treated as
       # compromised. Scanning only the tip would miss exactly that case.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -112,7 +112,7 @@ jobs:
     name: E2E gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v5
         with:
@@ -137,7 +137,7 @@ jobs:
     name: Examples
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v5
         with:
